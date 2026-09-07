@@ -1,5 +1,4 @@
 @echo off
-chcp 65001 >nul
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 
@@ -15,18 +14,18 @@ if /I "%~1"=="--ensure" set "MODE=ensure"
 if /I "%~1"=="--verify" set "MODE=verify"
 if /I "%~1"=="--recreate" set "MODE=recreate"
 
-call :banner "文件分发工作台 - Python 环境初始化"
+call :banner "File Distribution Studio - Python environment setup"
 if not exist "%REQ%" (
-  echo [错误] 未找到 requirements.txt：%REQ%
+  echo [ERROR] requirements.txt was not found: %REQ%
   exit /b 1
 )
 
 if /I "%MODE%"=="recreate" (
   if exist "%VENV%" (
-    echo [1/5] 正在删除旧的 .venv ...
+    echo [1/5] Removing old .venv ...
     rmdir /s /q "%VENV%"
     if exist "%VENV%" (
-      echo [错误] .venv 仍被占用。请关闭 VS Code 终端或相关 Python 进程后重试。
+      echo [ERROR] .venv is still in use. Close VS Code terminals and Python processes, then retry.
       exit /b 1
     )
   )
@@ -37,60 +36,60 @@ if /I "%MODE%"=="verify" goto :verify_only
 if /I "%MODE%"=="ensure" if exist "%VENV_PY%" (
   call :verify_quick >nul 2>&1
   if not errorlevel 1 (
-    echo Python 虚拟环境已就绪。
+    echo Python environment is ready.
     exit /b 0
   )
-  echo 检测到 .venv 依赖不完整，正在自动修复...
+  echo Existing .venv is incomplete. Repairing dependencies ...
 )
 
 if exist "%VENV_PY%" goto :install
 
-echo [1/5] 正在查找 64 位 Python 3.10-3.14 ...
+echo [1/5] Looking for 64-bit Python 3.10-3.14 ...
 call :find_python
 if errorlevel 1 exit /b 1
 
-echo [2/5] 正在创建 .venv ...
+echo [2/5] Creating .venv ...
 call :run_bootstrap -m venv "%VENV%"
 if errorlevel 1 (
-  echo [错误] Python 虚拟环境创建失败。
+  echo [ERROR] Failed to create the Python virtual environment.
   exit /b 1
 )
 
 :install
 if not exist "%VENV_PY%" (
-  echo [错误] 未找到虚拟环境 Python：%VENV_PY%
+  echo [ERROR] Virtual-environment Python was not found: %VENV_PY%
   exit /b 1
 )
 
-echo [3/5] 正在检查 pip ...
+echo [3/5] Checking pip ...
 "%VENV_PY%" -m ensurepip --upgrade >nul 2>&1
 "%VENV_PY%" -m pip --version
 if errorlevel 1 (
-  echo [错误] .venv 中的 pip 不可用。
+  echo [ERROR] pip is not available inside .venv.
   exit /b 1
 )
 
-echo [4/5] 正在安装 / 修复程序依赖 ...
-echo 提示：这里不会强制升级 pip，只安装 requirements.txt 中的程序依赖。
+echo [4/5] Installing / repairing application dependencies ...
+echo Note: this script does not force a pip self-upgrade.
 "%VENV_PY%" -m pip install --disable-pip-version-check --no-input --prefer-binary -r "%REQ%"
 if errorlevel 1 (
-  echo [错误] 依赖安装失败。
-  echo 请检查当前电脑到 Python 软件源的网络 / 代理配置，然后重新运行 setup.bat。
+  echo [ERROR] Dependency installation failed.
+  echo Check access to your Python package index / proxy, then run setup.bat again.
   exit /b 1
 )
 
-echo [5/5] 正在验证运行环境 ...
+echo [5/5] Verifying the runtime environment ...
 call :verify_environment
 if errorlevel 1 exit /b 1
 
 echo.
-call :banner "环境准备完成"
-echo 以后直接双击 run.bat 即可启动程序。
+call :banner "Environment setup completed"
+echo Start the application with run.bat.
 exit /b 0
 
 :verify_only
 if not exist "%VENV_PY%" (
-  echo [错误] .venv 尚未创建，请先运行 setup.bat。
+  echo [ERROR] .venv does not exist. Run setup.bat first.
   exit /b 1
 )
 call :verify_environment
@@ -103,45 +102,50 @@ exit /b %ERRORLEVEL%
 :verify_environment
 call :verify_quick
 if errorlevel 1 (
-  echo [错误] 缺少程序依赖，或者 Python 版本 / 架构不受支持。
+  echo [ERROR] Missing dependencies or unsupported Python version / architecture.
   exit /b 1
 )
 "%VENV_PY%" -m pip check
 if errorlevel 1 (
-  echo [错误] pip 依赖检查失败。
+  echo [ERROR] pip dependency check failed.
   exit /b 1
 )
 "%VENV_PY%" main.py --self-test
 if errorlevel 1 (
-  echo [错误] 程序自检失败。
+  echo [ERROR] Application self-test failed.
   exit /b 1
 )
 "%VENV_PY%" -c "import sys,PySide6,paramiko,psutil,winrm,impacket; print('Python:',sys.version.split()[0]); print('PySide6:',PySide6.__version__); print('paramiko:',paramiko.__version__); print('psutil:',psutil.__version__)"
 exit /b 0
 
 :find_python
-for /f "delims=" %%P in ('where py.exe 2^>nul') do if not defined BOOTSTRAP_EXE set "BOOTSTRAP_EXE=%%P"
-if defined BOOTSTRAP_EXE (
-  "%BOOTSTRAP_EXE%" -3 -c "import sys,struct; assert struct.calcsize('P')*8==64; assert (3,10) <= sys.version_info[:2] < (3,15)" >nul 2>&1
-  if not errorlevel 1 (
-    set "BOOTSTRAP_SELECTOR=-3"
-    echo 已选择：py -3
-    exit /b 0
-  )
-)
-set "BOOTSTRAP_EXE="
+for %%V in (3.14 3.13 3.12 3.11 3.10) do call :try_py_version %%V
+if defined BOOTSTRAP_EXE exit /b 0
+
 for /f "delims=" %%P in ('where python.exe 2^>nul') do if not defined BOOTSTRAP_EXE set "BOOTSTRAP_EXE=%%P"
 if defined BOOTSTRAP_EXE (
   "%BOOTSTRAP_EXE%" -c "import sys,struct; assert struct.calcsize('P')*8==64; assert (3,10) <= sys.version_info[:2] < (3,15)" >nul 2>&1
   if not errorlevel 1 (
     set "BOOTSTRAP_SELECTOR="
-    echo 已选择：python
+    echo Selected: python
     exit /b 0
   )
 )
-echo [错误] 未找到 64 位 Python 3.10-3.14。
-echo 请安装 Python x64，并确保 py.exe 或 python.exe 已加入 PATH。
+set "BOOTSTRAP_EXE="
+echo [ERROR] 64-bit Python 3.10-3.14 was not found.
+echo Install Python x64 and make sure py.exe or python.exe is available in PATH.
 exit /b 1
+
+:try_py_version
+if defined BOOTSTRAP_EXE exit /b 0
+where py.exe >nul 2>&1
+if errorlevel 1 exit /b 0
+py -%~1 -c "import sys,struct; assert struct.calcsize('P')*8==64; assert sys.version_info[:2]==tuple(map(int,'%~1'.split('.')))" >nul 2>&1
+if errorlevel 1 exit /b 0
+for /f "delims=" %%P in ('where py.exe 2^>nul') do if not defined BOOTSTRAP_EXE set "BOOTSTRAP_EXE=%%P"
+set "BOOTSTRAP_SELECTOR=-%~1"
+echo Selected: py -%~1
+exit /b 0
 
 :run_bootstrap
 if defined BOOTSTRAP_SELECTOR (

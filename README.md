@@ -1,4 +1,23 @@
-# 文件分发工作台 v0.6.16
+# 文件分发工作台 v0.6.17
+
+
+
+## Git 仓库提交建议（v0.6.17）
+
+项目根目录已提供 `.gitignore`。建议仓库只提交源代码、资源、脚本和文档，不提交本机虚拟环境、运行数据、日志、审计记录、构建产物或凭据/密钥。
+
+首次提交前可检查：
+
+```bash
+git init
+git status --ignored
+git add .
+git status
+```
+
+重点确认以下内容没有进入暂存区：`.venv/`、`build/`、`dist/`、`release/`、`settings.json`、`fds.db`、`logs/`、`audit/`、`.env*`、私钥/证书、真实 `hosts.csv`/`targets.csv` 以及生成的 EXE/ZIP。`sample_hosts.csv` 作为示例文件会正常提交。
+
+> 密码本身仍按应用既有设计保存到 Windows 凭据管理器；`.gitignore` 只是额外防止本地配置、密钥和运行产物被误提交，不能替代提交前的 `git status` 检查。
 
 ## v0.6.16 登录桌面识别、执行顺序与滚轮优化
 
@@ -432,4 +451,22 @@ build_windows.bat
 - `登录桌面（推荐）`：仍由 WinRM 控制，但临时通过 Windows 任务计划程序在目标机当前已登录桌面用户会话中执行 CMD，更接近人在目标机本地执行 `sys_ctl start fast` 的效果。
 - `WinRM 后台`：保持传统非交互式 WinRM 命令方式，适合无 GUI、与桌面环境无关的后台命令。
 - 登录桌面模式要求目标机已有用户登录，不安装 Agent，不在任务或命令行中保存密码。
+
+
+## Windows 脚本与 Git 行尾
+
+v0.6.18 起仓库根目录包含 `.gitattributes`：`*.bat`、`*.cmd`、`*.ps1` 在 checkout 时固定使用 CRLF。`setup.bat`/`run.bat` 的批处理控制文本使用 ASCII，避免 `cmd.exe` 受系统代码页或 UTF-8 中文字节影响。不要在编辑器中把这些脚本强制改成 LF。
+
+如果旧工作区曾经出现 `'xxx' 不是内部或外部命令`、中文乱码、批处理语句被拆开的现象，更新代码后执行：
+
+```powershell
+git add --renormalize .
+git status
+```
+
+然后重新运行：
+
+```powershell
+.\setup.bat
+```
 

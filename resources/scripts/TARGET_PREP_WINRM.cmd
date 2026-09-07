@@ -1,31 +1,31 @@
-﻿@echo off
-chcp 65001 >nul
+@echo off
 setlocal EnableExtensions
 
 echo ============================================================
-echo File Distribution Studio - WinRM 标准准备
+echo File Distribution Studio - Standard WinRM preparation
 echo ============================================================
-echo 此脚本只初始化/启动 WinRM，不修改 UAC、注册表、TrustedHosts 或用户权限。
-echo 请在目标 Windows 上“以管理员身份运行”。
+echo This script initializes and starts WinRM only.
+echo It does NOT modify UAC, registry policy, TrustedHosts, or user permissions.
+echo Run this script as Administrator on the target Windows host.
 echo.
 
 net session >nul 2>&1
 if errorlevel 1 (
-  echo [错误] 当前窗口不是管理员权限。
-  echo 请右键此脚本，选择“以管理员身份运行”。
+  echo [ERROR] This window is not elevated.
+  echo Right-click the script and choose "Run as administrator".
   pause
   exit /b 1
 )
 
-echo [1/6] 初始化 WinRM
+echo [1/6] Initialize WinRM
 winrm quickconfig -quiet
 
 echo.
-echo [2/6] 服务状态
+echo [2/6] WinRM service status
 sc query WinRM
 
 echo.
-echo [3/6] 设置自动启动并启动
+echo [3/6] Set WinRM to Automatic and start it
 sc config WinRM start= auto
 sc start WinRM
 
@@ -34,13 +34,13 @@ echo [4/6] Listener
 winrm enumerate winrm/config/listener
 
 echo.
-echo [5/6] 5985 监听
+echo [5/6] TCP 5985 listener
 netstat -ano | findstr :5985
 
 echo.
-echo [6/6] 本机 WinRM
+echo [6/6] Local WinRM identity
 winrm id
 
 echo.
-echo 完成。请回到管理机，在 File Distribution Studio 中点击“测试 WinRM”。
+echo Completed. Return to File Distribution Studio and click "Test WinRM".
 pause

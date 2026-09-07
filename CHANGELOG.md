@@ -1,4 +1,23 @@
+# v0.6.18-zh-CN
+
+- 修复 Windows `cmd.exe` 执行 `setup.bat` 时出现大量“不是内部或外部命令”的问题：根因是仓库中的 `.bat/.cmd` 使用 LF 行尾并包含 UTF-8 中文文本，Windows 批处理解析在部分环境下会把字节/行错误拆成命令。
+- 所有 `.bat/.cmd` 入口脚本改为纯 ASCII 控制文本并强制 CRLF、无 BOM，避免系统代码页影响批处理语法。应用 GUI 和文档仍保持简体中文。
+- `setup.bat` 继续支持 `--ensure / --verify / --recreate`，并改进 Python Launcher 查找，优先明确尝试 3.14→3.10 的 64 位解释器。
+- PowerShell `.ps1` 脚本统一为 CRLF + UTF-8 BOM，兼容 Windows PowerShell 5.1 的 Unicode 读取。
+- 新增 `.gitattributes` 与 `.editorconfig`，确保 Git clone/checkout 后 Windows 脚本仍为 CRLF，不会因开发机或 Git `core.autocrlf` 再次破坏。
+- 不修改 v0.6.17 的 WinRM 文件分发、远程命令、进程、凭据、审计等业务行为。
+
 # CHANGELOG
+
+
+## v0.6.17-zh-CN - 2026-09-07
+
+- Git 仓库整理版本：新增根目录 `.gitignore`。
+- 默认忽略 `.venv`、Python 缓存、IDE 本地配置、PyInstaller `build/dist/release` 输出、EXE/ZIP 等生成物。
+- 默认忽略运行时数据库、`settings.json`、日志、审计 JSONL、缓存/暂存目录和 `.fds_tmp`。
+- 默认忽略 `.env`、证书/私钥、凭据/secret 文件和真实主机清单；仓库继续保留 `sample_hosts.csv`。
+- 不包含“远程 GUI 自动点击/结果文件回收”需求；该需求暂不进入当前代码。
+- 不改变 v0.6.16 的 WinRM 分发、交互桌面命令、进程选择、凭据、备份、校验和审计业务逻辑。
 
 ## v0.6.16-zh-CN - 2026-09-07
 
