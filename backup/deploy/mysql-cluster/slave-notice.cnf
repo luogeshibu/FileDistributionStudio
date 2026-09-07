@@ -1,8 +1,0 @@
-[mysqld]
-server-id=3
-replicate-rewrite-db=ksbc_sys->ksbc_notice
-replicate-wild-do-table=ksbc_notice.sys_user
-replicate-wild-do-table=ksbc_notice.sys_organization
-replicate-wild-do-table=ksbc_notice.sys_user_org_rel
-replicate-wild-do-table=ksbc_notice.work_user_role_rel
-replicate-wild-do-table=ksbc_notice.sys_user_cover

@@ -1,9 +1,0 @@
-[mysqld]
-server-id=1
-log-bin=mysql-bin
-binlog-do-db=ksbc_sys
-sync_binlog=1
-binlog-ignore-db=mysql
-binlog-ignore-db=information_schema
-binlog-ignore-db=performance_schema
-binlog-ignore-db=sys

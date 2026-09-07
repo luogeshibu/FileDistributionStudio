@@ -1,7 +1,0 @@
-[mysqld]
-server-id=4
-replicate-rewrite-db=ksbc_sys->ksbc_score
-replicate-wild-do-table=ksbc_score.sys_user
-replicate-wild-do-table=ksbc_score.sys_organization
-replicate-wild-do-table=ksbc_score.sys_user_org_rel
-replicate-wild-do-table=ksbc_score.sys_user_cover
