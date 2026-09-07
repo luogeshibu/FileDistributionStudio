@@ -107,7 +107,9 @@ def run():
             try:
                 scale_x = pix.width() / 900.0
                 scale_y = pix.height() / 470.0
-                # The static splash already carries the NARI / 国际业务部 / 作者 branding.
+                # Keep NARI / 国际业务部 branding, but do not display personal author information.
+                # The legacy splash asset still contains an author line; cover that region at runtime.
+                painter.fillRect(285 * scale_x, 345 * scale_y, 230 * scale_x, 40 * scale_y, QColor("#0D2D47"))
                 # Only the release version is rendered dynamically to prevent stale version text.
                 painter.fillRect(530 * scale_x, 342 * scale_y, 290 * scale_x, 46 * scale_y, QColor("#102A44"))
                 font = QFont("Microsoft YaHei UI" if os.name == "nt" else "Noto Sans CJK SC", max(10, int(14 * scale_y)), QFont.Bold)

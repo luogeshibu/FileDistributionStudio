@@ -1,9 +1,19 @@
-# WinRM 服务约定（v0.6.10）
+# WinRM 服务约定（v0.6.23）
 
 File Distribution Studio 的目标端业务操作统一依赖 Windows WinRM 服务。
-正式文件写入、备份、校验、服务/进程控制、CMD/PowerShell 都只走 WinRM。
+正式文件写入、备份、校验、进程控制、CMD/PowerShell 都只走 WinRM。
 
 主机发现/识别可以继续使用 Ping、TCP 445/3389/5985/5986、DNS、NetBIOS、SMB/NTLM/WKSSVC 等只读辅助信号；这些方式不会用于修改目标机。
+
+
+## 普通用户默认设置
+
+一般情况下保持 **HTTP 5985** 即可。主界面只显示当前连接方式；HTTPS/5986 放在“高级连接…”中，只有现场已经配置 HTTPS Listener 时才需要修改。
+
+主界面可直接下载：
+
+- `TARGET_PREP_ADMS_WINRM.cmd`：目标机首次准备。
+- `TARGET_RESTORE_ADMS_WINRM.cmd`：只删除 `LocalAccountTokenFilterPolicy` 并停止 WinRM，不修改任何账号、用户组或 RDP 设置。
 
 ## 现场标准 WinRM 命令
 
@@ -111,3 +121,14 @@ reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v Loca
 ## 登录桌面命令说明（v0.6.16）
 
 `Win32_ComputerSystem.UserName` 在部分 RDP/控制台组合下可能为空，因此程序现在优先从目标机 `explorer.exe` 的进程所有者与 SessionId 判断真实交互桌面用户，并优先匹配 WinRM 用户。若确实没有登录桌面用户，才会明确提示无法使用“登录桌面”执行方式。
+
+
+## RDP 与 ADMS 账号权限
+v0.6.23 的 ADMS 设置/还原脚本不读取也不修改 ADMS 的启用状态、Administrators/Remote Desktop Users 成员关系或任何 RDP 用户权限策略。设置脚本只启用/启动 WinRM 并设置 `LocalAccountTokenFilterPolicy=1`；还原脚本只删除该值并停止 WinRM。
+
+
+## v0.6.24：WinRM 脚本与账号权限边界
+
+应用提供的 `TARGET_PREP_ADMS_WINRM.cmd` 只启用/启动 WinRM 并设置 `LocalAccountTokenFilterPolicy=1`；`TARGET_RESTORE_ADMS_WINRM.cmd` 只删除该注册表值并停止 WinRM。两个脚本都不会读取、创建、启用、禁用或修改 ADMS，也不会修改 Administrators、Remote Desktop Users 或 RDP 登录权限。
+
+如需现场手工检查 ADMS，请在“使用帮助 → ADMS 账号检查与管理员组（手工操作）”查看 `net user ADMS`、Administrators 成员查询以及手工加入命令。

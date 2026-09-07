@@ -29,6 +29,8 @@ class AppSettings:
     winrm_post_commands_text: str = ""
     winrm_post_on_failure: bool = True
     winrm_command_execution_mode: str = "INTERACTIVE"
+    distribution_target_selection_initialized: bool = False
+    distribution_target_checks: dict[str, bool] = field(default_factory=dict)
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -47,6 +49,13 @@ class AppSettings:
                 base["winrm_host_usernames"] = {}
             if not isinstance(base.get("winrm_kill_processes"), list):
                 base["winrm_kill_processes"] = []
+            if not isinstance(base.get("distribution_target_checks"), dict):
+                base["distribution_target_checks"] = {}
+            else:
+                base["distribution_target_checks"] = {
+                    str(k): bool(v) for k, v in base["distribution_target_checks"].items()
+                    if str(k).strip()
+                }
             if base.get("winrm_command_execution_mode") not in ("INTERACTIVE", "WINRM_BACKGROUND"):
                 base["winrm_command_execution_mode"] = "INTERACTIVE"
             return cls(**base)

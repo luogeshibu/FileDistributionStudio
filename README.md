@@ -1,6 +1,30 @@
-# 文件分发工作台 v0.6.17
+# 文件分发工作台 v0.6.23
 
 
+## 简化的 WinRM 使用（v0.6.23）
+
+主界面默认使用 **WinRM HTTP 5985**，普通用户无需理解 HTTPS/5986；只有现场已配置 WinRM HTTPS Listener 时才需要进入“高级连接…”修改。
+
+在“Windows 目标主机”区域可直接点击 **下载 ADMS 设置脚本** / **下载 ADMS 还原脚本**。v0.6.23 起，这两个脚本不读取也不修改任何 ADMS 账号、用户组或 RDP 设置：设置脚本只启用/启动 WinRM 并设置 `LocalAccountTokenFilterPolicy=1`；还原脚本只删除该注册表值并停止 WinRM。
+
+## Windows 目标主机选择记忆（v0.6.20）
+
+“文件分发 → Windows 目标主机”的复选框会自动记住上一次状态。全新初始化第一次出现目标主机时默认全部勾选；之后重新打开程序会按主机/IP恢复上次选择。已有历史后新增/新发现的主机默认不勾选，避免未确认主机意外进入分发范围。选择状态保存在本地 `settings.json`，仅包含主机/IP与布尔值，不保存密码。
+
+
+
+
+## ADMS 目标机一键 WinRM 准备
+
+v0.6.23 起，主界面下载的 `TARGET_PREP_ADMS_WINRM.cmd` **只启用/启动 WinRM，并设置 `LocalAccountTokenFilterPolicy=1`**；不检查、不创建、不启用/禁用、不加组、不移组，也不修改任何 ADMS/RDP 账号设置。
+
+`TARGET_RESTORE_ADMS_WINRM.cmd` **只删除 `LocalAccountTokenFilterPolicy` 并停止 WinRM**；不修改 ADMS 账号、任何组成员关系或 RDP 策略。
+
+> 当前 ADMS 设置脚本使用 `LocalAccountTokenFilterPolicy=1`，用于已属于本地 Administrators 的账号获得完整远程管理员令牌；脚本本身不会修改任何账号或用户组。
+
+## 分发进度语义
+
+进度条表示**完整主机工作流**，不是单纯的文件数量。文件上传、校验和替换全部结束时最多显示约 90%；主机的分发后命令和收尾完成后推进到 99%；只有任务、审计和所有主机流程真正结束时才显示 100% 并弹出最终结果。
 
 ## Git 仓库提交建议（v0.6.17）
 
@@ -470,3 +494,14 @@ git status
 .\setup.bat
 ```
 
+
+
+### v0.6.22 RDP 安全修正
+旧版 ADMS 准备脚本在发现 ADMS 不是本地管理员时会自动加入 Administrators。在启用了“拒绝本地管理员通过远程桌面登录”等安全策略的环境里，这可能间接改变该账号的 RDP 授权结果。v0.6.22 已取消这种自动账号/组变更。新版还原脚本兼容旧版 `ADMS_WinRM.before.txt`，可按旧快照撤销旧版对 ADMS 启用状态/Administrators 成员关系的修改，同时删除 `LocalAccountTokenFilterPolicy` 恢复 Windows 默认 Remote UAC。
+
+
+## v0.6.24：WinRM 脚本与账号权限边界
+
+应用提供的 `TARGET_PREP_ADMS_WINRM.cmd` 只启用/启动 WinRM 并设置 `LocalAccountTokenFilterPolicy=1`；`TARGET_RESTORE_ADMS_WINRM.cmd` 只删除该注册表值并停止 WinRM。两个脚本都不会读取、创建、启用、禁用或修改 ADMS，也不会修改 Administrators、Remote Desktop Users 或 RDP 登录权限。
+
+如需现场手工检查 ADMS，请在“使用帮助 → ADMS 账号检查与管理员组（手工操作）”查看 `net user ADMS`、Administrators 成员查询以及手工加入命令。

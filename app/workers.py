@@ -534,7 +534,7 @@ class DistributionThread(QThread):
                 status = "SUCCESS"
             db.finish_task(self.task_id, status, success, failed)
             for pm in prepared:
-                self.mapping_status.emit(pm.mapping.mapping_id, status, "任务已结束")
+                self.mapping_status.emit(pm.mapping.mapping_id, status, f"主机成功 {success}/{len(self.hosts)}，失败 {failed}")
             audit.finish_task(
                 self.settings.audit_path, self.task_id,
                 {"status": status, "success_hosts": success, "failed_hosts": failed,

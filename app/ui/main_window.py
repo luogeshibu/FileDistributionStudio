@@ -11,13 +11,13 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QFileDialog, QComboBox, QSpinBox, QCheckBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QPlainTextEdit, QGroupBox,
-    QAbstractItemView, QProgressBar, QFrame, QStackedWidget, QScrollArea
+    QAbstractItemView, QProgressBar, QFrame, QStackedWidget, QScrollArea, QApplication, QDialog, QDialogButtonBox
 )
 
 from ..version import APP_NAME, APP_VERSION
 from ..config import AppSettings
 from ..models import HostRecord, DistributionMapping
-from ..resources import asset_path
+from ..resources import asset_path, script_path
 from ..services.discovery import local_ipv4_networks, normalize_networks
 from ..services.sftp_source import SftpSource
 from ..services.remote_exec import RemoteActionPlan, WinRMExecutor, split_items, split_commands
@@ -60,6 +60,18 @@ winrm id
 sc config WinRM start= disabled
 sc config WinRM start= auto
 sc start WinRM"""
+
+ADMS_ACCOUNT_HELP = r""":: 1. 查看 ADMS 账号
+net user ADMS
+
+:: 2. 查看本地 Administrators 成员（只读）
+:: SID S-1-5-32-544 = Windows 内置 Administrators
+Get-LocalGroupMember -Group (Get-LocalGroup -SID 'S-1-5-32-544').Name
+
+:: 3. 仅在确认需要时，把 ADMS 加入 Administrators
+:: 请在“管理员 PowerShell”中执行
+Add-LocalGroupMember -Group (Get-LocalGroup -SID 'S-1-5-32-544').Name -Member 'ADMS'
+Get-LocalGroupMember -Group (Get-LocalGroup -SID 'S-1-5-32-544').Name"""
 
 WINRM_LOCAL_ADMIN_HELP = r""":: ======================================
 :: CMD：查看当前状态
@@ -107,7 +119,7 @@ PAGE_META = [
     ("主机发现", "跨一个或多个 IPv4 网段发现可访问的 Windows 主机。", "radar"),
     ("分发历史", "查看任务、主机、文件、备份、校验以及远程操作详情。", "history"),
     ("审计日志", "查看软件操作、主机发现、分发、备份、校验和远程操作的本地审计记录。", "terminal"),
-    ("使用帮助", "查看 WinRM 初始化、服务控制、本地管理员远程策略和临时目录说明。", "terminal"),
+    ("使用帮助", "查看 WinRM 初始化、ADMS 账号权限检查和常用远程操作说明。", "terminal"),
     ("系统设置", "调整并发、扫描、备份、校验、本地缓存和审计目录。", "settings"),
 ]
 
@@ -148,6 +160,7 @@ class MainWindow(QMainWindow):
         self._status_badge = None
         # 自定义主机密码只保存在当前进程内；若用户选择“安全记住”，同时写入 Windows 凭据管理器。
         self._session_host_credentials: dict[str, tuple[str, str]] = {}
+        self._suppress_target_selection_persist = False
 
         self.setWindowTitle(f"{APP_NAME}  ·  v{APP_VERSION}")
         self.resize(1420, 900)
@@ -239,9 +252,13 @@ class MainWindow(QMainWindow):
             "分发映射",
             "一次任务可以配置多条“源 → 目标目录”映射。每条映射的目标目录都可以不同；所有勾选主机会执行完全相同的映射计划。",
         )
-        self.mapping_table = QTableWidget(0, 7)
+        self.mapping_scope_label = QLabel("当前分发范围：尚未选择目标主机。")
+        self.mapping_scope_label.setWordWrap(True)
+        self.mapping_scope_label.setStyleSheet("color:#476574; font-weight:600;")
+        src_l.addWidget(self.mapping_scope_label)
+        self.mapping_table = QTableWidget(0, 8)
         self.mapping_table.setHorizontalHeaderLabels([
-            "启用", "来源", "类型", "源文件 / 目录", "目标目录", "目录方式", "状态"
+            "启用", "来源", "类型", "源文件 / 目录", "目标目录", "当前目标主机", "目录方式", "状态"
         ])
         self.mapping_table.setAlternatingRowColors(True)
         self.mapping_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -251,6 +268,7 @@ class MainWindow(QMainWindow):
         mh.setSectionResizeMode(QHeaderView.ResizeToContents)
         mh.setSectionResizeMode(3, QHeaderView.Stretch)
         mh.setSectionResizeMode(4, QHeaderView.Stretch)
+        mh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         src_l.addWidget(self.mapping_table)
 
         mr = QHBoxLayout()
@@ -267,13 +285,13 @@ class MainWindow(QMainWindow):
         src_l.addLayout(mr)
         map_hint = QLabel(
             "示例：core.dll → D:\\ADMS\\dll；config.xml → D:\\ADMS\\conf；整个 translations 目录 → E:\\ADMS\\translations。"
-            "目录可选择“仅复制目录内容”或“复制目录本身”。开始分发前会检查目标冲突。"
+            "目录可选择“仅复制目录内容”或“复制目录本身”。每条映射都会应用到当前全部已勾选目标主机；开始分发前会逐台预检查。"
         )
         map_hint.setObjectName("Muted"); map_hint.setWordWrap(True); src_l.addWidget(map_hint)
 
         target, target_l = card(
             "Windows 目标主机",
-            "主机只表示执行对象，目标目录由上面的分发映射决定。文件上传、目录创建、备份、校验、结束进程和 CMD/PowerShell 全部只通过 WinRM；SMB/RDP/Ping 只用于发现、识别和在线诊断。",
+            "选择本次要分发的 Windows 主机，并设置默认账号密码。",
         )
         cred = QHBoxLayout()
         self.win_user = QLineEdit(self.settings.winrm_default_username); self.win_password = PasswordLineEdit()
@@ -290,11 +308,8 @@ class MainWindow(QMainWindow):
         self.win_password.editingFinished.connect(lambda: self._save_default_winrm_credential(show_error=False))
         self.remember_default_cred.toggled.connect(lambda _checked: self._save_default_winrm_credential(show_error=False))
         cred_hint = QLabel(
-            "WinRM 模式直接操作目标机真实 Windows 路径，例如 C:\\、D:\\、E:\\、F:\\ 下的任意目录；"
-            "不需要配置 SMB 共享，也不会转换成 C$/D$/E$。目标机只需按现场标准启用 WinRM 服务/Listener。"
-            "注意：5985/5986 可达只表示服务已启动，Windows 仍会单独检查该账号是否允许远程管理。"
-            "v0.6.5 起支持“默认凭据 + 单机/批量自定义凭据”；大多数主机直接使用默认凭据，特殊主机可单独覆盖。"
-            "密码可安全记住在 Windows 凭据管理器中，不会写入配置、SQLite 或审计日志。"
+            "默认使用 WinRM HTTP 5985。首次使用目标机可下载 WinRM 设置脚本；脚本不会修改任何 Windows 账号、用户组或 RDP 权限。"
+            "大多数主机直接使用默认凭据，只有账号或密码不同的主机才需要单独设置。"
         )
         cred_hint.setObjectName("Muted"); cred_hint.setWordWrap(True); target_l.addWidget(cred_hint)
         self.target_table = QTableWidget(0, 8)
@@ -318,9 +333,19 @@ class MainWindow(QMainWindow):
         self.btn_winrm_test.setToolTip("对所有已勾选主机执行各自主机凭据的 WinRM 身份验证，并逐一测试当前目标目录的创建、写入、读取和删除。")
         self.btn_winrm_test.clicked.connect(self._test_winrm_targets)
         tr.addWidget(self.btn_winrm_test)
+        self.btn_download_adms_setup = QPushButton("下载 ADMS WinRM 设置脚本")
+        self.btn_download_adms_setup.setIcon(app_icon("file"))
+        self.btn_download_adms_setup.setToolTip("保存目标机首次使用的简化 WinRM 设置脚本；脚本不修改任何账号、用户组或 RDP 权限。")
+        self.btn_download_adms_setup.clicked.connect(lambda: self._save_bundled_cmd("TARGET_PREP_ADMS_WINRM.cmd", "保存 ADMS WinRM 设置脚本"))
+        tr.addWidget(self.btn_download_adms_setup)
+        self.btn_download_adms_restore = QPushButton("下载 ADMS 还原脚本")
+        self.btn_download_adms_restore.setIcon(app_icon("refresh"))
+        self.btn_download_adms_restore.setToolTip("保存 WinRM 还原脚本；仅删除 LocalAccountTokenFilterPolicy 并停止 WinRM，不修改任何账号、用户组或 RDP 权限。")
+        self.btn_download_adms_restore.clicked.connect(lambda: self._save_bundled_cmd("TARGET_RESTORE_ADMS_WINRM.cmd", "保存 ADMS 还原脚本"))
+        tr.addWidget(self.btn_download_adms_restore)
         self.btn_winrm_setup = QPushButton("WinRM 配置向导")
         self.btn_winrm_setup.setIcon(app_icon("settings"))
-        self.btn_winrm_setup.setToolTip("导出目标机 WinRM 标准准备脚本，或 ADMS 等本地管理员的 WinRM 准备/恢复脚本。")
+        self.btn_winrm_setup.setToolTip("查看其他 WinRM 准备方式和脚本内容。")
         self.btn_winrm_setup.clicked.connect(self._show_winrm_setup_guide)
         tr.addWidget(self.btn_winrm_setup); tr.addStretch(1); target_l.addLayout(tr)
 
@@ -358,10 +383,14 @@ class MainWindow(QMainWindow):
 
         remote, remote_l = card(
             "WinRM 连接与远程操作",
-            "正式业务全部通过 WinRM。实际顺序固定为：认证/目标预检查 → ① 结束目标进程 → ② 分发前 CMD（如 sys_ctl stop） → ③ 文件分发 → ④ 分发后 CMD（如 sys_ctl start fast）。",
+            "执行顺序：结束目标进程 → 分发前命令 → 文件分发 → 分发后命令。",
         )
         rt=QHBoxLayout(); self.remote_enabled=QCheckBox("启用分发前 / 后操作"); self.remote_enabled.setChecked(bool(self.settings.winrm_remote_actions_enabled)); self.remote_https=QCheckBox("HTTPS"); self.remote_port=QSpinBox(); self.remote_port.setRange(1,65535); self.remote_port.setValue(int(self.settings.winrm_port or 5985)); self.remote_https.toggled.connect(lambda c:self.remote_port.setValue(5986 if c else 5985)); self.remote_https.setChecked(bool(self.settings.winrm_use_https)); self.remote_port.setValue(int(self.settings.winrm_port or (5986 if self.remote_https.isChecked() else 5985)))
-        rt.addWidget(self.remote_enabled); rt.addWidget(self.remote_https); rt.addWidget(QLabel("WinRM 端口")); rt.addWidget(self.remote_port); rt.addStretch(1); remote_l.addLayout(rt)
+        self.remote_https.setVisible(False); self.remote_port.setVisible(False)
+        self.winrm_conn_summary = QLabel(); self.winrm_conn_summary.setObjectName("Muted")
+        self._refresh_winrm_connection_summary()
+        advanced_btn = QPushButton("高级连接…"); advanced_btn.clicked.connect(self._show_winrm_advanced_connection)
+        rt.addWidget(self.remote_enabled); rt.addWidget(self.winrm_conn_summary); rt.addWidget(advanced_btn); rt.addStretch(1); remote_l.addLayout(rt)
 
         pipeline = QFrame(); pipeline.setObjectName("SoftCard")
         pl = QVBoxLayout(pipeline); pl.setContentsMargins(14,12,14,12); pl.setSpacing(9)
@@ -434,13 +463,59 @@ class MainWindow(QMainWindow):
                 if obj: out.append(obj)
         return out
 
+    def _target_scope_display(self, hosts=None):
+        hosts = list(hosts if hosts is not None else self._selected_hosts())
+        if not hosts:
+            return "0 台", "当前没有勾选目标主机。"
+        labels=[]
+        details=[]
+        for h in hosts:
+            name=(h.name or h.host or "").strip()
+            shown=name if name and name != h.host else h.host
+            labels.append(shown)
+            details.append(f"{shown} ({h.host})" if shown != h.host else h.host)
+        preview="、".join(labels[:3])
+        if len(labels)>3:
+            preview += f" 等 {len(labels)} 台"
+        else:
+            preview = f"{len(labels)} 台：{preview}"
+        tooltip="当前勾选目标主机：\n" + "\n".join(f"• {x}" for x in details) + "\n\n同一条分发映射会应用到以上全部主机。"
+        return preview, tooltip
+
+    def _refresh_mapping_scope(self):
+        if not hasattr(self, "mapping_table"):
+            return
+        hosts = self._selected_hosts() if hasattr(self, "target_table") else []
+        enabled_mappings = self._mapping_rows(True)
+        host_count=len(hosts)
+        mapping_count=len(enabled_mappings)
+        execution_count=host_count * mapping_count
+        host_text, host_tip = self._target_scope_display(hosts)
+        if host_count:
+            summary=f"当前分发范围：{host_count} 台目标主机 × {mapping_count} 条启用映射 = {execution_count} 个主机映射执行项；{host_text}。"
+        else:
+            summary=f"当前分发范围：0 台目标主机；当前有 {mapping_count} 条启用映射。请先在下方勾选目标主机。"
+        if hasattr(self, "mapping_scope_label"):
+            self.mapping_scope_label.setText(summary)
+            self.mapping_scope_label.setToolTip(host_tip)
+        for r in range(self.mapping_table.rowCount()):
+            cell=QTableWidgetItem(host_text if host_count else "0 台")
+            cell.setToolTip(host_tip)
+            self.mapping_table.setItem(r,5,cell)
+
+    def _on_mapping_enabled_changed(self, *_):
+        self._refresh_mapping_scope()
+
     def _append_mapping(self, mapping: DistributionMapping):
         r=self.mapping_table.rowCount(); self.mapping_table.insertRow(r)
-        chk=QCheckBox(); chk.setChecked(True); self.mapping_table.setCellWidget(r,0,chk)
+        chk=QCheckBox(); chk.setChecked(True); chk.stateChanged.connect(self._on_mapping_enabled_changed); self.mapping_table.setCellWidget(r,0,chk)
+        scope_text, scope_tip = self._target_scope_display()
         vals=["SFTP" if mapping.source_type=="SFTP" else "本地", "目录" if mapping.source_kind=="DIR" else "文件", mapping.display_source(), mapping.target_path,
-              ("复制目录本身" if mapping.folder_mode=="SELF" else "复制目录内容") if mapping.source_kind=="DIR" else "文件", "待分发"]
+              scope_text, ("复制目录本身" if mapping.folder_mode=="SELF" else "复制目录内容") if mapping.source_kind=="DIR" else "文件", "待分发"]
         for c,v in enumerate(vals,1): self.mapping_table.setItem(r,c,QTableWidgetItem(v))
         self.mapping_table.item(r,3).setData(ROLE_HOST_OBJECT,mapping)
+        self.mapping_table.item(r,5).setToolTip(scope_tip)
+        self._refresh_mapping_scope()
         audit.operation(self.settings.audit_path,"MAPPING","ADD","SUCCESS","已添加分发映射。",subject=mapping.mapping_id,details=mapping.safe_dict())
 
     def _remote_drive_context_for_mapping(self):
@@ -514,18 +589,18 @@ class MainWindow(QMainWindow):
             d=MappingTargetDialog(self,target_path=m.target_path,is_directory=m.source_kind=="DIR",folder_mode=m.folder_mode, **self._mapping_dialog_kwargs())
             if not d.exec():return
             v=d.value();m.target_path=v["target_path"];m.folder_mode=v["folder_mode"]
-        self.mapping_table.setItem(r,1,QTableWidgetItem("SFTP" if m.source_type=="SFTP" else "本地"));self.mapping_table.setItem(r,2,QTableWidgetItem("目录" if m.source_kind=="DIR" else "文件"));src=QTableWidgetItem(m.display_source());src.setData(ROLE_HOST_OBJECT,m);self.mapping_table.setItem(r,3,src);self.mapping_table.setItem(r,4,QTableWidgetItem(m.target_path));self.mapping_table.setItem(r,5,QTableWidgetItem(("复制目录本身" if m.folder_mode=="SELF" else "复制目录内容") if m.source_kind=="DIR" else "文件"));self.mapping_table.setItem(r,6,QTableWidgetItem("待分发"))
-        audit.operation(self.settings.audit_path,"MAPPING","EDIT","SUCCESS","已修改分发映射。",subject=m.mapping_id,details=m.safe_dict());self.refresh_audit()
+        scope_text,scope_tip=self._target_scope_display(); self.mapping_table.setItem(r,1,QTableWidgetItem("SFTP" if m.source_type=="SFTP" else "本地"));self.mapping_table.setItem(r,2,QTableWidgetItem("目录" if m.source_kind=="DIR" else "文件"));src=QTableWidgetItem(m.display_source());src.setData(ROLE_HOST_OBJECT,m);self.mapping_table.setItem(r,3,src);self.mapping_table.setItem(r,4,QTableWidgetItem(m.target_path));scope_item=QTableWidgetItem(scope_text);scope_item.setToolTip(scope_tip);self.mapping_table.setItem(r,5,scope_item);self.mapping_table.setItem(r,6,QTableWidgetItem(("复制目录本身" if m.folder_mode=="SELF" else "复制目录内容") if m.source_kind=="DIR" else "文件"));self.mapping_table.setItem(r,7,QTableWidgetItem("待分发"))
+        self._refresh_mapping_scope(); audit.operation(self.settings.audit_path,"MAPPING","EDIT","SUCCESS","已修改分发映射。",subject=m.mapping_id,details=m.safe_dict());self.refresh_audit()
 
     def _delete_mapping(self):
         r=self._selected_mapping_row()
         if r>=0:
-            m=self.mapping_table.item(r,3).data(ROLE_HOST_OBJECT); self.mapping_table.removeRow(r)
+            m=self.mapping_table.item(r,3).data(ROLE_HOST_OBJECT); self.mapping_table.removeRow(r); self._refresh_mapping_scope()
             if m:audit.operation(self.settings.audit_path,"MAPPING","DELETE","SUCCESS","已删除分发映射。",subject=m.mapping_id,details=m.safe_dict());self.refresh_audit()
 
     def _clear_mappings(self):
         if self.mapping_table.rowCount() and QMessageBox.question(self,"清空映射","确定清空当前所有分发映射吗？")!=QMessageBox.Yes:return
-        self.mapping_table.setRowCount(0);audit.operation(self.settings.audit_path,"MAPPING","CLEAR","SUCCESS","已清空当前分发映射。");self.refresh_audit()
+        self.mapping_table.setRowCount(0); self._refresh_mapping_scope(); audit.operation(self.settings.audit_path,"MAPPING","CLEAR","SUCCESS","已清空当前分发映射。");self.refresh_audit()
 
     def _selected_hosts(self):
         out=[]
@@ -537,9 +612,58 @@ class MainWindow(QMainWindow):
         return out
 
     def _set_all_targets(self,checked):
+        # 批量切换时只落盘一次，避免每个复选框都重复写 settings.json。
+        self._suppress_target_selection_persist = True
+        try:
+            for r in range(self.target_table.rowCount()):
+                w=self.target_table.cellWidget(r,0)
+                if w:w.setChecked(checked)
+        finally:
+            self._suppress_target_selection_persist = False
+        self._save_all_target_selection_preferences()
+        self._refresh_mapping_scope()
+
+    def _on_target_check_changed(self, host: str, checked: bool):
+        """Persist one target-host checkbox without ever storing credentials/secrets."""
+        if self._suppress_target_selection_persist:
+            return
+        checks = dict(getattr(self.settings, "distribution_target_checks", {}) or {})
+        checks[str(host).strip()] = bool(checked)
+        self.settings.distribution_target_checks = checks
+        # A real user selection means the one-time first-launch default has been consumed.
+        self.settings.distribution_target_selection_initialized = True
+        try:
+            self.settings.save()
+        except Exception as exc:
+            logging.getLogger("fds.settings").warning("保存目标主机选择状态失败：%s", exc)
+        self._refresh_mapping_scope()
+
+    def _save_all_target_selection_preferences(self):
+        """Persist the current distribution-target checkbox map.
+
+        First-ever initialization is intentionally different: when no saved selection exists yet,
+        every existing host is checked. From then on we restore exactly the user's last choices;
+        newly discovered hosts default to unchecked until the user explicitly selects them.
+        """
+        if not hasattr(self, "target_table"):
+            return
+        current = dict(getattr(self.settings, "distribution_target_checks", {}) or {})
+        rows = 0
         for r in range(self.target_table.rowCount()):
-            w=self.target_table.cellWidget(r,0)
-            if w:w.setChecked(checked)
+            host_item = self.target_table.item(r, 2)
+            chk = self.target_table.cellWidget(r, 0)
+            if host_item and chk:
+                host = host_item.text().strip()
+                if host:
+                    current[host] = bool(chk.isChecked())
+                    rows += 1
+        self.settings.distribution_target_checks = current
+        if rows:
+            self.settings.distribution_target_selection_initialized = True
+        try:
+            self.settings.save()
+        except Exception as exc:
+            logging.getLogger("fds.settings").warning("保存目标主机选择状态失败：%s", exc)
 
     def _load_default_winrm_credential(self):
         """Load the remembered default credential from Windows Credential Manager."""
@@ -736,6 +860,49 @@ class MainWindow(QMainWindow):
         if not hosts:QMessageBox.warning(self,"在线测试","请先至少勾选一台目标主机。");return
         self._start_host_status_test([h.host for h in hosts],"distribution")
 
+    def _save_bundled_cmd(self, name: str, title: str):
+        source = script_path(name)
+        if not source.exists():
+            QMessageBox.critical(self, title, f"脚本资源缺失：\n{name}")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, title, name, "Windows CMD (*.cmd);;所有文件 (*)")
+        if not path:
+            return
+        if not path.lower().endswith(".cmd"):
+            path += ".cmd"
+        try:
+            Path(path).write_bytes(source.read_bytes())
+            QMessageBox.information(self, title, f"脚本已保存：\n{path}\n\n请复制到目标 Windows，并以管理员身份运行。")
+        except Exception as e:
+            QMessageBox.critical(self, title, f"保存脚本失败：\n{e}")
+
+    def _refresh_winrm_connection_summary(self):
+        if not hasattr(self, "winrm_conn_summary"):
+            return
+        scheme = "HTTPS" if self.remote_https.isChecked() else "HTTP"
+        self.winrm_conn_summary.setText(f"WinRM：{scheme} {self.remote_port.value()}")
+
+    def _show_winrm_advanced_connection(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("WinRM 高级连接")
+        dlg.setModal(True)
+        lay = QVBoxLayout(dlg)
+        note = QLabel("一般情况下保持 HTTP 5985 即可。只有现场已经配置 WinRM HTTPS Listener 时才需要修改。")
+        note.setWordWrap(True); note.setObjectName("Muted"); lay.addWidget(note)
+        form = QFormLayout()
+        https = QCheckBox("使用 HTTPS")
+        https.setChecked(self.remote_https.isChecked())
+        port = QSpinBox(); port.setRange(1,65535); port.setValue(self.remote_port.value())
+        https.toggled.connect(lambda checked: port.setValue(5986 if checked else 5985))
+        form.addRow("连接方式", https); form.addRow("端口", port); lay.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("确定"); buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(dlg.accept); buttons.rejected.connect(dlg.reject); lay.addWidget(buttons)
+        if dlg.exec() == QDialog.Accepted:
+            self.remote_https.setChecked(https.isChecked())
+            self.remote_port.setValue(port.value())
+            self._refresh_winrm_connection_summary()
+
     def _show_winrm_setup_guide(self):
         WinRMSetupDialog(self).exec()
 
@@ -871,7 +1038,8 @@ class MainWindow(QMainWindow):
         targets=len(set(m.target_path for m in mappings))
         default_count=sum(1 for _,_,src in credentials.values() if src=="默认凭据")
         custom_count=len(credentials)-default_count
-        msg=(f"分发映射：{len(mappings)} 条\n目标目录：{targets} 个\n目标主机：{len(hosts)} 台\n"
+        host_lines="\n".join(f"  • {(h.name or h.host)} ({h.host})" if (h.name or h.host) != h.host else f"  • {h.host}" for h in hosts)
+        msg=(f"分发映射：{len(mappings)} 条\n目标目录：{targets} 个\n目标主机：{len(hosts)} 台\n{host_lines}\n"
              f"凭据：默认 {default_count} 台 / 自定义 {custom_count} 台\n"
              f"备份目录：{self.backup_root.text().strip() or '各目标目录\\.fds_backup'}\n"
              f"校验策略：{'文件大小 + SHA256' if self.chk_verify.isChecked() else '文件大小'}\n"
@@ -883,7 +1051,16 @@ class MainWindow(QMainWindow):
              "所有主机会执行同一套映射，但每台主机会使用自己的有效 WinRM 凭据。"
              "本操作可能结束远程进程并覆盖目标文件。\n确定继续吗？")
         if QMessageBox.question(self,"确认分发",msg)!=QMessageBox.Yes:return
-        self._append_log("开始执行多源多目标分发任务……");self.btn_start.setEnabled(False);self.btn_cancel.setEnabled(True);self.overall.setValue(0);self._set_busy(True,"正在分发")
+        self._append_log("开始执行多源多目标分发任务……")
+        self.btn_start.setEnabled(False); self.btn_cancel.setEnabled(True)
+        self.overall.setFormat("%p%")
+        self.overall.setValue(0)
+        # 进度条表示完整主机工作流，而不是仅表示文件数量。文件全部上传完成时最多到 90%，
+        # 每台主机的分发后 CMD / 收尾完成后逐步到 99%，只有 completed 信号到达才显示 100%。
+        self._dist_progress_hosts = {h.host: 0.0 for h in hosts}
+        self._dist_progress_finished = set()
+        self._dist_progress_host_count = max(1, len(hosts))
+        self._set_busy(True,"正在分发")
         audit.operation(
             self.settings.audit_path,"TASK","USER_START","SUCCESS","用户确认开始多源多目标分发。",
             details={"mappings":[m.safe_dict() for m in mappings],"hosts":[h.host for h in hosts],
@@ -902,24 +1079,56 @@ class MainWindow(QMainWindow):
     def _cancel_distribution(self):
         if self.distribution_thread:self.distribution_thread.cancel();self._append_log("已请求取消当前任务……")
     def _append_log(self,text):self.dist_log.appendPlainText(f"{datetime.now().strftime('%H:%M:%S')}  {text}");logging.getLogger("fds.ui").info(text)
-    def _dist_prepared(self,task_id,files,total_bytes):self._append_log(f"{task_id}：{files} 个文件，共 {human_bytes(total_bytes)}")
+    def _dist_prepared(self,task_id,files,total_bytes):
+        self._append_log(f"{task_id}：{files} 个文件，共 {human_bytes(total_bytes)}")
+        if self.overall.value() < 5:
+            self.overall.setValue(5)
+
+    def _refresh_distribution_progress(self):
+        hosts = getattr(self, "_dist_progress_hosts", {})
+        count = max(1, int(getattr(self, "_dist_progress_host_count", len(hosts) or 1)))
+        file_ratio = sum(max(0.0, min(1.0, float(v))) for v in hosts.values()) / count
+        finished_ratio = len(getattr(self, "_dist_progress_finished", set())) / count
+        # 文件处理占 5~90%，完整主机收尾（包含分发后 CMD）占 90~99%。
+        value = int(5 + file_ratio * 85 + finished_ratio * 9)
+        self.overall.setValue(max(self.overall.value(), min(99, value)))
+
     def _host_status(self,host,status,detail):
         for r in range(self.target_table.rowCount()):
-            if self.target_table.item(r,2).text()==host:self.target_table.setItem(r,7,QTableWidgetItem(f"{status_text(status)} {detail}".strip()));break
+            if self.target_table.item(r,2).text()==host:
+                self.target_table.setItem(r,7,QTableWidgetItem(f"{status_text(status)} {detail}".strip()));break
+        if status in {"SUCCESS", "FAILED", "CANCELLED"}:
+            if hasattr(self, "_dist_progress_finished"):
+                self._dist_progress_finished.add(host)
+                self._refresh_distribution_progress()
     def _mapping_status(self,mapping_id,status,detail):
         for r in range(self.mapping_table.rowCount()):
             item=self.mapping_table.item(r,3)
             m=item.data(ROLE_HOST_OBJECT) if item else None
             if m and m.mapping_id==mapping_id:
                 label={"PREPARING":"准备中","READY":"已准备","SUCCESS":"成功","FAILED":"失败","PARTIAL_FAILED":"部分失败","CANCELLED":"已取消"}.get(status,status)
-                cell=QTableWidgetItem(f"{label} {detail}".strip());self.mapping_table.setItem(r,6,cell);break
+                cell=QTableWidgetItem(f"{label} {detail}".strip());self.mapping_table.setItem(r,7,cell);break
     def _file_progress(self,host,i,total,rel,status):
-        if total:self.overall.setValue(min(100,int(i*100/total)))
-        if status=="FAILED":self._append_log(f"[{host}] 分发失败：{rel}")
+        if total and hasattr(self, "_dist_progress_hosts"):
+            self._dist_progress_hosts[host] = max(0.0, min(1.0, float(i) / float(total)))
+            self._refresh_distribution_progress()
+        if status=="FAILED":
+            self._append_log(f"[{host}] 分发失败：{rel}")
+
     def _dist_completed(self,status,success,failed):
-        self.btn_start.setEnabled(True);self.btn_cancel.setEnabled(False);self._set_busy(False)
-        if status=="SUCCESS":self.overall.setValue(100)
-        self._append_log(f"任务完成：{status_text(status)}，成功主机={success}，失败主机={failed}");self.refresh_history();self.refresh_audit();QMessageBox.information(self,"文件分发",f"状态：{status_text(status)}\n成功主机：{success}\n失败主机：{failed}\n\n详细记录请查看“分发历史”和“审计日志”。")
+        self.btn_start.setEnabled(True); self.btn_cancel.setEnabled(False); self._set_busy(False)
+        # 100% 只在整个任务真正结束时出现：此时所有主机的文件、分发后 CMD 和审计收尾均已完成。
+        self.overall.setValue(100)
+        if status == "SUCCESS":
+            self.overall.setFormat("100% · 已完成")
+        elif status == "CANCELLED":
+            self.overall.setFormat("100% · 已结束（已取消）")
+        else:
+            self.overall.setFormat("100% · 已结束（有失败）")
+        self._append_log(f"任务完成：{status_text(status)}，成功主机={success}，失败主机={failed}")
+        self.refresh_history(); self.refresh_audit()
+        QApplication.processEvents()  # 先让用户真正看到 100%，再弹出最终结果。
+        QMessageBox.information(self,"文件分发",f"状态：{status_text(status)}\n成功主机：{success}\n失败主机：{failed}\n\n详细记录请查看“分发历史”和“审计日志”。")
 
     # ---------- Inventory ----------
     def _build_inventory_page(self):
@@ -954,6 +1163,8 @@ class MainWindow(QMainWindow):
         target_check_state = {}
         target_had_rows = False
         target_scroll = 0
+        persisted_target_checks = dict(getattr(self.settings, "distribution_target_checks", {}) or {})
+        target_selection_initialized = bool(getattr(self.settings, "distribution_target_selection_initialized", False))
         if hasattr(self,"target_table"):
             target_had_rows = self.target_table.rowCount() > 0
             target_scroll = self.target_table.verticalScrollBar().value()
@@ -987,13 +1198,19 @@ class MainWindow(QMainWindow):
             self.target_table.setRowCount(len(hosts))
             for r,h in enumerate(hosts):
                 chk=QCheckBox()
-                # 首次进入页面保持历史行为：默认勾选全部主机。
-                # 之后任何刷新都按主机/IP恢复原勾选状态；刷新过程中新增的主机默认不勾选，
-                # 避免在用户已明确选择目标后把新主机意外加入分发。
+                # v0.6.20：目标主机选择跨启动持久化。
+                # 1) 当前会话已有表格时，刷新只恢复当前会话状态；
+                # 2) 新启动且已有历史记录时，恢复上次每台主机的勾选状态；
+                # 3) 真正第一次初始化时，所有已有目标主机默认全部勾选；
+                # 4) 初始化之后新发现的主机默认不勾选，防止意外加入正式分发。
                 if h.host in target_check_state:
-                    chk.setChecked(target_check_state[h.host])
+                    checked = target_check_state[h.host]
+                elif target_selection_initialized:
+                    checked = bool(persisted_target_checks.get(h.host, False))
                 else:
-                    chk.setChecked(not target_had_rows)
+                    checked = True
+                chk.setChecked(checked)
+                chk.stateChanged.connect(lambda state, host=h.host: self._on_target_check_changed(host, state == Qt.Checked.value))
                 self.target_table.setCellWidget(r,0,chk)
                 item=QTableWidgetItem(h.name); item.setData(ROLE_HOST_OBJECT,h); self.target_table.setItem(r,1,item)
                 self.target_table.setItem(r,2,QTableWidgetItem(h.host)); self.target_table.setItem(r,3,QTableWidgetItem(group_text(h.group_name)))
@@ -1001,6 +1218,11 @@ class MainWindow(QMainWindow):
                 online=QTableWidgetItem(online_status_text(h.online_status)); online.setToolTip(f"Ping={'是' if h.ping_ok else '否'}，445={'是' if h.smb_port_ok else '否'}，3389={'是' if h.rdp_port_ok else '否'}，WinRM={'是' if h.winrm_port_ok else '否'}\n最后测试：{h.last_test_at or '未测试'}"); self.target_table.setItem(r,5,online)
                 self.target_table.setItem(r,6,QTableWidgetItem(winrm_status_label(h.winrm_status))); self.target_table.setItem(r,7,QTableWidgetItem(""))
             self.target_table.verticalScrollBar().setValue(target_scroll)
+            # 首次初始化：只有实际存在主机时才消费“一次性默认全选”规则。
+            # 这样全新安装若尚未发现任何主机，首次发现主机后仍会默认全部勾选。
+            if hosts and not target_selection_initialized:
+                self._save_all_target_selection_preferences()
+            self._refresh_mapping_scope()
 
     def _add_host(self):
         d=HostEditDialog(self)
@@ -1346,12 +1568,20 @@ class MainWindow(QMainWindow):
 
         c,l=card(
             "WinRM 常用命令",
-            "正式文件上传、目录创建、备份、校验、结束进程和 CMD/PowerShell 均使用 WinRM。下面命令用于目标 Windows 的 WinRM 初始化、状态检查和服务本身的启停控制。",
+            "目标机首次使用时先启用 WinRM。软件提供的设置/还原脚本只处理 WinRM 和 LocalAccountTokenFilterPolicy，不会修改 ADMS 或任何 Windows 账号、用户组、RDP 权限。",
         )
         service_box=QPlainTextEdit(); service_box.setReadOnly(True); service_box.setPlainText(WINRM_SERVICE_HELP); service_box.setMinimumHeight(300)
         l.addWidget(service_box)
         row=QHBoxLayout(); copy_service=QPushButton("复制 WinRM 命令"); copy_service.clicked.connect(lambda: self._copy_help_text(WINRM_SERVICE_HELP)); setup=QPushButton("打开 WinRM 配置向导"); setup.clicked.connect(self._show_winrm_setup_guide); row.addWidget(copy_service); row.addWidget(setup); row.addStretch(1); l.addLayout(row)
         root.addWidget(c)
+
+        a,la=card(
+            "ADMS 账号与管理员组（手工）",
+            "这里只保留 WinRM 真正需要关注的账号检查：确认 ADMS 存在，并确认它是否属于本地 Administrators。若 ADMS 已在 Administrators 中，通常无需再加入 Remote Desktop Users；软件不会自动修改任何账号或用户组。",
+        )
+        account_box=QPlainTextEdit(); account_box.setReadOnly(True); account_box.setPlainText(ADMS_ACCOUNT_HELP); account_box.setMinimumHeight(300); la.addWidget(account_box)
+        account_row=QHBoxLayout(); copy_account=QPushButton("复制 ADMS 检查命令"); copy_account.clicked.connect(lambda: self._copy_help_text(ADMS_ACCOUNT_HELP)); account_row.addWidget(copy_account); account_row.addStretch(1); la.addLayout(account_row)
+        root.addWidget(a)
 
         u,l2=card(
             "本地管理员 / Remote UAC",
@@ -1370,9 +1600,9 @@ class MainWindow(QMainWindow):
 
         b,lb=card(
             "远程目录浏览器",
-            "v0.6.9 起，配置目标目录时可以点击“浏览远程目录”。程序会在当前应用内通过 WinRM 只读读取参考目标主机的盘符和目录树，不会弹出目标机桌面窗口，也不使用 SMB/C$/D$/E$。目录按需懒加载：只有展开某个盘符或目录时才读取下一层，避免扫描整盘。",
+            "配置目标目录时可以点击“浏览远程目录”。目录树仍只读取一台参考主机，但现在会额外显示当前全部已勾选目标主机，并可一键只读检查所选路径在每台主机上的存在情况。不会弹出目标机桌面窗口，也不使用 SMB/C$/D$/E$。",
         )
-        browser_help=QLabel("多主机：目录树只浏览你选择的“参考主机”，最终选择的真实 Windows 路径仍会在正式分发前对所有勾选主机逐台执行写入与空间预检查。遇到无权限目录时只提示读取失败，不会修改远程目录。")
+        browser_help=QLabel("多主机：路径覆盖表会显示“已存在 / 目录未创建 / 盘符不存在 / 检查失败”。同一映射始终应用到当前全部勾选主机；目录未创建时正式预检查会按现有逻辑尝试创建，盘符不存在则该主机会失败。分发映射表还会直接显示当前目标主机数量和名称。")
         browser_help.setWordWrap(True); browser_help.setObjectName("Muted"); lb.addWidget(browser_help); root.addWidget(b)
 
         p,lp=card(
@@ -1454,6 +1684,8 @@ class MainWindow(QMainWindow):
         self.settings.save()
 
     def closeEvent(self,event):
+        try: self._save_all_target_selection_preferences()
+        except Exception: pass
         try: self._save_remote_action_preferences()
         except Exception: pass
         try: self._save_default_winrm_credential(show_error=False)

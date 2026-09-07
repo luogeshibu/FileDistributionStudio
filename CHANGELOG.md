@@ -1,3 +1,84 @@
+## v0.6.29 - 2026-09-07
+
+- 修复 `TARGET_PREP_ADMS_WINRM.cmd` 中 WinRM 初始化后脚本不继续执行的问题：`winrm` 在 Windows 中由 `winrm.cmd` 提供，批处理内改为 `call winrm quickconfig -quiet`，确保控制流返回并继续执行后续 `sc` 和 `reg add`。
+- WinRM 设置脚本增加分步状态输出，并对 WinRM 服务运行状态和 `LocalAccountTokenFilterPolicy=1` 做最终验证。
+- WinRM 恢复脚本增加分步状态输出；注册表值不存在时视为无需处理，停止 WinRM 后验证服务状态。
+- 两个脚本末尾统一显示 `SUCCESS` / `FAILED` 总结，并使用 `pause` 保持窗口不退出。
+- 不新增账号、用户组或 RDP 权限修改逻辑。
+
+## v0.6.28 - 2026-09-07
+
+- 简化“使用帮助 → ADMS 账号与管理员组”命令：Administrators 查询/加入/复查均直接使用内置 SID `S-1-5-32-544`，不再定义 `$g` 变量。
+- `TARGET_PREP_ADMS_WINRM.cmd` 保持原有极简业务动作不变；`LocalAccountTokenFilterPolicy=1` 使用单行 `reg add ... /d 1 /f` 执行，避免 CMD 多行续行复制带来的歧义。
+- 设置脚本末尾仅增加完成提示和 `pause`，不新增检查、账号、用户组、RDP 或其他修改逻辑。
+
+## v0.6.27-zh-CN - 2026-09-07
+
+- 简化“使用帮助 → ADMS 账号与管理员组（手工）”模块。
+- 移除 Remote Desktop Users（SID `S-1-5-32-555`）查询和加入命令，避免把 RDP 组权限与 WinRM 管理权限混在一起。
+- 帮助区只保留 3 个步骤：查看 ADMS、查看本地 Administrators、必要时手工加入 Administrators。
+- 明确说明：ADMS 已属于 Administrators 时，通常无需再加入 Remote Desktop Users；账号/用户组命令仍只用于手工操作，一键脚本不会执行。
+- 缩短帮助文本框高度，减少页面占用。
+- 正式文件分发、WinRM、Remote UAC、主机管理、审计及其他业务逻辑均未修改。
+
+## v0.6.26-zh-CN - 2026-09-07
+
+- 修正 `TARGET_PREP_ADMS_WINRM.cmd` 中 `LocalAccountTokenFilterPolicy` 的值：正式 ADMS 本地管理员 WinRM 模式应设置为 `1`，不是 `0`。
+- ADMS 设置脚本继续保持极简：仅 `winrm quickconfig -quiet`、WinRM 自动启动/启动服务、`LocalAccountTokenFilterPolicy=1`；不读取、不创建、不启用/禁用、不加组、不移组，也不修改 RDP。
+- ADMS 还原脚本保持不变：仅删除 `LocalAccountTokenFilterPolicy` 并停止 WinRM。
+- 主界面/配置向导/当前文档同步修正为 `LocalAccountTokenFilterPolicy=1`，避免与帮助中的正确管理员令牌说明冲突。
+- 保留 v0.6.25 的多目标主机远程目录浏览/路径范围提示与其他业务逻辑，不做额外业务改动。
+
+## v0.6.24
+
+- “使用帮助”新增 **ADMS 账号检查与管理员组（手工操作）**，包含：`net user ADMS`、按 SID 查看本地 Administrators、手工将 ADMS 加入 Administrators、查看/可选加入 Remote Desktop Users。
+- 明确区分“帮助中的手工账号命令”和“一键 WinRM 脚本”：应用脚本不会执行任何账号、用户组或 RDP 变更。
+- `TARGET_PREP_ADMS_WINRM.cmd` 简化为仅执行 WinRM 初始化/启动和 `LocalAccountTokenFilterPolicy=0`。
+- `TARGET_RESTORE_ADMS_WINRM.cmd` 简化为仅删除 `LocalAccountTokenFilterPolicy` 并停止 WinRM。
+- 其余文件分发、WinRM 远程操作、凭据、选择记忆、进度、审计等业务逻辑不变。
+
+# v0.6.23
+
+- 按现场要求极简化 ADMS WinRM 设置/还原脚本；不再读取、检查、启用、禁用或修改 ADMS 账号，也不修改任何用户组、RDP 权限或其他账号策略。
+- `TARGET_PREP_ADMS_WINRM.cmd` 现在只执行 WinRM 启用/启动，并显式设置 `LocalAccountTokenFilterPolicy=0`。
+- `TARGET_RESTORE_ADMS_WINRM.cmd` 现在只删除 `LocalAccountTokenFilterPolicy` 并停止 WinRM；不会修改 WinRM 启动类型，也不会修改任何 ADMS 相关状态。
+- 主程序其他业务逻辑保持 v0.6.22 不变。
+
+# v0.6.22-zh-CN
+
+- 修复 ADMS 初始化脚本可能间接改变 RDP 授权行为的风险：新版 `TARGET_PREP_ADMS_WINRM.cmd` 不再自动启用/禁用 ADMS，也不再自动把 ADMS 加入本地 Administrators；只验证 ADMS 已启用且已是本地管理员，然后配置 WinRM HTTP 5985 与 `LocalAccountTokenFilterPolicy=1`。
+- 准备脚本明确不修改 Remote Desktop Users 或任何 RDP 登录策略。
+- 新版 `TARGET_RESTORE_ADMS_WINRM.cmd` 继续删除 `LocalAccountTokenFilterPolicy` 恢复 Windows 默认 Remote UAC，并兼容读取旧版 `ADMS_WinRM.before.txt`：若旧脚本曾改变 ADMS 启用状态或 Administrators 成员关系，可按旧快照恢复。
+- 使用 v2 状态文件 `ADMS_WinRM.before.v2.txt` 记录新版 Remote UAC 基线，避免复用陈旧旧版快照。
+- 其余 WinRM-only 分发、进程/CMD、凭据、选择记忆、进度与审计逻辑保持不变。
+
+# v0.6.21-zh-CN
+
+- 简化“Windows 目标主机”和“WinRM 连接与远程操作”的用户说明：主界面只保留必要信息，默认显示 `WinRM：HTTP 5985`；HTTPS/自定义端口移到“高级连接…”中。
+- “Windows 目标主机”区域新增“下载 ADMS 设置脚本”和“下载 ADMS 还原脚本”，无需先进入配置向导即可直接保存两个 CMD。
+- 修复 `TARGET_RESTORE_ADMS_WINRM.cmd`：还原脚本现在会恢复记录的 ADMS 启用/管理员成员状态，并明确把 `LocalAccountTokenFilterPolicy` 删除，恢复 Windows 默认 Remote UAC 行为；随后再次查询验证该值确实不存在，否则报错。
+- 还原成功后删除旧的 `ADMS_WinRM.before.txt` 状态文件，避免下一次重新准备时继续复用陈旧备份。WinRM 服务保持启用，仅重启一次以应用新会话策略。
+- 配置向导文字同步精简；设置脚本仍不会创建 ADMS 或修改密码。
+- 其余 v0.6.20 的 WinRM-only 文件分发、目标主机选择记忆、进程/CMD、凭据、进度、审计和 Git 行为不变。
+
+# v0.6.20-zh-CN
+
+- Windows 目标主机复选框现在会跨程序启动记住上一次选择。第一次初始化且已有主机时默认全部勾选；此后重新打开程序按主机/IP精确恢复上次的勾选/取消状态。
+- 首次初始化时如果主机列表为空，不会提前消费“默认全选”；首次发现/添加主机后仍默认全部勾选。
+- 已经存在选择历史后，新发现或新增的主机默认不勾选，避免用户未确认的新机器自动进入正式分发范围。
+- “全选 / 取消全选”和单机勾选都会立即保存选择状态；普通刷新、在线测试、WinRM 测试、主机名验证等刷新不会改变选择。
+- 选择记录只保存主机/IP与布尔勾选状态到 `settings.json`，不涉及密码或其他敏感凭据。
+- 其余 WinRM-only 分发、进程/CMD、凭据、审计、进度与 ADMS 一键准备逻辑保持 v0.6.19 不变。
+
+# v0.6.19-zh-CN
+
+- 修正分发总进度语义：文件全部上传/校验完成时不再提前显示 100%；文件阶段最多推进到 90%，每台主机完成分发后 CMD/收尾后最多到 99%，只有整个任务 completed 信号到达、审计收尾完成时才显示 100% 并弹出最终结果。失败/取消也只在工作流真正结束时显示 100%，同时在进度文字中标明最终状态。
+- WinRM 配置向导新增默认“ADMS 一键准备（推荐）”模式，并新增 `TARGET_PREP_ADMS_WINRM.cmd`：只针对目标机**已存在**的本地 ADMS 账号，不创建账号、不修改密码；会记录原状态，必要时启用 ADMS、加入本地 Administrators、执行 `winrm quickconfig`、设置 WinRM 自动启动/启动服务、设置 `LocalAccountTokenFilterPolicy=1`，最后检查 Listener/5985。
+- 新增 `TARGET_RESTORE_ADMS_WINRM.cmd`：按首次准备前记录的状态恢复 ADMS 是否启用、是否属于 Administrators 以及 `LocalAccountTokenFilterPolicy`；WinRM 服务保持启用，避免误中断正在使用的远程管理通道。
+- 配置向导导出 `.cmd` 时改为直接复制经过验证的资源字节，确保仍为 ASCII + CRLF + 无 BOM，不再由 GUI 重新写成带 BOM 的 UTF-8。
+- 启动 Splash 不再显示个人作者信息；保留 NARI、国际业务部 / International Business Division 和动态版本号。
+- 不加入此前暂缓的“远程 GUI 自动点击/结果文件回收”需求，正式目标侧业务仍为 WinRM-only。
+
 # v0.6.18-zh-CN
 
 - 修复 Windows `cmd.exe` 执行 `setup.bat` 时出现大量“不是内部或外部命令”的问题：根因是仓库中的 `.bat/.cmd` 使用 LF 行尾并包含 UTF-8 中文文本，Windows 批处理解析在部分环境下会把字节/行错误拆成命令。

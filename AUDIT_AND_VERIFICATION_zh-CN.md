@@ -204,3 +204,10 @@ WinRM 用户名可持久化；密码若选择“记住”仅进入 Windows 凭�
 ## v0.6.4 WinRM 流式上传
 
 文件内容不再进入 PowerShell 命令文本，而是经 WSMan/WinRS stdin 发送原始二进制。远端接收器以 `FileMode.Create` 写入任务临时文件，结束后返回 `FDS_UPLOAD_OK`。随后沿用原有临时文件大小/SHA256校验、备份、正式提交和最终文件校验链路。
+
+
+## v0.6.24：WinRM 脚本与账号权限边界
+
+应用提供的 `TARGET_PREP_ADMS_WINRM.cmd` 只启用/启动 WinRM 并设置 `LocalAccountTokenFilterPolicy=1`；`TARGET_RESTORE_ADMS_WINRM.cmd` 只删除该注册表值并停止 WinRM。两个脚本都不会读取、创建、启用、禁用或修改 ADMS，也不会修改 Administrators、Remote Desktop Users 或 RDP 登录权限。
+
+如需现场手工检查 ADMS，请在“使用帮助 → ADMS 账号检查与管理员组（手工操作）”查看 `net user ADMS`、Administrators 成员查询以及手工加入命令。

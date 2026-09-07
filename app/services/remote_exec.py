@@ -492,6 +492,40 @@ $items | ConvertTo-Json -Compress
             out.append({"name": name, "path": full})
         return out
 
+    def directory_info(self, path: str) -> dict:
+        """只读检查目标 Windows 目录是否已存在以及所属盘符是否存在。
+
+        供多主机目标路径覆盖检查使用；不会创建目录、文件或写入探针。
+        """
+        raw = (path or "").strip().replace("/", "\\")
+        if not re.match(r"^[A-Za-z]:\\(?:.*)?$", raw):
+            raise ValueError(f"远程目录必须是绝对 Windows 路径：{path}")
+        p = self.ps_quote(raw)
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+$p = {p}
+$root = [IO.Path]::GetPathRoot($p)
+$driveExists = [IO.Directory]::Exists($root)
+$exists = [IO.Directory]::Exists($p)
+[pscustomobject]@{{
+    Path = $p
+    Exists = [bool]$exists
+    DriveExists = [bool]$driveExists
+}} | ConvertTo-Json -Compress
+"""
+        r = self.run_ps(script)
+        self._require_success(r, f"检查远程目录 {raw}")
+        text = (r.get("stdout") or "").strip()
+        try:
+            data = json.loads((text.splitlines() or ["{}"])[-1])
+        except Exception as e:
+            raise RuntimeError(f"解析远程目录状态失败：{raw}；返回：{text}") from e
+        return {
+            "path": raw,
+            "exists": bool(data.get("Exists", False)),
+            "drive_exists": bool(data.get("DriveExists", False)),
+        }
+
     def list_processes(self) -> list[dict]:
         """只读列出目标 Windows 当前进程，供 GUI 远程进程选择器使用。
 

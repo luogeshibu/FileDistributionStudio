@@ -1,3 +1,4 @@
+from pathlib import Path
 from .widgets import PasswordLineEdit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -6,7 +7,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QComboBox,
     QDialogButtonBox, QTextEdit, QTableWidget, QTableWidgetItem,
     QHeaderView, QTabWidget, QLabel, QFrame, QCheckBox, QSpinBox, QMessageBox,
-    QPushButton, QFileDialog, QApplication, QTreeWidget, QTreeWidgetItem
+    QPushButton, QFileDialog, QApplication, QTreeWidget, QTreeWidgetItem, QAbstractItemView
 )
 from ..models import HostRecord
 from .. import db
@@ -336,8 +337,56 @@ class RemoteDirectoryQueryThread(QThread):
             })
 
 
+class RemotePathCoverageThread(QThread):
+    """只读检查同一目标目录在所有当前目标主机上的存在情况。"""
+    completed = Signal(object)
+
+    def __init__(self, contexts: list[dict], *, path: str, use_https=False, port=5985, max_workers=4):
+        super().__init__()
+        self.contexts = list(contexts or [])
+        self.path = (path or "").strip().replace("/", "\\")
+        self.use_https = bool(use_https)
+        self.port = int(port)
+        self.max_workers = max(1, min(8, int(max_workers)))
+
+    def run(self):
+        results = {}
+        errors = {}
+
+        def one(ctx):
+            host = ctx.get("host", "")
+            plan = RemoteActionPlan(
+                enabled=False,
+                use_https=self.use_https,
+                port=self.port,
+                username=ctx.get("username", ""),
+                password=ctx.get("password", ""),
+                command_timeout=25,
+            )
+            try:
+                info = WinRMExecutor(host, plan).directory_info(self.path)
+                return host, info, ""
+            except Exception as exc:
+                return host, {}, describe_winrm_failure(host, plan, exc)
+
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, max(1, len(self.contexts)))) as ex:
+            futures = [ex.submit(one, ctx) for ctx in self.contexts]
+            for fut in as_completed(futures):
+                host, info, error = fut.result()
+                if error:
+                    errors[host] = error
+                else:
+                    results[host] = info
+        self.completed.emit({
+            "path": self.path,
+            "results": results,
+            "errors": errors,
+            "total": len(self.contexts),
+        })
+
+
 class RemoteDirectoryBrowserDialog(QDialog):
-    """在本 App 内通过 WinRM 只读浏览远程 Windows 目录树。"""
+    """在本 App 内通过 WinRM 只读浏览远程 Windows 目录树，并显示多主机路径覆盖。"""
     ROLE_PATH = Qt.UserRole + 21
     ROLE_KIND = Qt.UserRole + 22
     ROLE_LOADED = Qt.UserRole + 23
@@ -349,10 +398,14 @@ class RemoteDirectoryBrowserDialog(QDialog):
         self.use_https = bool(use_https)
         self.port = int(port)
         self._thread = None
+        self._coverage_thread = None
         self._loading_item = None
+        self._coverage_path = ""
+        self._coverage_payload = None
+        self._pending_coverage_path = ""
 
         self.setWindowTitle("选择远程目标目录")
-        self.resize(820, 620)
+        self.resize(930, 720)
 
         self.host_combo = QComboBox()
         for i, ctx in enumerate(self.contexts):
@@ -363,13 +416,39 @@ class RemoteDirectoryBrowserDialog(QDialog):
 
         self.path_edit = QLineEdit(self.initial_path)
         self.path_edit.setPlaceholderText(r"例如：D:\ADMS\bin")
+        self.check_path_btn = QPushButton("检查全部目标主机")
+        self.check_path_btn.setEnabled(bool(self.contexts))
+        self.check_path_btn.setToolTip("只读检查当前路径在所有已勾选目标主机上是否已经存在，不创建目录、不写入文件。")
+
+        self.coverage_summary = QLabel("")
+        self.coverage_summary.setWordWrap(True)
+        self.coverage_summary.setStyleSheet("color:#667A8A;")
+
+        self.coverage_table = QTableWidget(len(self.contexts), 3)
+        self.coverage_table.setHorizontalHeaderLabels(["目标主机", "主机 / IP", "当前路径状态"])
+        self.coverage_table.verticalHeader().setVisible(False)
+        self.coverage_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.coverage_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.coverage_table.setAlternatingRowColors(True)
+        ch = self.coverage_table.horizontalHeader()
+        ch.setSectionResizeMode(0, QHeaderView.Stretch)
+        ch.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        ch.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.coverage_table.setMaximumHeight(min(190, 58 + max(1, len(self.contexts)) * 30))
+        for r, ctx in enumerate(self.contexts):
+            name = (ctx.get("name") or ctx.get("host") or "").strip()
+            host = (ctx.get("host") or "").strip()
+            self.coverage_table.setItem(r, 0, QTableWidgetItem(name))
+            self.coverage_table.setItem(r, 1, QTableWidgetItem(host))
+            self.coverage_table.setItem(r, 2, QTableWidgetItem("未检查"))
+
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["远程目录", "信息"])
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.tree.setUniformRowHeights(True)
 
-        self.status = QLabel("通过 WinRM 只读浏览参考主机目录；展开节点时才读取下一层，不会递归扫描整个磁盘。")
+        self.status = QLabel("目录树只浏览参考主机；当前路径可另外检查所有已勾选目标主机。")
         self.status.setWordWrap(True)
         self.status.setStyleSheet("color:#667A8A;")
         self.multi_note = QLabel("")
@@ -377,8 +456,10 @@ class RemoteDirectoryBrowserDialog(QDialog):
         self.multi_note.setStyleSheet("color:#8A6D3B;")
         if len(self.contexts) > 1:
             self.multi_note.setText(
-                f"当前共勾选 {len(self.contexts)} 台目标主机。目录树只浏览上方“参考主机”；选择后，正式分发前仍会逐台验证该路径。"
+                f"当前分发范围是 {len(self.contexts)} 台目标主机。目录树仅用于参考主机浏览；最终这条映射会把同一个目标路径应用到全部 {len(self.contexts)} 台。"
             )
+        elif len(self.contexts) == 1:
+            self.multi_note.setText("当前分发范围是 1 台目标主机。")
 
         self.refresh_btn = QPushButton("刷新")
         self.select_btn = QPushButton("选择此目录")
@@ -393,6 +474,7 @@ class RemoteDirectoryBrowserDialog(QDialog):
         path_row = QHBoxLayout()
         path_row.addWidget(QLabel("当前路径"))
         path_row.addWidget(self.path_edit, 1)
+        path_row.addWidget(self.check_path_btn)
 
         bottom = QHBoxLayout()
         bottom.addStretch(1)
@@ -403,12 +485,17 @@ class RemoteDirectoryBrowserDialog(QDialog):
         lay.addLayout(host_row)
         lay.addWidget(self.multi_note)
         lay.addLayout(path_row)
+        lay.addWidget(self.coverage_summary)
+        lay.addWidget(self.coverage_table)
         lay.addWidget(self.tree, 1)
         lay.addWidget(self.status)
         lay.addLayout(bottom)
 
         self.host_combo.currentIndexChanged.connect(self._reference_host_changed)
         self.refresh_btn.clicked.connect(self.refresh_root)
+        self.check_path_btn.clicked.connect(self._start_coverage_check)
+        self.path_edit.editingFinished.connect(self._start_coverage_check)
+        self.path_edit.textChanged.connect(self._coverage_path_edited)
         self.tree.itemExpanded.connect(self._item_expanded)
         self.tree.itemClicked.connect(self._item_clicked)
         self.tree.itemDoubleClicked.connect(self._item_double_clicked)
@@ -418,8 +505,11 @@ class RemoteDirectoryBrowserDialog(QDialog):
         if not self.contexts:
             self.refresh_btn.setEnabled(False)
             self.select_btn.setEnabled(False)
+            self.check_path_btn.setEnabled(False)
+            self.coverage_summary.setText("当前没有可用目标主机/WinRM 凭据。")
             self.status.setText("当前没有可用目标主机/WinRM 凭据，无法浏览远程目录。")
         else:
+            self._reset_coverage_rows("未检查")
             QTimer.singleShot(80, self.refresh_root)
 
     def _current_context(self):
@@ -501,6 +591,8 @@ class RemoteDirectoryBrowserDialog(QDialog):
             item = self.tree.topLevelItem(0)
             self.tree.setCurrentItem(item)
             self.path_edit.setText(item.data(0, self.ROLE_PATH) or "")
+        if self.path_edit.text().strip():
+            QTimer.singleShot(80, self._start_coverage_check)
 
     def _populate_directories(self, parent_item, directories):
         if parent_item is None:
@@ -540,10 +632,10 @@ class RemoteDirectoryBrowserDialog(QDialog):
             return
         if payload.get("kind") == "drives":
             self._populate_drives(payload.get("data") or [])
-            self.status.setText("远程盘符读取完成。展开盘符或目录时，程序只读取该节点的下一层子目录。")
+            self.status.setText("参考主机盘符读取完成。展开盘符或目录时，只读取下一层。")
         else:
             self._populate_directories(item, payload.get("data") or [])
-            self.status.setText(f"已读取：{payload.get('path') or ''}")
+            self.status.setText(f"参考主机已读取：{payload.get('path') or ''}")
 
     def _item_expanded(self, item):
         kind = item.data(0, self.ROLE_KIND)
@@ -561,11 +653,114 @@ class RemoteDirectoryBrowserDialog(QDialog):
         path = item.data(0, self.ROLE_PATH)
         if path:
             self.path_edit.setText(str(path))
+            QTimer.singleShot(60, self._start_coverage_check)
 
     def _item_double_clicked(self, item, _column):
         path = item.data(0, self.ROLE_PATH)
         if path:
             item.setExpanded(True)
+
+    def _coverage_path_edited(self, text):
+        normalized = (text or "").strip().replace("/", "\\")
+        if normalized != self._coverage_path:
+            self._coverage_payload = None
+            self.coverage_summary.setStyleSheet("color:#667A8A;")
+            self.coverage_summary.setText(
+                f"当前路径尚未检查全部目标主机。分发范围仍是 {len(self.contexts)} 台。" if self.contexts else ""
+            )
+            self._reset_coverage_rows("未检查")
+
+    def _reset_coverage_rows(self, status):
+        for r in range(self.coverage_table.rowCount()):
+            item = QTableWidgetItem(status)
+            self.coverage_table.setItem(r, 2, item)
+
+    def _start_coverage_check(self):
+        if not self.contexts:
+            return
+        path = self.path_edit.text().strip().replace("/", "\\")
+        if not path:
+            return
+        try:
+            validate_windows_target_path(path, allow_unc=False)
+        except Exception:
+            return
+        if self._coverage_thread and self._coverage_thread.isRunning():
+            self._pending_coverage_path = path
+            return
+        self._pending_coverage_path = ""
+        self._reset_coverage_rows("检查中…")
+        self.coverage_summary.setStyleSheet("color:#667A8A;")
+        self.coverage_summary.setText(f"正在检查 {len(self.contexts)} 台目标主机：{path}")
+        self.check_path_btn.setEnabled(False)
+        self.check_path_btn.setText("正在检查…")
+        self._coverage_thread = RemotePathCoverageThread(
+            self.contexts, path=path, use_https=self.use_https, port=self.port,
+            max_workers=min(4, len(self.contexts)),
+        )
+        self._coverage_thread.completed.connect(self._coverage_completed)
+        self._coverage_thread.start()
+
+    def _coverage_completed(self, payload):
+        self.check_path_btn.setEnabled(bool(self.contexts))
+        self.check_path_btn.setText("检查全部目标主机")
+        path = (payload.get("path") or "").strip().replace("/", "\\")
+        results = payload.get("results") or {}
+        errors = payload.get("errors") or {}
+        total = int(payload.get("total", len(self.contexts)) or 0)
+        exists_count = 0
+        missing_count = 0
+        drive_missing_count = 0
+        for r, ctx in enumerate(self.contexts):
+            host = (ctx.get("host") or "").strip()
+            cell = QTableWidgetItem()
+            if host in errors:
+                cell.setText("检查失败")
+                cell.setToolTip(errors[host])
+            else:
+                info = results.get(host) or {}
+                if info.get("exists"):
+                    exists_count += 1
+                    cell.setText("✓ 已存在")
+                elif info.get("drive_exists"):
+                    missing_count += 1
+                    cell.setText("○ 目录未创建")
+                    cell.setToolTip("目标盘符存在，但这个目录当前尚未创建。正式分发预检查会按现有逻辑尝试创建并验证可写。")
+                else:
+                    drive_missing_count += 1
+                    cell.setText("⚠ 盘符不存在")
+                    cell.setToolTip("目标主机没有这个盘符；若继续使用该路径，该主机正式分发会失败。")
+            self.coverage_table.setItem(r, 2, cell)
+
+        error_count = len(errors)
+        self._coverage_path = path
+        self._coverage_payload = {
+            "path": path,
+            "total": total,
+            "exists": exists_count,
+            "missing": missing_count,
+            "drive_missing": drive_missing_count,
+            "errors": error_count,
+        }
+        parts = [f"路径覆盖：{exists_count}/{total} 台已存在"]
+        if missing_count:
+            parts.append(f"{missing_count} 台目录未创建")
+        if drive_missing_count:
+            parts.append(f"{drive_missing_count} 台无该盘符")
+        if error_count:
+            parts.append(f"{error_count} 台检查失败")
+        if total and exists_count == total:
+            self.coverage_summary.setStyleSheet("color:#14866D; font-weight:600;")
+            parts.append("这条映射会分发到以上全部目标主机")
+        else:
+            self.coverage_summary.setStyleSheet("color:#8A6D3B; font-weight:600;")
+            parts.append("正式分发仍会对全部已勾选主机逐台预检查")
+        self.coverage_summary.setText("；".join(parts) + "。")
+
+        pending = self._pending_coverage_path
+        self._pending_coverage_path = ""
+        if pending and pending != path and pending == self.path_edit.text().strip().replace("/", "\\"):
+            QTimer.singleShot(60, self._start_coverage_check)
 
     def _accept_checked(self):
         path = self.path_edit.text().strip()
@@ -577,24 +772,44 @@ class RemoteDirectoryBrowserDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(self, "远程目录", str(exc))
             return
-        self.path_edit.setText(path.replace("/", "\\"))
+        path = path.replace("/", "\\")
+        payload = self._coverage_payload if self._coverage_path == path else None
+        if payload and len(self.contexts) > 1:
+            missing = int(payload.get("missing", 0) or 0)
+            drive_missing = int(payload.get("drive_missing", 0) or 0)
+            errors = int(payload.get("errors", 0) or 0)
+            if drive_missing or missing or errors:
+                detail = []
+                if missing:
+                    detail.append(f"{missing} 台目标机上该目录尚未创建")
+                if drive_missing:
+                    detail.append(f"{drive_missing} 台目标机没有对应盘符")
+                if errors:
+                    detail.append(f"{errors} 台目标机未能完成只读检查")
+                text = (
+                    "当前路径并非在所有目标主机上都已存在：\n" + "\n".join(f"• {x}" for x in detail) +
+                    f"\n\n这条映射仍会应用到当前全部 {len(self.contexts)} 台目标主机。"
+                    "目录未创建时，正式分发预检查会按现有逻辑尝试创建；盘符不存在的主机会失败。\n\n仍选择此路径吗？"
+                )
+                if QMessageBox.question(self, "确认多主机目标路径", text) != QMessageBox.Yes:
+                    return
+        self.path_edit.setText(path)
         self.accept()
 
     def selected_path(self):
         return self.path_edit.text().strip().replace("/", "\\")
 
     def reject(self):
-        if self._thread and self._thread.isRunning():
-            QMessageBox.information(self, "远程目录", "正在读取远程目录，请等待当前读取完成后再关闭窗口。")
+        if (self._thread and self._thread.isRunning()) or (self._coverage_thread and self._coverage_thread.isRunning()):
+            QMessageBox.information(self, "远程目录", "正在读取远程信息，请等待当前读取完成后再关闭窗口。")
             return
         super().reject()
 
     def closeEvent(self, event):
-        if self._thread and self._thread.isRunning():
+        if (self._thread and self._thread.isRunning()) or (self._coverage_thread and self._coverage_thread.isRunning()):
             event.ignore()
             return
         super().closeEvent(event)
-
 
 
 class RemoteProcessQueryThread(QThread):
@@ -890,9 +1105,15 @@ class MappingTargetDialog(QDialog):
         idx = self.mode.findData(folder_mode)
         self.mode.setCurrentIndex(max(0, idx))
         self.mode.setEnabled(is_directory)
-        note = QLabel(
-            "目标目录属于本次分发映射，可为任意 Windows 盘符目录。所有已选择目标主机都会执行同一条映射。"
-        )
+        scope_names = [((c.get("name") or c.get("host") or "").strip()) for c in self.remote_drive_contexts]
+        scope_preview = "、".join(scope_names[:4])
+        if len(scope_names) > 4:
+            scope_preview += f" 等 {len(scope_names)} 台"
+        if scope_names:
+            note_text = f"当前已勾选 {len(scope_names)} 台目标主机；这条映射会把同一个目标路径同时应用到：{scope_preview}。"
+        else:
+            note_text = "目标目录属于本次分发映射；选择目标主机后，这条映射会应用到全部已勾选主机。"
+        note = QLabel(note_text)
         note.setWordWrap(True); note.setStyleSheet("color:#667A8A;")
         self.drive_selector = RemoteDriveSelector(
             self.target, contexts=self.remote_drive_contexts, context_hint=self.remote_drive_hint,
@@ -968,7 +1189,9 @@ class SftpMappingDialog(QDialog):
         idx = self.folder_mode.findData(initial.get("folder_mode", "CONTENTS")); self.folder_mode.setCurrentIndex(max(0,idx))
         self.source_kind.currentIndexChanged.connect(lambda *_: self.folder_mode.setEnabled(self.source_kind.currentData()=="DIR"))
         self.folder_mode.setEnabled(self.source_kind.currentData()=="DIR")
-        note = QLabel("SFTP 密码只存在当前程序进程内，不写入 SQLite、JSONL 或任务审计文件。分发时先拉取到本机缓存，再通过 WinRM 向 Windows 目标主机分发。")
+        scope_names = [((c.get("name") or c.get("host") or "").strip()) for c in self.remote_drive_contexts]
+        scope_text = f" 当前已勾选 {len(scope_names)} 台目标主机，这条映射会应用到全部这些主机。" if scope_names else ""
+        note = QLabel("SFTP 密码只存在当前程序进程内，不写入 SQLite、JSONL 或任务审计文件。分发时先拉取到本机缓存，再通过 WinRM 向 Windows 目标主机分发。" + scope_text)
         note.setWordWrap(True); note.setStyleSheet("color:#667A8A;")
         self.drive_selector = RemoteDriveSelector(
             self.target, contexts=self.remote_drive_contexts, context_hint=self.remote_drive_hint,
@@ -1255,6 +1478,8 @@ class TaskDetailDialog(QDialog):
 class WinRMSetupDialog(QDialog):
     """面向非专业用户的目标机 WinRM 准备向导。"""
 
+    ADMS_ONECLICK = "TARGET_PREP_ADMS_WINRM.cmd"
+    ADMS_RESTORE = "TARGET_RESTORE_ADMS_WINRM.cmd"
     STANDARD = "TARGET_PREP_WINRM.cmd"
     LOCAL_ADMIN = "TARGET_PREP_WINRM_LOCAL_ADMIN.cmd"
     RESTORE = "TARGET_RESTORE_WINRM_LOCAL_ADMIN.cmd"
@@ -1267,14 +1492,14 @@ class WinRMSetupDialog(QDialog):
         title = QLabel("目标 Windows 只需完成一次 WinRM 准备")
         title.setStyleSheet("font-size:14pt;font-weight:700;")
         intro = QLabel(
-            "File Distribution Studio 的文件上传、目录创建、备份、SHA256、结束进程和 CMD/PowerShell "
-            "全部走 WinRM。主机发现可以继续使用 Ping、445、3389、DNS、NetBIOS 或 SMB 身份信息，但不会通过这些通道修改目标机。"
+            "目标机首次使用时，可导出简化 WinRM 设置脚本并以管理员身份运行。脚本只启用 WinRM 并设置约定的 LocalAccountTokenFilterPolicy；不会读取或修改任何账号、用户组或 RDP 权限。"
         )
         intro.setWordWrap(True)
 
         self.mode = QComboBox()
+        self.mode.addItem("简化 WinRM 设置（推荐：不修改任何账号）", self.ADMS_ONECLICK)
         self.mode.addItem("标准 WinRM 服务准备（不修改 UAC / 注册表）", self.STANDARD)
-        self.mode.addItem("本地管理员 WinRM 模式（ADMS 等本地管理员）", self.LOCAL_ADMIN)
+        self.mode.addItem("本地管理员 WinRM 模式（通用）", self.LOCAL_ADMIN)
         self.mode.currentIndexChanged.connect(self._refresh_text)
 
         self.desc = QLabel()
@@ -1289,16 +1514,15 @@ class WinRMSetupDialog(QDialog):
         row = QHBoxLayout()
         save_btn = QPushButton("保存 CMD 到…")
         copy_btn = QPushButton("复制脚本内容")
-        restore_btn = QPushButton("保存恢复脚本…")
+        self.restore_btn = QPushButton("保存对应恢复脚本…")
         save_btn.clicked.connect(self._save_selected)
         copy_btn.clicked.connect(self._copy_selected)
-        restore_btn.clicked.connect(self._save_restore)
-        row.addWidget(save_btn); row.addWidget(copy_btn); row.addWidget(restore_btn); row.addStretch(1)
+        self.restore_btn.clicked.connect(self._save_restore)
+        row.addWidget(save_btn); row.addWidget(copy_btn); row.addWidget(self.restore_btn); row.addStretch(1)
 
         help_text = QLabel(
-            "使用方式：在目标 Windows 上右键保存的 CMD → “以管理员身份运行” → 完成后回到管理机点击“测试 WinRM”。\n"
-            "若目标机使用 ADMS 这类本地 Administrators 成员账号，并且 PowerShell Invoke-Command 返回 AccessDenied，"
-            "请选择“本地管理员 WinRM 模式”。该模式会明确询问确认，并记录原策略状态，可用恢复脚本撤销。"
+            "使用方式：保存脚本 → 复制到目标 Windows → 右键“以管理员身份运行” → 回到本软件点击“测试 WinRM”。\n"
+            "设置脚本只启用 WinRM 并写入 LocalAccountTokenFilterPolicy=1；还原脚本只删除该注册表值并停止 WinRM。账号权限检查/加入命令请到“使用帮助”中手工执行。"
         )
         help_text.setWordWrap(True)
 
@@ -1329,9 +1553,13 @@ class WinRMSetupDialog(QDialog):
 
     def _refresh_text(self):
         name = self._selected_script()
-        if name == self.LOCAL_ADMIN:
+        if name == self.ADMS_ONECLICK:
             self.desc.setText(
-                "适用于 ADMS 等目标机本地管理员账号。除标准 WinRM 服务初始化外，还会设置 "
+                "最简模式：只启用 WinRM，并设置 LocalAccountTokenFilterPolicy=1，使已属于本地 Administrators 的账号可获得完整远程管理员令牌。脚本不会检查或修改 ADMS、Administrators、Remote Desktop Users 或其他账号设置。"
+            )
+        elif name == self.LOCAL_ADMIN:
+            self.desc.setText(
+                "适用于任意已属于目标机本地 Administrators 的本地账号。除标准 WinRM 服务初始化外，还会设置 "
                 "LocalAccountTokenFilterPolicy=1，使本地管理员通过 WinRM 获得完整管理员令牌。"
                 "脚本执行前会保存原始状态，并提供恢复脚本。"
             )
@@ -1341,6 +1569,8 @@ class WinRMSetupDialog(QDialog):
                 "不修改注册表、UAC、TrustedHosts 或账号权限。"
             )
         self.preview.setPlainText(self._read_script(name))
+        self.restore_btn.setEnabled(name != self.STANDARD)
+        self.restore_btn.setToolTip("标准 WinRM 模式不修改账号权限/Remote UAC，无需对应恢复脚本。" if name == self.STANDARD else "保存与当前准备模式对应的恢复脚本。")
 
     def _save_script(self, name: str, title: str):
         default_name = name
@@ -1350,9 +1580,12 @@ class WinRMSetupDialog(QDialog):
         if not path.lower().endswith(".cmd"):
             path += ".cmd"
         try:
-            text = self._read_script(name)
-            with open(path, "w", encoding="utf-8-sig", newline="\r\n") as f:
-                f.write(text)
+            source = script_path(name)
+            if not source.exists():
+                raise FileNotFoundError(f"脚本资源缺失：{name}")
+            # 直接复制资源字节，保留仓库中经过验证的 ASCII + CRLF + 无 BOM 格式，
+            # 避免 Windows cmd.exe 因 BOM/行尾被破坏而把脚本片段误解析为命令。
+            Path(path).write_bytes(source.read_bytes())
             QMessageBox.information(self, "WinRM 配置向导", f"脚本已保存：\n{path}\n\n请复制到目标 Windows 并以管理员身份运行。")
         except Exception as e:
             QMessageBox.critical(self, "WinRM 配置向导", f"保存脚本失败：\n{e}")
@@ -1361,7 +1594,13 @@ class WinRMSetupDialog(QDialog):
         self._save_script(self._selected_script(), "保存目标机 WinRM 配置脚本")
 
     def _save_restore(self):
-        self._save_script(self.RESTORE, "保存 WinRM 本地管理员策略恢复脚本")
+        selected = self._selected_script()
+        if selected == self.ADMS_ONECLICK:
+            self._save_script(self.ADMS_RESTORE, "保存 WinRM 还原脚本")
+        elif selected == self.LOCAL_ADMIN:
+            self._save_script(self.RESTORE, "保存 WinRM 本地管理员策略恢复脚本")
+        else:
+            QMessageBox.information(self, "WinRM 配置向导", "标准 WinRM 模式不修改账号权限或 Remote UAC，因此无需对应恢复脚本。")
 
     def _copy_selected(self):
         QApplication.clipboard().setText(self._read_script(self._selected_script()))
