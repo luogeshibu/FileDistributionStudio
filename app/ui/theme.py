@@ -26,6 +26,7 @@ QWidget {{ font-family:'Microsoft YaHei UI','Segoe UI'; font-size:10pt; color:{C
 QFrame#Sidebar {{ background:{COLORS['nav']}; border:none; }}
 QFrame#Topbar {{ background:#FFFFFF; border-bottom:1px solid {COLORS['border']}; }}
 QFrame#Card {{ background:#FFFFFF; border:1px solid {COLORS['border']}; border-radius:12px; }}
+QFrame#Card[taskActive="true"] {{ background:#F2FBF8; border:1px solid #8FD3C0; }}
 QFrame#SoftCard {{ background:{COLORS['soft']}; border:1px solid #E1E8EF; border-radius:10px; }}
 QLabel#BrandTitle {{ color:white; font-size:14pt; font-weight:750; }}
 QLabel#BrandSub {{ color:#9EB6CB; font-size:8.5pt; font-weight:650; }}
@@ -53,6 +54,10 @@ QPushButton:disabled {{ color:#9DA9B4; background:#F3F5F7; border-color:#E1E6EA;
 QPushButton#Primary {{ background:{COLORS['accent']}; color:white; border-color:{COLORS['accent']}; }}
 QPushButton#Primary:hover {{ background:{COLORS['accent_dark']}; border-color:{COLORS['accent_dark']}; }}
 QPushButton#Danger {{ background:#FFF4F2; color:{COLORS['danger']}; border-color:#F2C6C1; }}
+QPushButton#TaskToggle {{ background:#F3F6F9; color:#516579; border:1px solid #C7D2DD; border-radius:12px; padding:7px 13px; font-weight:750; text-align:left; }}
+QPushButton#TaskToggle:hover {{ background:#EDF4F7; border-color:#9CB6C4; }}
+QPushButton#TaskToggle:checked {{ background:#E8F7F2; color:#0A6B58; border:1px solid #80CDB7; }}
+QPushButton#TaskToggle:checked:hover {{ background:#DDF3EC; border-color:#5BB99E; }}
 QPushButton#NavButton {{ background:transparent; color:#C6D6E5; border:none; border-radius:8px; padding:10px 12px; text-align:left; font-weight:600; }}
 QPushButton#NavButton:hover {{ background:{COLORS['nav_hover']}; color:white; }}
 QPushButton#NavButton:checked {{ background:{COLORS['nav_selected']}; color:white; }}

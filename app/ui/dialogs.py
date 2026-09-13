@@ -812,6 +812,285 @@ class RemoteDirectoryBrowserDialog(QDialog):
         super().closeEvent(event)
 
 
+
+class RemoteBackupEntryQueryThread(QThread):
+    """只读读取参考主机盘符或当前目录的一层文件/文件夹。"""
+    completed = Signal(object)
+
+    def __init__(self, context: dict, *, path="", use_https=False, port=5985):
+        super().__init__()
+        self.context = dict(context or {})
+        self.path = (path or "").strip().replace("/", "\\")
+        self.use_https = bool(use_https)
+        self.port = int(port)
+
+    def run(self):
+        host = self.context.get("host", "")
+        plan = RemoteActionPlan(
+            enabled=False, use_https=self.use_https, port=self.port,
+            username=self.context.get("username", ""), password=self.context.get("password", ""),
+            command_timeout=40,
+        )
+        try:
+            ex = WinRMExecutor(host, plan)
+            if self.path:
+                data = ex.list_directory_entries(self.path)
+                kind = "entries"
+            else:
+                data = ex.list_drives()
+                kind = "drives"
+            self.completed.emit({"ok": True, "host": host, "kind": kind, "path": self.path, "data": data, "error": ""})
+        except Exception as exc:
+            self.completed.emit({
+                "ok": False, "host": host, "kind": "entries" if self.path else "drives",
+                "path": self.path, "data": [], "error": describe_winrm_failure(host, plan, exc),
+            })
+
+
+class RemoteBackupBrowserDialog(QDialog):
+    """通过 WinRM 浏览目标机磁盘、文件夹和文件，并建立独立备份清单。"""
+    ROLE_PATH = Qt.UserRole + 41
+    ROLE_IS_DIR = Qt.UserRole + 42
+
+    def __init__(self, parent=None, *, contexts=None, preselected=None, use_https=False, port=5985):
+        super().__init__(parent)
+        self.contexts = list(contexts or [])
+        self.use_https = bool(use_https)
+        self.port = int(port)
+        self._thread = None
+        self._selected_paths = []
+        for x in (preselected or []):
+            x = str(x or "").strip().replace("/", "\\")
+            if x and x not in self._selected_paths:
+                self._selected_paths.append(x)
+
+        self.setWindowTitle("选择远程备份文件 / 文件夹")
+        self.resize(1040, 720)
+
+        self.host_combo = QComboBox()
+        for i, ctx in enumerate(self.contexts):
+            name = (ctx.get("name") or "").strip()
+            host = (ctx.get("host") or "").strip()
+            self.host_combo.addItem(f"{name}  ({host})" if name and name != host else host, i)
+
+        self.drive_combo = QComboBox()
+        self.drive_combo.addItem("正在读取盘符...", "")
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText(r"例如：D:\ADMS\bin")
+        self.up_btn = QPushButton("上一级")
+        self.go_btn = QPushButton("转到")
+        self.refresh_btn = QPushButton("刷新")
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["选择", "名称", "类型", "大小", "修改时间", "完整路径"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(5, QHeaderView.Stretch)
+
+        self.status = QLabel("选择一个盘符后会读取该目录下一层的文件和文件夹；双击文件夹可进入。")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#667A8A;")
+        self.note = QLabel("目录也可以直接加入备份清单；执行时会递归备份该目录。多台主机使用同一组路径，实际执行时逐台检查是否存在。")
+        self.note.setWordWrap(True)
+        self.note.setStyleSheet("color:#8A6D3B;")
+
+        self.selected_preview = QTextEdit()
+        self.selected_preview.setReadOnly(True)
+        self.selected_preview.setMaximumHeight(130)
+        self.add_checked_btn = QPushButton("添加勾选项")
+        self.clear_selected_btn = QPushButton("清空已选")
+        self.ok_btn = QPushButton("使用这些备份目标")
+        self.ok_btn.setObjectName("Primary")
+        self.cancel_btn = QPushButton("取消")
+
+        host_row = QHBoxLayout(); host_row.addWidget(QLabel("参考主机")); host_row.addWidget(self.host_combo, 1); host_row.addWidget(self.refresh_btn)
+        nav_row = QHBoxLayout(); nav_row.addWidget(QLabel("盘符")); nav_row.addWidget(self.drive_combo); nav_row.addWidget(QLabel("当前路径")); nav_row.addWidget(self.path_edit, 1); nav_row.addWidget(self.up_btn); nav_row.addWidget(self.go_btn)
+        selected_btns = QHBoxLayout(); selected_btns.addWidget(QLabel("已选备份目标")); selected_btns.addStretch(1); selected_btns.addWidget(self.add_checked_btn); selected_btns.addWidget(self.clear_selected_btn)
+        bottom = QHBoxLayout(); bottom.addStretch(1); bottom.addWidget(self.ok_btn); bottom.addWidget(self.cancel_btn)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(host_row); lay.addLayout(nav_row); lay.addWidget(self.note); lay.addWidget(self.table, 1); lay.addWidget(self.status)
+        lay.addLayout(selected_btns); lay.addWidget(self.selected_preview); lay.addLayout(bottom)
+
+        self.host_combo.currentIndexChanged.connect(self._host_changed)
+        self.drive_combo.currentIndexChanged.connect(self._drive_changed)
+        self.refresh_btn.clicked.connect(self._refresh_current)
+        self.go_btn.clicked.connect(self._go_path)
+        self.path_edit.returnPressed.connect(self._go_path)
+        self.up_btn.clicked.connect(self._go_up)
+        self.table.cellDoubleClicked.connect(self._double_clicked)
+        self.add_checked_btn.clicked.connect(self._add_checked)
+        self.clear_selected_btn.clicked.connect(self._clear_selected)
+        self.ok_btn.clicked.connect(self._accept_checked)
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self._refresh_selected_preview()
+        if self.contexts:
+            QTimer.singleShot(80, self._load_drives)
+        else:
+            self.status.setText("当前没有可用目标主机/WinRM 凭据。")
+            self.ok_btn.setEnabled(False)
+
+    def _current_context(self):
+        if not self.contexts:
+            return None
+        try:
+            return self.contexts[int(self.host_combo.currentData())]
+        except Exception:
+            return self.contexts[0]
+
+    def _set_busy(self, busy: bool, text=""):
+        for w in (self.host_combo, self.drive_combo, self.path_edit, self.up_btn, self.go_btn, self.refresh_btn):
+            w.setEnabled(not busy)
+        if text:
+            self.status.setText(text)
+
+    def _query(self, path=""):
+        if self._thread and self._thread.isRunning():
+            return
+        ctx = self._current_context()
+        if not ctx:
+            return
+        self._set_busy(True, f"正在读取 {ctx.get('host','')}：{path or '磁盘列表'} ...")
+        self._thread = RemoteBackupEntryQueryThread(ctx, path=path, use_https=self.use_https, port=self.port)
+        self._thread.completed.connect(self._query_done)
+        self._thread.start()
+
+    def _load_drives(self):
+        self._query("")
+
+    def _query_done(self, payload):
+        self._set_busy(False)
+        if not payload.get("ok"):
+            self.status.setText(payload.get("error") or "读取远程文件信息失败。")
+            return
+        if payload.get("kind") == "drives":
+            current = self.path_edit.text().strip()[:3].upper() if self.path_edit.text().strip() else ""
+            self.drive_combo.blockSignals(True)
+            self.drive_combo.clear()
+            for d in payload.get("data") or []:
+                name = d.get("name", "")
+                label = d.get("volume_label", "")
+                info = f"{name}  {label}".strip()
+                self.drive_combo.addItem(info, name)
+            self.drive_combo.blockSignals(False)
+            if not self.drive_combo.count():
+                self.status.setText("没有读取到可用远程盘符。")
+                return
+            idx = 0
+            if current:
+                for i in range(self.drive_combo.count()):
+                    if str(self.drive_combo.itemData(i)).upper() == current:
+                        idx = i; break
+            self.drive_combo.setCurrentIndex(idx)
+            self._drive_changed(idx)
+            return
+        self._populate_entries(payload.get("data") or [], payload.get("path") or "")
+
+    def _populate_entries(self, entries, path):
+        self.path_edit.setText(path)
+        self.table.setRowCount(0)
+        for item in entries:
+            r = self.table.rowCount(); self.table.insertRow(r)
+            chk = QTableWidgetItem("")
+            chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+            chk.setCheckState(Qt.Unchecked); chk.setTextAlignment(Qt.AlignCenter)
+            chk.setData(self.ROLE_PATH, item.get("path", "")); chk.setData(self.ROLE_IS_DIR, bool(item.get("is_dir")))
+            self.table.setItem(r, 0, chk)
+            vals = [
+                item.get("name", ""), "文件夹" if item.get("is_dir") else "文件",
+                "—" if item.get("is_dir") else human_bytes(int(item.get("size", 0) or 0)),
+                item.get("modified", ""), item.get("path", ""),
+            ]
+            for c, v in enumerate(vals, 1):
+                self.table.setItem(r, c, QTableWidgetItem(str(v)))
+        self.status.setText(f"{path}：读取到 {len(entries)} 个项目。勾选文件/文件夹后点击“添加勾选项”；双击文件夹可进入。")
+
+    def _drive_changed(self, index):
+        drive = self.drive_combo.itemData(index)
+        if drive:
+            self.path_edit.setText(str(drive))
+            self._query(str(drive))
+
+    def _host_changed(self, *_):
+        self.path_edit.clear()
+        self.table.setRowCount(0)
+        self._load_drives()
+
+    def _refresh_current(self):
+        path = self.path_edit.text().strip().replace("/", "\\")
+        if path:
+            self._query(path)
+        else:
+            self._load_drives()
+
+    def _go_path(self):
+        path = self.path_edit.text().strip().replace("/", "\\")
+        if not path:
+            return
+        if len(path) == 2 and path[1] == ':':
+            path += "\\"
+        self._query(path)
+
+    def _go_up(self):
+        import ntpath
+        path = self.path_edit.text().strip().replace("/", "\\")
+        if not path:
+            return
+        drive, tail = ntpath.splitdrive(path)
+        if not drive:
+            return
+        root = drive + "\\"
+        if path.rstrip("\\").lower() == drive.lower():
+            self.path_edit.setText(root); self._query(root); return
+        parent = ntpath.dirname(path.rstrip("\\")) or root
+        self.path_edit.setText(parent); self._query(parent)
+
+    def _double_clicked(self, row, column):
+        item = self.table.item(row, 0)
+        if item and bool(item.data(self.ROLE_IS_DIR)):
+            path = str(item.data(self.ROLE_PATH) or "")
+            if path:
+                self.path_edit.setText(path); self._query(path)
+
+    def _add_checked(self):
+        added = 0
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item and item.checkState() == Qt.Checked:
+                path = str(item.data(self.ROLE_PATH) or "").strip()
+                if path and path not in self._selected_paths:
+                    self._selected_paths.append(path); added += 1
+                item.setCheckState(Qt.Unchecked)
+        self._refresh_selected_preview()
+        self.status.setText(f"已加入 {added} 个项目；当前备份清单共 {len(self._selected_paths)} 项。")
+
+    def _clear_selected(self):
+        self._selected_paths = []
+        self._refresh_selected_preview()
+
+    def _refresh_selected_preview(self):
+        self.selected_preview.setPlainText("\n".join(self._selected_paths))
+
+    def _accept_checked(self):
+        self._add_checked()
+        if not self._selected_paths:
+            QMessageBox.warning(self, "备份", "请至少选择一个远程文件或文件夹。")
+            return
+        self.accept()
+
+    def selected_paths(self):
+        return list(self._selected_paths)
+
+
 class RemoteProcessQueryThread(QThread):
     """通过 WinRM 只读读取一个参考主机的当前进程列表。"""
     completed = Signal(object)
@@ -1092,7 +1371,7 @@ class MappingTargetDialog(QDialog):
                  use_https=False, winrm_port=5985):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(760, 390)
+        self.resize(760, 330)
         self.remote_drive_contexts = list(remote_drive_contexts or [])
         self.remote_drive_hint = remote_drive_hint or ""
         self.use_https = bool(use_https)
@@ -1115,10 +1394,6 @@ class MappingTargetDialog(QDialog):
             note_text = "目标目录属于本次分发映射；选择目标主机后，这条映射会应用到全部已勾选主机。"
         note = QLabel(note_text)
         note.setWordWrap(True); note.setStyleSheet("color:#667A8A;")
-        self.drive_selector = RemoteDriveSelector(
-            self.target, contexts=self.remote_drive_contexts, context_hint=self.remote_drive_hint,
-            use_https=self.use_https, port=self.winrm_port, parent=self,
-        )
         self.browse_remote_btn = QPushButton("浏览远程目录")
         self.browse_remote_btn.setEnabled(bool(self.remote_drive_contexts))
         self.browse_remote_btn.setToolTip("通过 WinRM 只读浏览参考目标主机的盘符和目录；不会创建或修改远程文件。")
@@ -1128,7 +1403,6 @@ class MappingTargetDialog(QDialog):
         target_row.addWidget(self.target, 1)
         target_row.addWidget(self.browse_remote_btn)
         form = QFormLayout()
-        form.addRow("远程盘符", self.drive_selector)
         form.addRow("目标目录", target_row)
         if is_directory:
             form.addRow("目录方式", self.mode)
@@ -1172,7 +1446,7 @@ class SftpMappingDialog(QDialog):
         super().__init__(parent)
         initial = initial or {}
         self.setWindowTitle("添加 SFTP 分发映射")
-        self.resize(760, 540)
+        self.resize(760, 500)
         self.remote_drive_contexts = list(remote_drive_contexts or [])
         self.remote_drive_hint = remote_drive_hint or ""
         self.use_https = bool(use_https)
@@ -1193,16 +1467,12 @@ class SftpMappingDialog(QDialog):
         scope_text = f" 当前已勾选 {len(scope_names)} 台目标主机，这条映射会应用到全部这些主机。" if scope_names else ""
         note = QLabel("SFTP 密码只存在当前程序进程内，不写入 SQLite、JSONL 或任务审计文件。分发时先拉取到本机缓存，再通过 WinRM 向 Windows 目标主机分发。" + scope_text)
         note.setWordWrap(True); note.setStyleSheet("color:#667A8A;")
-        self.drive_selector = RemoteDriveSelector(
-            self.target, contexts=self.remote_drive_contexts, context_hint=self.remote_drive_hint,
-            use_https=self.use_https, port=self.winrm_port, parent=self,
-        )
         self.browse_remote_btn = QPushButton("浏览远程目录")
         self.browse_remote_btn.setEnabled(bool(self.remote_drive_contexts))
         self.browse_remote_btn.setToolTip("通过 WinRM 只读浏览参考目标主机目录。")
         self.browse_remote_btn.clicked.connect(self._browse_remote_directory)
         target_row = QHBoxLayout(); target_row.setContentsMargins(0,0,0,0); target_row.addWidget(self.target,1); target_row.addWidget(self.browse_remote_btn)
-        form=QFormLayout(); form.addRow("SFTP 主机",self.host); form.addRow("端口",self.port); form.addRow("用户名",self.username); form.addRow("密码",self.password); form.addRow("远程路径",self.remote_path); form.addRow("远程源类型",self.source_kind); form.addRow("远程盘符",self.drive_selector); form.addRow("目标目录",target_row); form.addRow("目录方式",self.folder_mode)
+        form=QFormLayout(); form.addRow("SFTP 主机",self.host); form.addRow("端口",self.port); form.addRow("用户名",self.username); form.addRow("密码",self.password); form.addRow("远程路径",self.remote_path); form.addRow("远程源类型",self.source_kind); form.addRow("目标目录",target_row); form.addRow("目录方式",self.folder_mode)
         buttons=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); buttons.button(QDialogButtonBox.Ok).setText("添加映射"); buttons.button(QDialogButtonBox.Cancel).setText("取消"); buttons.accepted.connect(self._accept_checked); buttons.rejected.connect(self.reject)
         lay=QVBoxLayout(self); lay.addWidget(note); lay.addLayout(form); lay.addWidget(buttons)
 

@@ -359,7 +359,7 @@ lang\ → F:\Update\translations
 
 ## 备份策略
 
-“备份根目录”可留空：
+“目标主机备份根目录”可留空：
 
 ```text
 <目标目录>\.fds_backup\<TaskID>
@@ -505,3 +505,17 @@ git status
 应用提供的 `TARGET_PREP_ADMS_WINRM.cmd` 只启用/启动 WinRM 并设置 `LocalAccountTokenFilterPolicy=1`；`TARGET_RESTORE_ADMS_WINRM.cmd` 只删除该注册表值并停止 WinRM。两个脚本都不会读取、创建、启用、禁用或修改 ADMS，也不会修改 Administrators、Remote Desktop Users 或 RDP 登录权限。
 
 如需现场手工检查 ADMS，请在“使用帮助 → ADMS 账号检查与管理员组（手工操作）”查看 `net user ADMS`、Administrators 成员查询以及手工加入命令。
+
+
+### 主机信息导出
+
+“主机管理”支持将全部已保存主机信息导出为 Excel（.xlsx）；导出内容不包含任何密码。
+
+### 执行前预演与失败重试（v0.6.56）
+
+文件分发页提供 `Dry Run 预演`，用于在不修改目标机的前提下提前检查源清单、WinRM、远端路径、磁盘空间和关联工具路径。正式分发结束后，如果存在失败主机，可使用 `重试失败主机` 只重跑失败目标；最近一次任务可通过 `导出任务结果` 输出含文件动作与 SHA256 对比的 Excel。
+
+
+## 远程文件
+
+“远程文件”是独立的单机人工运维工具，不加入文件分发任务。选择一台已保存 Windows 主机后，可通过 WinRM 浏览远程磁盘/目录，并在本机与目标机之间上传或下载文件；支持从 Windows 资源管理器拖放文件/目录到远程面板上传。

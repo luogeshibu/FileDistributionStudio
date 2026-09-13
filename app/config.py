@@ -1,6 +1,6 @@
 from dataclasses import dataclass, asdict, field
 import json
-from .paths import settings_path, cache_dir, audit_dir
+from .paths import settings_path, cache_dir, audit_dir, app_data_dir
 
 
 @dataclass
@@ -22,15 +22,31 @@ class AppSettings:
     winrm_default_username: str = ""
     remember_winrm_default_credential: bool = True
     winrm_host_usernames: dict[str, str] = field(default_factory=dict)
-    winrm_command_workdir: str = ""
+    winrm_command_workdir: str = r"D:\ADMS\bin"
     winrm_remote_actions_enabled: bool = False
-    winrm_pre_commands_text: str = ""
+    winrm_pre_commands_text: str = "sys_ctl stop"
     winrm_kill_processes: list[str] = field(default_factory=list)
-    winrm_post_commands_text: str = ""
+    winrm_post_commands_text: str = "sys_ctl start fast"
     winrm_post_on_failure: bool = True
     winrm_command_execution_mode: str = "INTERACTIVE"
     distribution_target_selection_initialized: bool = False
     distribution_target_checks: dict[str, bool] = field(default_factory=dict)
+    simple_distribution_mode: bool = False
+    distribution_enabled: bool = True
+    backup_task_enabled: bool = False
+    version_checker_enabled: bool = False
+    version_checker_after_distribution: bool = False
+    version_checker_exe_path: str = r"D:\ADMS\bin\version_checker.exe"
+    version_checker_workdir: str = r"D:\ADMS\bin"
+    version_checker_output_dir: str = r"D:\ADMS\bin"
+    version_checker_save_button: str = "Save"
+    version_checker_timeout_seconds: int = 120
+    version_checker_collect_excel: bool = True
+    version_checker_close_after: bool = True
+    version_checker_local_result_root: str = str(app_data_dir() / "version_results")
+    remote_file_local_path: str = ""
+    remote_file_remote_path: str = ""
+    remote_file_last_host: str = ""
 
     @classmethod
     def load(cls) -> "AppSettings":

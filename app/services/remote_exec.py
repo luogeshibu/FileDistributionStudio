@@ -492,6 +492,58 @@ $items | ConvertTo-Json -Compress
             out.append({"name": name, "path": full})
         return out
 
+    def list_directory_entries(self, path: str) -> list[dict]:
+        """只读列出目标 Windows 某目录下的直接文件和子目录及基础信息。
+
+        用于“单独备份”的远程文件浏览器。只读取当前一层，不递归扫描；
+        文件夹真正备份时再由用户明确选择后递归复制。
+        """
+        raw = (path or "").strip().replace("/", "\\")
+        if not re.match(r"^[A-Za-z]:\\(?:.*)?$", raw):
+            raise ValueError(f"远程目录必须是绝对 Windows 路径：{path}")
+        p = self.ps_quote(raw)
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+$p = {p}
+if (-not [IO.Directory]::Exists($p)) {{ throw ('目录不存在：' + $p) }}
+$items = @(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop | ForEach-Object {{
+    [pscustomobject]@{{
+        Name = [string]$_.Name
+        FullName = [string]$_.FullName
+        IsDirectory = [bool]$_.PSIsContainer
+        Length = if ($_.PSIsContainer) {{ 0 }} else {{ [Int64]$_.Length }}
+        LastWriteTime = $_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+    }}
+}})
+$items | ConvertTo-Json -Compress
+"""
+        r = self.run_ps(script)
+        self._require_success(r, f"读取远程文件目录 {raw}")
+        text = (r.get("stdout") or "").strip()
+        if not text:
+            return []
+        try:
+            data = json.loads(text.splitlines()[-1])
+        except Exception as e:
+            raise RuntimeError(f"解析远程文件目录失败：{raw}；返回：{text}") from e
+        if isinstance(data, dict):
+            data = [data]
+        out = []
+        for item in data or []:
+            name = str(item.get("Name", "") or "").strip()
+            full = str(item.get("FullName", "") or "").strip().replace("/", "\\")
+            if not name or not full:
+                continue
+            is_dir = bool(item.get("IsDirectory", False))
+            out.append({
+                "name": name,
+                "path": full,
+                "is_dir": is_dir,
+                "size": int(item.get("Length", 0) or 0),
+                "modified": str(item.get("LastWriteTime", "") or ""),
+            })
+        return sorted(out, key=lambda x: (not x["is_dir"], x["name"].lower()))
+
     def directory_info(self, path: str) -> dict:
         """只读检查目标 Windows 目录是否已存在以及所属盘符是否存在。
 
@@ -609,6 +661,18 @@ Remove-Item -LiteralPath $probe -Force
         r = self.run_ps(f"$ErrorActionPreference='Stop'; [IO.Directory]::CreateDirectory({p}) | Out-Null")
         return self._require_success(r, f"创建目录 {path}")
 
+    def rename_path(self, path: str, new_name: str):
+        """在同一远程目录内重命名文件或文件夹。"""
+        raw = (path or "").strip().replace("/", "\\")
+        name = (new_name or "").strip()
+        if not raw or not name or any(ch in name for ch in '<>:"/\\|?*'):
+            raise ValueError("远程重命名参数无效。")
+        p = self.ps_quote(raw)
+        n = self.ps_quote(name)
+        script = f"$ErrorActionPreference='Stop';$p={p};$n={n};if(-not(Test-Path -LiteralPath $p)){{throw('路径不存在：'+$p)}};Rename-Item -LiteralPath $p -NewName $n -ErrorAction Stop"
+        r = self.run_ps(script)
+        return self._require_success(r, f"重命名 {raw}")
+
     def remove_path(self, path: str):
         p = self.ps_quote(path)
         r = self.run_ps(
@@ -640,6 +704,36 @@ if ([IO.Directory]::Exists($p)) {{
             self.remove_empty_directory(task_root)
         if staging_root and ntpath.basename(staging_root).lower() == ".fds_tmp":
             self.remove_empty_directory(staging_root)
+
+    def path_info(self, path: str) -> dict:
+        """只读检查远程绝对路径，可同时识别文件与目录。"""
+        raw = (path or "").strip().replace("/", "\\")
+        if not re.match(r"^[A-Za-z]:\\(?:.*)?$", raw):
+            raise ValueError(f"远程路径必须是绝对 Windows 路径：{path}")
+        p = self.ps_quote(raw)
+        script = rf"""
+$ErrorActionPreference='Stop'
+$p={p}
+if (-not (Test-Path -LiteralPath $p)) {{
+  [pscustomobject]@{{Exists=$false;IsDirectory=$false;Size=0}} | ConvertTo-Json -Compress
+  exit 0
+}}
+$item=Get-Item -LiteralPath $p -Force
+$isDir=[bool]$item.PSIsContainer
+$size=if($isDir){{0}}else{{[Int64]$item.Length}}
+[pscustomobject]@{{Exists=$true;IsDirectory=$isDir;Size=$size}} | ConvertTo-Json -Compress
+"""
+        r = self.run_ps(script)
+        self._require_success(r, f"读取路径信息 {raw}")
+        try:
+            data = json.loads((r.get("stdout", "").splitlines() or ["{}"]) [-1])
+            return {
+                "exists": bool(data.get("Exists", False)),
+                "is_dir": bool(data.get("IsDirectory", False)),
+                "size": int(data.get("Size", 0) or 0),
+            }
+        except Exception as e:
+            raise RuntimeError(f"解析远程路径信息失败：{raw}；返回：{r.get('stdout','')}") from e
 
     def file_info(self, path: str, include_sha256: bool = False) -> dict:
         p = self.ps_quote(path)
@@ -682,6 +776,156 @@ if (-not (Get-Variable -Name sha -ErrorAction SilentlyContinue)) {{ $sha='' }}
         except Exception as e:
             raise RuntimeError(f"解析远程文件信息失败：{path}；返回：{r['stdout']}") from e
 
+    def download_file(self, remote_path: str, local_path: str | Path, chunk_size: int = 48 * 1024) -> Path:
+        """通过 WinRM 分块读取远程文件到本机，不依赖 SMB。"""
+        info = self.file_info(remote_path, include_sha256=False)
+        if not info.get("exists"):
+            raise FileNotFoundError(f"远程文件不存在：{remote_path}")
+        size = int(info.get("size", 0) or 0)
+        dest = Path(local_path); dest.parent.mkdir(parents=True, exist_ok=True)
+        rq = self.ps_quote(remote_path); chunk_size = min(max(8192, int(chunk_size)), 49152)
+        with dest.open("wb") as f:
+            offset = 0
+            while offset < size:
+                count = min(chunk_size, size-offset)
+                script = f"$p={rq};$fs=[IO.File]::OpenRead($p);try{{$fs.Seek({offset},0)|Out-Null;$b=New-Object byte[] {count};$n=$fs.Read($b,0,{count});if($n -lt $b.Length){{$x=New-Object byte[] $n;[Array]::Copy($b,$x,$n);$b=$x}};[Console]::Write([Convert]::ToBase64String($b))}}finally{{$fs.Dispose()}}"
+                r=self.run_ps(script); self._require_success(r, f"读取远程结果文件 {remote_path}")
+                data=base64.b64decode((r.get("stdout") or "").strip()); f.write(data); offset += len(data)
+        return dest
+
+    def run_version_checker_export(self, exe_path: str, workdir: str, output_dir: str,
+                                   save_button: str = "Save", timeout_seconds: int = 120,
+                                   close_after: bool = True) -> dict:
+        """在当前登录桌面启动版本检查器：Save -> OK -> 等待 CSV -> 可选关闭程序。"""
+        exe_path=(exe_path or "").strip(); workdir=(workdir or "").strip() or ntpath.dirname(exe_path)
+        output_dir=(output_dir or "").strip() or workdir; save_button=(save_button or "Save").strip() or "Save"
+        timeout_seconds=max(15,int(timeout_seconds or 120))
+        if not exe_path: raise ValueError("Version Checker 程序路径为空。")
+        def b64(v): return base64.b64encode(v.encode("utf-8")).decode("ascii")
+        ui = r"""$ErrorActionPreference='Stop'
+$exe=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__EXE__'))
+$wd=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__WD__'))
+$outDir=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__OUT__'))
+$btnName=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__BTN__'))
+$timeout=__TIMEOUT__; $closeAfter=__CLOSE__
+if (-not [IO.File]::Exists($exe)) { throw ('Program not found: ' + $exe) }
+if (-not [IO.Directory]::Exists($wd)) { throw ('Working directory not found: ' + $wd) }
+if (-not [IO.Directory]::Exists($outDir)) { [IO.Directory]::CreateDirectory($outDir) | Out-Null }
+$csv = Join-Path $outDir 'version_checker_result.csv'
+$beforeTicks = $null; $beforeLength = $null
+if ([IO.File]::Exists($csv)) { $fi = Get-Item -LiteralPath $csv; $beforeTicks = $fi.LastWriteTimeUtc.Ticks; $beforeLength = $fi.Length }
+$p = Start-Process $exe -WorkingDirectory $wd -PassThru
+$windowDeadline = (Get-Date).AddSeconds([Math]::Min(60, $timeout))
+do { $p.Refresh(); if ($p.HasExited) { throw 'Version Checker exited before its main window appeared.' }; if ($p.MainWindowHandle -ne 0) { break }; Start-Sleep -Milliseconds 300 } while ((Get-Date) -lt $windowDeadline)
+if ($p.MainWindowHandle -eq 0) { throw 'Timed out waiting for Version Checker main window.' }
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class FDSWin32 {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+  public const uint MOUSEEVENTF_LEFTDOWN=0x0002, MOUSEEVENTF_LEFTUP=0x0004, BM_CLICK=0x00F5;
+}
+'@
+function Get-FdsWindowText([IntPtr]$h) { $sb=New-Object Text.StringBuilder 512; [void][FDSWin32]::GetWindowText($h,$sb,$sb.Capacity); return $sb.ToString() }
+function Invoke-UiaByName([IntPtr]$rootHandle,[string]$name) {
+  try { $root=[Windows.Automation.AutomationElement]::FromHandle($rootHandle); if ($null -eq $root){return $false}; $cond=New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::NameProperty,$name); $el=$root.FindFirst([Windows.Automation.TreeScope]::Descendants,$cond); if ($null -eq $el){return $false}; $pat=$null; if($el.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern,[ref]$pat)){([Windows.Automation.InvokePattern]$pat).Invoke();return $true}; try{$el.SetFocus();[System.Windows.Forms.SendKeys]::SendWait('{ENTER}');return $true}catch{return $false} } catch { return $false }
+}
+function Invoke-ChildByText([IntPtr]$parent,[string]$text) {
+  $script:fdsFound=[IntPtr]::Zero; $cb=[FDSWin32+EnumWindowsProc]{param([IntPtr]$h,[IntPtr]$l) if ((Get-FdsWindowText $h) -eq $text){$script:fdsFound=$h;return $false};return $true}; [void][FDSWin32]::EnumChildWindows($parent,$cb,[IntPtr]::Zero); if ($script:fdsFound -ne [IntPtr]::Zero){[void][FDSWin32]::SendMessage($script:fdsFound,[FDSWin32]::BM_CLICK,[IntPtr]::Zero,[IntPtr]::Zero);return $true}; return $false
+}
+function Click-MainSaveFallback([IntPtr]$h) {
+  $rc=New-Object FDSWin32+RECT; if (-not [FDSWin32]::GetWindowRect($h,[ref]$rc)){return $false}
+  $w=$rc.Right-$rc.Left; $hh=$rc.Bottom-$rc.Top; if (($w -lt 500) -or ($hh -lt 300)){return $false}
+  [void][FDSWin32]::SetForegroundWindow($h); Start-Sleep -Milliseconds 300
+  # version_checker 的 Save 位于主窗口底部右侧，使用窗口相对坐标而非屏幕绝对坐标。
+  $x=[int]($rc.Left+($w*0.895)); $y=[int]($rc.Top+($hh*0.965))
+  [void][FDSWin32]::SetCursorPos($x,$y)
+  [FDSWin32]::mouse_event([FDSWin32]::MOUSEEVENTF_LEFTDOWN,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 100
+  [FDSWin32]::mouse_event([FDSWin32]::MOUSEEVENTF_LEFTUP,0,0,0,[UIntPtr]::Zero)
+  return $true
+}
+function Find-ProcessDialog([uint32]$processId,[string]$title,[int]$waitMs) {
+  $deadline=(Get-Date).AddMilliseconds($waitMs); do { $script:fdsDialog=[IntPtr]::Zero; $cb=[FDSWin32+EnumWindowsProc]{param([IntPtr]$h,[IntPtr]$l) if (-not [FDSWin32]::IsWindowVisible($h)){return $true}; [uint32]$wpid=0;[void][FDSWin32]::GetWindowThreadProcessId($h,[ref]$wpid); if ($wpid -ne $processId){return $true}; $t=Get-FdsWindowText $h; if (($title -eq '') -or ($t -eq $title)){$script:fdsDialog=$h;return $false};return $true}; [void][FDSWin32]::EnumWindows($cb,[IntPtr]::Zero); if ($script:fdsDialog -ne [IntPtr]::Zero){return $script:fdsDialog}; Start-Sleep -Milliseconds 200 } while ((Get-Date) -lt $deadline); return [IntPtr]::Zero
+}
+function Find-MainVersionCheckerWindow([int]$waitMs) {
+  $deadline=(Get-Date).AddMilliseconds($waitMs)
+  do {
+    $script:fdsBest=[IntPtr]::Zero; $script:fdsBestArea=0
+    $cb=[FDSWin32+EnumWindowsProc]{param([IntPtr]$h,[IntPtr]$l)
+      if (-not [FDSWin32]::IsWindowVisible($h)){return $true}
+      $t=Get-FdsWindowText $h
+      if ([string]::IsNullOrWhiteSpace($t)){return $true}
+      if ($t -notlike '*version_checker*'){return $true}
+      $rc=New-Object FDSWin32+RECT
+      if (-not [FDSWin32]::GetWindowRect($h,[ref]$rc)){return $true}
+      $area=($rc.Right-$rc.Left)*($rc.Bottom-$rc.Top)
+      if ($area -gt $script:fdsBestArea){$script:fdsBest=$h;$script:fdsBestArea=$area}
+      return $true
+    }
+    [void][FDSWin32]::EnumWindows($cb,[IntPtr]::Zero)
+    if ($script:fdsBest -ne [IntPtr]::Zero){return $script:fdsBest}
+    Start-Sleep -Milliseconds 200
+  } while ((Get-Date) -lt $deadline)
+  return [IntPtr]::Zero
+}
+function Find-InformationDialog([int]$waitMs) {
+  $deadline=(Get-Date).AddMilliseconds($waitMs)
+  do {
+    $script:fdsDialog=[IntPtr]::Zero
+    $cb=[FDSWin32+EnumWindowsProc]{param([IntPtr]$h,[IntPtr]$l)
+      if (-not [FDSWin32]::IsWindowVisible($h)){return $true}
+      $t=Get-FdsWindowText $h
+      if ($t -eq 'Information'){$script:fdsDialog=$h;return $false}
+      return $true
+    }
+    [void][FDSWin32]::EnumWindows($cb,[IntPtr]::Zero)
+    if ($script:fdsDialog -ne [IntPtr]::Zero){return $script:fdsDialog}
+    Start-Sleep -Milliseconds 150
+  } while ((Get-Date) -lt $deadline)
+  return [IntPtr]::Zero
+}
+$main=Find-MainVersionCheckerWindow ([Math]::Min(15000,$timeout*1000))
+if ($main -eq [IntPtr]::Zero){throw 'Unable to locate visible version_checker window.'}
+$saveMethod=''; $dlg=[IntPtr]::Zero
+if (Invoke-UiaByName $main $btnName){$saveMethod='UIA';$dlg=Find-InformationDialog 2500}
+if (($dlg -eq [IntPtr]::Zero) -and (Invoke-ChildByText $main $btnName)){$saveMethod='WIN32_TEXT';$dlg=Find-InformationDialog 2500}
+if (($dlg -eq [IntPtr]::Zero) -and (Click-MainSaveFallback $main)){$saveMethod='RELATIVE_CLICK';$dlg=Find-InformationDialog 5000}
+if ($dlg -eq [IntPtr]::Zero){throw('Unable to invoke Save or Information dialog did not appear: '+$btnName)}
+$okMethod=''; if (Invoke-UiaByName $dlg 'OK'){$okMethod='UIA'} elseif (Invoke-ChildByText $dlg 'OK') {$okMethod='WIN32_TEXT'}else{[void][FDSWin32]::SetForegroundWindow($dlg);Start-Sleep -Milliseconds 150;[System.Windows.Forms.SendKeys]::SendWait('{ENTER}');$okMethod='ENTER'}
+$result=$null;$deadline=(Get-Date).AddSeconds($timeout)
+do { if ([IO.File]::Exists($csv)){try{$fi=Get-Item -LiteralPath $csv;$changed=($null -eq $beforeTicks) -or ($fi.LastWriteTimeUtc.Ticks -gt $beforeTicks) -or ($fi.Length -ne $beforeLength);if ($changed -and ($fi.Length -gt 0)){$len1=$fi.Length;$ticks1=$fi.LastWriteTimeUtc.Ticks;Start-Sleep -Milliseconds 700;$fi.Refresh();if (($fi.Length -eq $len1) -and ($fi.LastWriteTimeUtc.Ticks -eq $ticks1) -and ($fi.Length -gt 0)){$result=$fi;break}}}catch{}};Start-Sleep -Milliseconds 350 } while ((Get-Date) -lt $deadline)
+if ($null -eq $result){throw('CSV not created/updated: '+$csv)}
+if ($closeAfter -and -not $p.HasExited){try{[void]$p.CloseMainWindow();Start-Sleep -Milliseconds 800}catch{};$p.Refresh();if (-not $p.HasExited){try{$p.Kill();$p.WaitForExit(3000)|Out-Null}catch{}}}
+[pscustomobject]@{CsvPath=$result.FullName;Size=[Int64]$result.Length;SaveMethod=$saveMethod;OkMethod=$okMethod}|ConvertTo-Json -Compress
+"""
+        ui=(ui.replace('__EXE__',b64(exe_path)).replace('__WD__',b64(workdir)).replace('__OUT__',b64(output_dir))
+              .replace('__BTN__',b64(save_button)).replace('__TIMEOUT__',str(timeout_seconds)).replace('__CLOSE__','$true' if close_after else '$false'))
+        payload=base64.b64encode(b'\xef\xbb\xbf' + ui.encode('utf-8')).decode('ascii')
+        token=str(int(monotonic()*1000)); create=rf"""$d=Join-Path $env:ProgramData 'FileDistributionStudio\version_checker';[IO.Directory]::CreateDirectory($d)|Out-Null;$p=Join-Path $d 'run_{token}.ps1';[IO.File]::WriteAllBytes($p,[Convert]::FromBase64String('{payload}'));[Console]::Write($p)"""
+        cr=self.run_ps_streamed(create); self._require_success(cr,'部署 Version Checker 自动化脚本'); ps=(cr.get('stdout') or '').strip().splitlines()[-1]
+        try:
+            r=self.run_interactive_cmd(f'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{ps}"',workdir=workdir,timeout_seconds=timeout_seconds+35)
+            self._require_success(r,'Version Checker 自动导出'); text=(r.get('stdout') or '').strip(); data=json.loads(text.splitlines()[-1])
+            return {'csv_path':str(data.get('CsvPath','')),'size':int(data.get('Size',0) or 0),'save_method':str(data.get('SaveMethod','')),'ok_method':str(data.get('OkMethod','')),'interactive_user':r.get('interactive_user','')}
+        finally:
+            try:self.run_ps(f"Remove-Item -LiteralPath {self.ps_quote(ps)} -Force -ErrorAction SilentlyContinue")
+            except Exception:pass
+
     def free_space(self, path: str) -> int | None:
         """返回目标盘可用字节。UNC/无法识别卷时返回 None，不阻断写权限预检查。"""
         m = re.match(r"^([A-Za-z]):[\\/]", (path or "").strip())
@@ -714,6 +958,23 @@ Copy-Item -LiteralPath {src} -Destination {dst} {force}
 """
         r = self.run_ps(script)
         return self._require_success(r, f"远程备份 {source} → {destination}")
+
+    def copy_remote_directory(self, source: str, destination: str, overwrite: bool = True):
+        """在同一目标 Windows 主机内递归复制一个目录到备份位置。"""
+        src = self.ps_quote(source)
+        dst = self.ps_quote(destination)
+        parent = ntpath.dirname(destination)
+        parent_q = self.ps_quote(parent)
+        remove = f"if (Test-Path -LiteralPath {dst}) {{ Remove-Item -LiteralPath {dst} -Recurse -Force }}" if overwrite else ""
+        script = rf"""
+$ErrorActionPreference='Stop'
+if (-not (Test-Path -LiteralPath {src} -PathType Container)) {{ throw '源目录不存在' }}
+[IO.Directory]::CreateDirectory({parent_q}) | Out-Null
+{remove}
+Copy-Item -LiteralPath {src} -Destination {dst} -Recurse -Force
+"""
+        r = self.run_ps(script)
+        return self._require_success(r, f"远程目录备份 {source} → {destination}")
 
     def promote_temp_file(self, temp_path: str, destination: str):
         temp = self.ps_quote(temp_path)

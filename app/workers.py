@@ -1,8 +1,9 @@
 from pathlib import Path
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 import getpass
 import platform
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
@@ -11,6 +12,7 @@ from PySide6.QtCore import QThread, Signal
 from .models import HostRecord, DistributionMapping, PreparedMapping
 from .version import APP_VERSION
 from .config import AppSettings
+from .utils import human_bytes
 from .services.manifest import build_manifest, manifest_digest
 from .services.sftp_source import SftpSource
 from .services.winrm_distribution import distribute_plan_to_host_winrm, test_winrm_targets
@@ -53,6 +55,35 @@ class DiscoveryThread(QThread):
         except Exception as e:
             self.log.emit(f"主机发现失败：{e}")
             self.completed.emit("Failed")
+
+
+class DiscoveryReconcileThread(QThread):
+    """Re-check saved hosts that were not rediscovered in the current scan.
+
+    The scan itself intentionally only returns Windows-like hosts.  For an IP that
+    used to exist in the host library but is missing from the new scan, this worker
+    distinguishes "reachable but no Windows signals" from simple offline/unreachable
+    so the UI can make a safe cleanup suggestion without deleting anything silently.
+    """
+    completed = Signal(object)  # list[(host, HostConnectivity)]
+
+    def __init__(self, hosts: list[str], timeout: float, max_workers: int = 16):
+        super().__init__()
+        self.hosts = list(dict.fromkeys(hosts))
+        self.timeout = timeout
+        self.max_workers = max(1, min(32, max_workers))
+
+    def run(self):
+        results = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+            futures = {ex.submit(test_host_connectivity, h, self.timeout): h for h in self.hosts}
+            for fut in as_completed(futures):
+                h = futures[fut]
+                try:
+                    results.append((h, fut.result()))
+                except Exception:
+                    results.append((h, None))
+        self.completed.emit(results)
 
 
 class HostnameVerificationThread(QThread):
@@ -228,6 +259,86 @@ class WinRMTargetTestThread(QThread):
                     failed += 1
                 self.result.emit(host, ok, msg)
         self.completed.emit(success, failed)
+
+
+class HostEnvironmentCheckThread(QThread):
+    """Read-only Windows environment inspection via WinRM."""
+    result = Signal(str, bool, object)
+    completed = Signal(int, int)
+
+    def __init__(self, hosts: list[HostRecord], credentials: dict[str, tuple[str, str, str]],
+                 use_https: bool = False, port: int = 5985, max_workers: int = 8):
+        super().__init__()
+        self.hosts=list(hosts or [])
+        self.credentials=dict(credentials or {})
+        self.use_https=bool(use_https); self.port=int(port)
+        self.max_workers=max(1,min(16,int(max_workers or 8)))
+
+    def _one(self, hrec: HostRecord):
+        username,password,source=self.credentials.get(hrec.host,("","","未设置"))
+        if not username or not password:
+            return hrec.host,False,{"error":f"{source}缺少用户名或密码。"}
+        try:
+            username=qualify_windows_username(username,hrec.name)
+            plan=RemoteActionPlan(enabled=False,use_https=self.use_https,port=self.port,
+                                  username=username,password=password,command_timeout=30)
+            ps=r'''$ErrorActionPreference='Stop'
+$profiles=@()
+try {
+  $profiles=@(Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object {
+    [pscustomobject]@{Name=[string]$_.Name;Enabled=[bool]$_.Enabled;DefaultInboundAction=[string]$_.DefaultInboundAction;DefaultOutboundAction=[string]$_.DefaultOutboundAction}
+  })
+} catch { $profiles=@() }
+$svc=Get-Service -Name W32Time -ErrorAction SilentlyContinue
+$tz=''
+try { $tz=(Get-TimeZone).Id } catch { $tz=[TimeZoneInfo]::Local.Id }
+[pscustomobject]@{
+  UtcNow=[DateTimeOffset]::UtcNow.ToString('o')
+  TimeZone=$tz
+  TimeService=if($null -eq $svc){'NotFound'}else{[string]$svc.Status}
+  FirewallProfiles=$profiles
+} | ConvertTo-Json -Depth 5 -Compress'''
+            t0=datetime.now(timezone.utc)
+            rr=WinRMExecutor(hrec.host,plan).run_ps(ps)
+            t1=datetime.now(timezone.utc)
+            if int(rr.get('exit_code',1)) != 0:
+                raise RuntimeError(rr.get('stderr') or rr.get('stdout') or f"退出码={rr.get('exit_code')}")
+            payload=json.loads((rr.get('stdout') or '').strip())
+            raw=str(payload.get('UtcNow') or '').replace('Z','+00:00')
+            remote=datetime.fromisoformat(raw)
+            if remote.tzinfo is None:
+                remote=remote.replace(tzinfo=timezone.utc)
+            midpoint=t0+(t1-t0)/2
+            drift=(remote.astimezone(timezone.utc)-midpoint).total_seconds()
+            profiles=payload.get('FirewallProfiles') or []
+            if isinstance(profiles,dict): profiles=[profiles]
+            if not profiles:
+                fw='无法读取'
+            else:
+                enabled=[str(x.get('Name','?')) for x in profiles if bool(x.get('Enabled'))]
+                disabled=[str(x.get('Name','?')) for x in profiles if not bool(x.get('Enabled'))]
+                if not enabled: fw='全部关闭'
+                elif not disabled: fw='全部开启'
+                else: fw='部分开启（' + ','.join(enabled) + '）'
+            return hrec.host,True,{
+                'time_drift_seconds':round(drift,3), 'remote_utc':remote.astimezone(timezone.utc).isoformat(),
+                'local_utc':midpoint.isoformat(), 'time_zone':str(payload.get('TimeZone') or '未知'),
+                'time_service':str(payload.get('TimeService') or '未知'), 'firewall_profiles':profiles,
+                'firewall_summary':fw, 'credential_source':source,
+            }
+        except Exception as exc:
+            return hrec.host,False,{'error':str(exc),'credential_source':source}
+
+    def run(self):
+        success=failed=0
+        with ThreadPoolExecutor(max_workers=min(self.max_workers,max(1,len(self.hosts)))) as ex:
+            futures=[ex.submit(self._one,h) for h in self.hosts]
+            for fut in as_completed(futures):
+                host,ok,data=fut.result()
+                if ok: success+=1
+                else: failed+=1
+                self.result.emit(host,ok,data)
+        self.completed.emit(success,failed)
 
 
 class DistributionThread(QThread):
@@ -562,3 +673,561 @@ class DistributionThread(QThread):
                 pass
             self.completed.emit(status, 0, len(self.hosts))
 
+
+class DryRunThread(DistributionThread):
+    """Read-only execution-plan validation.
+
+    Dry Run deliberately never uploads, replaces, kills, starts/stops, backs up, or
+    launches Version Checker.  It may read local/SFTP sources to build the manifest,
+    and uses WinRM only for authentication and read-only remote path / free-space
+    checks.  Target paths that do not yet exist are reported as warnings because the
+    real distribution path is allowed to create them during its write preflight.
+    """
+    dry_completed = Signal(object)
+
+    def __init__(self, mappings: list[DistributionMapping], hosts: list[HostRecord],
+                 credentials: dict[str, tuple[str, str, str]], settings: AppSettings,
+                 remote_plan: RemoteActionPlan | None = None, backup_root_path: str = "",
+                 version_config: dict | None = None):
+        super().__init__(mappings, hosts, credentials, settings,
+                         remote_plan or RemoteActionPlan(enabled=False), backup_root_path)
+        self.task_id = "DRYRUN-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        self.version_config = dict(version_config or {})
+
+    def cancel(self):
+        self._cancel.set()
+        audit.operation(self.settings.audit_path, "PREFLIGHT", "DRY_RUN_CANCEL_REQUEST", "CANCELLED",
+                        "用户请求取消 Dry Run。", task_id=self.task_id)
+
+    @staticmethod
+    def _target_bytes(prepared: list[PreparedMapping]) -> dict[str, int]:
+        totals: dict[str, int] = {}
+        for pm in prepared:
+            key = (pm.mapping.target_path or "").strip()
+            totals[key] = totals.get(key, 0) + int(pm.total_bytes)
+        return totals
+
+    def _check_host(self, hrec: HostRecord, prepared: list[PreparedMapping]) -> dict:
+        username, password, source = self._credential_for(hrec)
+        plan = replace(self.remote_plan, enabled=False, username=username, password=password)
+        executor = WinRMExecutor(hrec.host, plan)
+        issues: list[str] = []
+        warnings: list[str] = []
+        details: list[str] = []
+
+        try:
+            r = executor.test()
+            if int(r.get("exit_code", 1)) != 0:
+                raise RuntimeError(r.get("stderr") or r.get("stdout") or f"退出码={r.get('exit_code')}")
+            details.append(f"WinRM认证通过（{source}）")
+        except Exception as exc:
+            return {"host": hrec.host, "name": hrec.name or hrec.host, "status": "FAILED",
+                    "issues": [describe_winrm_failure(hrec.host, plan, exc)], "warnings": [], "details": []}
+
+        target_totals = self._target_bytes(prepared)
+        margin = max(0, int(self.settings.min_free_space_margin_mb)) * 1024 * 1024
+        for target, bytes_needed in target_totals.items():
+            try:
+                info = executor.path_info(target)
+                if info.get("exists"):
+                    if not info.get("is_dir"):
+                        issues.append(f"目标路径已存在但不是目录：{target}")
+                    else:
+                        details.append(f"目标目录存在：{target}")
+                else:
+                    warnings.append(f"目标目录不存在，正式执行时将尝试创建：{target}")
+                free = executor.free_space(target)
+                if free is not None:
+                    required = int(bytes_needed) + margin
+                    # 使用目标目录内置备份时，同盘至少再预留一份源文件规模。
+                    if self.settings.backup_existing and not (self.backup_root_path or "").strip():
+                        required += int(bytes_needed)
+                    if free < required:
+                        issues.append(
+                            f"目标磁盘空间不足：{target} 可用 {human_bytes(free)}，预计至少需要 {human_bytes(required)}"
+                        )
+                    else:
+                        details.append(f"目标盘空间通过：{target} 可用 {human_bytes(free)}")
+            except Exception as exc:
+                issues.append(f"读取目标路径失败：{target}；{exc}")
+
+        if self.settings.backup_existing and (self.backup_root_path or "").strip():
+            root = self.backup_root_path.strip()
+            try:
+                info = executor.path_info(root)
+                if info.get("exists") and not info.get("is_dir"):
+                    issues.append(f"备份根路径已存在但不是目录：{root}")
+                elif info.get("exists"):
+                    details.append(f"备份根目录存在：{root}")
+                else:
+                    warnings.append(f"备份根目录不存在，正式执行时将自动创建：{root}")
+                free = executor.free_space(root)
+                if free is not None:
+                    backup_required = sum(int(pm.total_bytes) for pm in prepared) + margin
+                    if free < backup_required:
+                        issues.append(
+                            f"备份盘空间不足：{root} 可用 {human_bytes(free)}，预计至少需要 {human_bytes(backup_required)}"
+                        )
+                    else:
+                        details.append(f"备份盘空间通过：{root} 可用 {human_bytes(free)}")
+            except Exception as exc:
+                issues.append(f"读取备份根目录失败：{root}；{exc}")
+
+        if self.remote_plan.enabled and (self.remote_plan.command_workdir or "").strip():
+            wd = self.remote_plan.command_workdir.strip()
+            try:
+                info = executor.path_info(wd)
+                if not info.get("exists") or not info.get("is_dir"):
+                    issues.append(f"CMD 工作目录不存在或不是目录：{wd}")
+                else:
+                    details.append(f"CMD 工作目录存在：{wd}")
+            except Exception as exc:
+                issues.append(f"读取 CMD 工作目录失败：{wd}；{exc}")
+
+        if self.version_config.get("enabled"):
+            exe = str(self.version_config.get("exe_path") or "").strip()
+            wd = str(self.version_config.get("workdir") or "").strip()
+            out = str(self.version_config.get("output_dir") or "").strip()
+            for label, path, expect_dir in (("Version Checker 程序", exe, False),
+                                            ("Version Checker 工作目录", wd, True),
+                                            ("Version Checker CSV目录", out, True)):
+                if not path:
+                    issues.append(f"{label}未配置")
+                    continue
+                try:
+                    info = executor.path_info(path)
+                    if not info.get("exists"):
+                        issues.append(f"{label}不存在：{path}")
+                    elif bool(info.get("is_dir")) != bool(expect_dir):
+                        issues.append(f"{label}类型不正确：{path}")
+                    else:
+                        details.append(f"{label}存在：{path}")
+                except Exception as exc:
+                    issues.append(f"读取{label}失败：{path}；{exc}")
+
+        status = "FAILED" if issues else ("WARNING" if warnings else "SUCCESS")
+        return {"host": hrec.host, "name": hrec.name or hrec.host, "status": status,
+                "issues": issues, "warnings": warnings, "details": details}
+
+    def run(self):
+        summary = {"task_id": self.task_id, "status": "FAILED", "success": 0,
+                   "warning": 0, "failed": 0, "hosts": [], "file_count": 0,
+                   "total_bytes": 0, "mapping_count": len(self.mappings), "error": ""}
+        try:
+            if not self.mappings:
+                raise RuntimeError("没有配置任何启用的分发映射。")
+            self._log("Dry Run 开始：只做读取与检查，不上传、不覆盖、不备份、不结束进程、不执行 CMD、不启动 Version Checker。")
+            prepared: list[PreparedMapping] = []
+            for mapping in self.mappings:
+                if self._cancel.is_set():
+                    raise RuntimeError("用户已取消 Dry Run")
+                self.mapping_status.emit(mapping.mapping_id, "PREPARING", "Dry Run 生成清单")
+                pm = self._prepare_mapping(mapping)
+                if not pm.manifest:
+                    raise RuntimeError(f"分发映射没有可分发文件：{mapping.display_source()}")
+                prepared.append(pm)
+                self.mapping_status.emit(mapping.mapping_id, "READY", f"Dry Run：{pm.file_count} 个文件 / {human_bytes(pm.total_bytes)}")
+            self._check_collisions(prepared)
+            summary["file_count"] = sum(pm.file_count for pm in prepared)
+            summary["total_bytes"] = sum(pm.total_bytes for pm in prepared)
+            self.prepared.emit(self.task_id, summary["file_count"], summary["total_bytes"])
+            self._log(f"Dry Run 分发计划：{len(prepared)} 条映射，{summary['file_count']} 个文件，共 {human_bytes(summary['total_bytes'])}。")
+
+            with ThreadPoolExecutor(max_workers=min(max(1, self.settings.max_concurrency), max(1, len(self.hosts)))) as ex:
+                futures = {ex.submit(self._check_host, h, prepared): h for h in self.hosts}
+                for fut in as_completed(futures):
+                    if self._cancel.is_set():
+                        break
+                    result = fut.result()
+                    summary["hosts"].append(result)
+                    st = result["status"]
+                    if st == "SUCCESS":
+                        summary["success"] += 1
+                        detail = "预演通过"
+                    elif st == "WARNING":
+                        summary["warning"] += 1
+                        detail = "；".join(result["warnings"][:2]) or "有警告"
+                    else:
+                        summary["failed"] += 1
+                        detail = "；".join(result["issues"][:2]) or "预演失败"
+                    self.host_status.emit(result["host"], st, detail)
+                    for item in result["details"]:
+                        self._log(f"[{result['host']}] ✓ {item}")
+                    for item in result["warnings"]:
+                        self._log(f"[{result['host']}] ⚠ {item}")
+                    for item in result["issues"]:
+                        self._log(f"[{result['host']}] ✗ {item}")
+
+            if self._cancel.is_set():
+                summary["status"] = "CANCELLED"
+            elif summary["failed"]:
+                summary["status"] = "FAILED"
+            elif summary["warning"]:
+                summary["status"] = "WARNING"
+            else:
+                summary["status"] = "SUCCESS"
+            audit.operation(
+                self.settings.audit_path, "PREFLIGHT", "DRY_RUN", summary["status"],
+                "Dry Run 执行计划检查完成。", task_id=self.task_id,
+                details={k: v for k, v in summary.items() if k != "hosts"},
+            )
+        except Exception as exc:
+            summary["error"] = str(exc)
+            summary["status"] = "CANCELLED" if self._cancel.is_set() else "FAILED"
+            self._log(f"Dry Run 失败：{exc}")
+            audit.operation(self.settings.audit_path, "PREFLIGHT", "DRY_RUN", summary["status"],
+                            str(exc), task_id=self.task_id)
+        self.dry_completed.emit(summary)
+
+
+class BackupThread(DistributionThread):
+    """Standalone backup for the currently enabled distribution mappings.
+
+    The local/SFTP source is used only to build the same target-file manifest that a
+    distribution would use.  No file is uploaded or replaced.  For each target host,
+    only an existing remote file that corresponds to a manifest entry is copied to the
+    backup location.
+    """
+    completed = Signal(str, int, int)
+
+    def __init__(self, mappings: list[DistributionMapping], hosts: list[HostRecord],
+                 credentials: dict[str, tuple[str, str, str]], settings: AppSettings,
+                 connection_plan: RemoteActionPlan | None = None, backup_root_path: str = "",
+                 remote_paths: list[str] | None = None):
+        super().__init__(mappings, hosts, credentials, settings,
+                         connection_plan or RemoteActionPlan(enabled=False), backup_root_path)
+        self.remote_paths = list(remote_paths or [])
+        self.task_id = "BACKUP-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+
+    @staticmethod
+    def _remote_final_path(mapping: DistributionMapping, relative_path: str) -> str:
+        import ntpath
+        base = mapping.target_path.rstrip("\\/")
+        rel = (relative_path or "").replace("/", "\\")
+        return ntpath.normpath(base + "\\" + rel) if rel else ntpath.normpath(base)
+
+    def _backup_destination(self, source_path: str) -> str:
+        import ntpath
+        src = ntpath.normpath(source_path)
+        if self.backup_root_path:
+            drive, tail = ntpath.splitdrive(src)
+            drive_name = drive.rstrip(":\\/") or "ROOT"
+            tail = tail.lstrip("\\/")
+            return ntpath.join(self.backup_root_path, self.task_id, drive_name, tail)
+        parent = ntpath.dirname(src)
+        name = ntpath.basename(src)
+        return ntpath.join(parent, ".fds_backup", self.task_id, name)
+
+    def run(self):
+        try:
+            if not self.mappings and not self.remote_paths:
+                raise RuntimeError("没有指定任何需要备份的目标文件。")
+            prepared=[]
+            if not self.remote_paths:
+                for mapping in self.mappings:
+                    if self._cancel.is_set(): break
+                    pm=self._prepare_mapping(mapping)
+                    prepared.append(pm)
+                    self._log(f"备份清单已生成：{mapping.target_path}，{pm.file_count} 个目标文件。")
+            else:
+                self._log(f"单独备份文件清单：{len(self.remote_paths)} 个目标路径。")
+            if self._cancel.is_set():
+                self.completed.emit("CANCELLED",0,0); return
+
+            success=failed=0
+            def one(hrec):
+                username,password,source=self._credential_for(hrec)
+                plan=replace(self.remote_plan,enabled=False,username=username,password=password)
+                ex=WinRMExecutor(hrec.host,plan)
+                self.host_status.emit(hrec.host,"RUNNING","备份中")
+                if self.backup_root_path:
+                    import ntpath
+                    task_backup_root = ntpath.join(self.backup_root_path, self.task_id)
+                    ex.ensure_directory(task_backup_root)
+                    self._log(f"[{hrec.host}] 备份目录已就绪：{task_backup_root}（不存在自动创建，已存在直接使用）")
+                copied=skipped=0
+                targets=list(self.remote_paths)
+                if not targets:
+                    for pm in prepared:
+                        for entry in pm.manifest:
+                            targets.append(self._remote_final_path(pm.mapping,entry.relative_path))
+                for remote in targets:
+                    if self._cancel.is_set(): return hrec,"CANCELLED",copied,skipped,"已取消"
+                    info=ex.path_info(remote)
+                    if not info.get("exists"):
+                        skipped+=1
+                        self._log(f"[{hrec.host}] 跳过（目标不存在）：{remote}")
+                        continue
+                    dest=self._backup_destination(remote)
+                    if info.get("is_dir"):
+                        ex.copy_remote_directory(remote,dest,overwrite=True)
+                        copied+=1
+                        self._log(f"[{hrec.host}] 已递归备份目录：{remote} → {dest}")
+                    else:
+                        ex.copy_remote_file(remote,dest,overwrite=True)
+                        copied+=1
+                        self._log(f"[{hrec.host}] 已备份文件：{remote} → {dest}")
+                return hrec,"SUCCESS",copied,skipped,""
+
+            with ThreadPoolExecutor(max_workers=max(1,self.settings.max_concurrency)) as pool:
+                futures=[pool.submit(one,h) for h in self.hosts]
+                for fut in as_completed(futures):
+                    try:
+                        h,status,copied,skipped,msg=fut.result()
+                    except Exception as e:
+                        failed+=1; self._log(f"备份主机失败：{e}"); continue
+                    if status=="SUCCESS":
+                        success+=1
+                        detail=f"备份={copied}，远端不存在/跳过={skipped}"
+                        self.host_status.emit(h.host,"SUCCESS",detail)
+                        audit.operation(self.settings.audit_path,"BACKUP","STANDALONE","SUCCESS","单独备份完成。",task_id=self.task_id,host=h.host,details={"copied":copied,"skipped":skipped,"backup_root":self.backup_root_path})
+                    elif status=="CANCELLED":
+                        self.host_status.emit(h.host,"CANCELLED",msg)
+                    else:
+                        failed+=1; self.host_status.emit(h.host,"FAILED",msg)
+            status="CANCELLED" if self._cancel.is_set() else ("SUCCESS" if failed==0 else ("PARTIAL_FAILED" if success else "FAILED"))
+            self.completed.emit(status,success,failed)
+        except Exception as e:
+            self._log(f"备份任务失败：{e}")
+            self.completed.emit("CANCELLED" if self._cancel.is_set() else "FAILED",0,len(self.hosts))
+
+
+class VersionCheckThread(QThread):
+    log = Signal(str)
+    host_status = Signal(str, str, str)
+    completed = Signal(str, int, int, str)
+
+    def __init__(self, hosts: list[HostRecord], credentials: dict[str, tuple[str, str, str]], settings: AppSettings,
+                 connection_plan: RemoteActionPlan, exe_path: str, workdir: str, output_dir: str,
+                 save_button: str, timeout_seconds: int, collect_excel: bool, close_after: bool,
+                 local_result_root: str):
+        super().__init__()
+        self.hosts=list(hosts); self.credentials=dict(credentials or {}); self.settings=settings
+        self.connection_plan=connection_plan; self.exe_path=exe_path; self.workdir=workdir; self.output_dir=output_dir
+        self.save_button=save_button; self.timeout_seconds=max(15,int(timeout_seconds or 120))
+        self.collect_excel=bool(collect_excel); self.close_after=bool(close_after)
+        self.local_result_root=local_result_root
+        self.task_id='VERCHK-'+datetime.now().strftime('%Y%m%d-%H%M%S-%f')[:-3]
+        self._cancel=threading.Event()
+
+    def cancel(self): self._cancel.set()
+    def _log(self,text): self.log.emit(text)
+
+    def _credential_for(self,hrec):
+        username,password,source=self.credentials.get(hrec.host,("","","未设置"))
+        username=qualify_windows_username(username,hrec.name)
+        if not username or not password: raise RuntimeError(f"{hrec.host} 缺少 WinRM 凭据（{source}）。")
+        return username,password,source
+
+    def run(self):
+        base=Path(self.local_result_root).expanduser()/self.task_id
+        base.mkdir(parents=True,exist_ok=True)
+        success=failed=0
+        def one(hrec):
+            if self._cancel.is_set(): return hrec,'CANCELLED','已取消',''
+            try:
+                username,password,source=self._credential_for(hrec)
+                plan=replace(self.connection_plan,enabled=False,username=username,password=password)
+                ex=WinRMExecutor(hrec.host,plan)
+                self.host_status.emit(hrec.host,'RUNNING','Version Checker 启动中')
+                self._log(f"[{hrec.host}] 启动 Version Checker；凭据来源：{source}")
+                result=ex.run_version_checker_export(self.exe_path,self.workdir,self.output_dir,self.save_button,self.timeout_seconds,self.close_after)
+                remote_csv=result['csv_path']; local=''
+                self._log(f"[{hrec.host}] Save 已触发（{result.get('save_method') or 'unknown'}），Information/OK 已处理（{result.get('ok_method') or 'unknown'}）。")
+                if self.collect_excel:
+                    safe_host=(hrec.name or "UNKNOWN_HOST").replace('\\','_').replace('/','_').replace(':','_')
+                    safe_ip=(hrec.host or "UNKNOWN_IP").replace('\\','_').replace('/','_').replace(':','_')
+                    filename=Path(remote_csv.replace('\\','/')).name or 'version_checker_result.csv'
+                    # 回收结果直接放到用户选择的本机结果目录根目录，并同时带主机名和 IP，便于多机现场核对。
+                    local_root=Path(self.local_result_root).expanduser()
+                    local_root.mkdir(parents=True,exist_ok=True)
+                    local_path=local_root/f"{safe_host}_{safe_ip}_{filename}"
+                    downloaded=ex.download_file(remote_csv,local_path)
+                    remote_size=int(result.get('size',0) or 0)
+                    if not downloaded.exists():
+                        raise RuntimeError(f"CSV 回收后本机文件不存在：{downloaded}")
+                    local_size=downloaded.stat().st_size
+                    if remote_size and local_size != remote_size:
+                        raise RuntimeError(f"CSV 回收大小校验失败：远端={remote_size} 字节，本机={local_size} 字节；{downloaded}")
+                    local=str(downloaded.resolve())
+                    self._log(f"[{hrec.host}] CSV 已回收到本机：{local}")
+                    self._log(f"[{hrec.host}] 本机文件已确认：{local_size} 字节。")
+                else:
+                    self._log(f"[{hrec.host}] CSV 已生成：{remote_csv}")
+                audit.operation(self.settings.audit_path,'VERSION_CHECK','EXPORT','SUCCESS','Version Checker 导出完成。',task_id=self.task_id,host=hrec.host,subject=remote_csv,details={'local_result':local})
+                return hrec,'SUCCESS',f"版本检查完成；CSV={'已回收' if self.collect_excel else remote_csv}",local
+            except Exception as e:
+                msg=str(e); self._log(f"[{hrec.host}] Version Checker 失败：{msg}")
+                audit.operation(self.settings.audit_path,'VERSION_CHECK','EXPORT','FAILED',msg,task_id=self.task_id,host=hrec.host)
+                return hrec,'FAILED',msg,''
+        with ThreadPoolExecutor(max_workers=max(1,self.settings.max_concurrency)) as pool:
+            futs=[pool.submit(one,h) for h in self.hosts]
+            for fut in as_completed(futs):
+                h,status,detail,local=fut.result(); self.host_status.emit(h.host,status,detail)
+                if status=='SUCCESS': success+=1
+                elif status=='FAILED': failed+=1
+        status='CANCELLED' if self._cancel.is_set() else ('SUCCESS' if failed==0 else ('PARTIAL_FAILED' if success else 'FAILED'))
+        self.completed.emit(status,success,failed,str(Path(self.local_result_root).expanduser().resolve()) if self.collect_excel else '')
+
+class RemoteFileOperationThread(QThread):
+    """远程文件管理独立操作线程。
+
+    只服务“远程文件”人工运维模块，不参与文件分发、备份、Dry Run、版本检查等任务流程。
+    """
+    progress = Signal(int, int, str)
+    log = Signal(str)
+    completed = Signal(object)
+
+    def __init__(self, context: dict, operation: str, *, use_https=False, port=5985,
+                 remote_path="", local_path="", paths=None, new_name=""):
+        super().__init__()
+        self.context = dict(context or {})
+        self.operation = str(operation or "").upper()
+        self.use_https = bool(use_https)
+        self.port = int(port)
+        self.remote_path = str(remote_path or "")
+        self.local_path = str(local_path or "")
+        self.paths = list(paths or [])
+        self.new_name = str(new_name or "")
+
+    def _executor(self):
+        plan = RemoteActionPlan(
+            enabled=False,
+            use_https=self.use_https,
+            port=self.port,
+            username=self.context.get("username", ""),
+            password=self.context.get("password", ""),
+            command_timeout=120,
+        )
+        return WinRMExecutor(self.context.get("host", ""), plan)
+
+    def _upload_one(self, executor, source: Path, remote_dir: str, counters: dict):
+        import ntpath
+        if source.is_file():
+            dest = ntpath.join(remote_dir, source.name)
+            self.log.emit(f"上传：{source} -> {dest}")
+            executor.upload_file(source, dest)
+            counters["done"] += 1
+            self.progress.emit(counters["done"], counters["total"], source.name)
+            return
+        base_dest = ntpath.join(remote_dir, source.name)
+        executor.ensure_directory(base_dest)
+        for item in sorted(source.rglob("*")):
+            rel = item.relative_to(source)
+            remote_item = ntpath.join(base_dest, *rel.parts)
+            if item.is_dir():
+                executor.ensure_directory(remote_item)
+            elif item.is_file():
+                self.log.emit(f"上传：{item} -> {remote_item}")
+                executor.upload_file(item, remote_item)
+                counters["done"] += 1
+                self.progress.emit(counters["done"], counters["total"], item.name)
+
+    @staticmethod
+    def _count_local_files(paths):
+        total = 0
+        for raw in paths:
+            p = Path(raw)
+            if p.is_file():
+                total += 1
+            elif p.is_dir():
+                total += sum(1 for x in p.rglob("*") if x.is_file())
+        return total
+
+    def _download_remote_tree(self, executor, remote_source: str, local_dir: Path, counters: dict):
+        import ntpath
+        info = executor.path_info(remote_source)
+        if not info.get("exists"):
+            raise FileNotFoundError(f"远程路径不存在：{remote_source}")
+        if not info.get("is_dir"):
+            dest = local_dir / ntpath.basename(remote_source)
+            self.log.emit(f"下载：{remote_source} -> {dest}")
+            executor.download_file(remote_source, dest)
+            counters["done"] += 1
+            self.progress.emit(counters["done"], max(1, counters["total"]), ntpath.basename(remote_source))
+            return
+        root_name = ntpath.basename(remote_source.rstrip("\\")) or remote_source[:2].replace(":", "")
+        target_root = local_dir / root_name
+        target_root.mkdir(parents=True, exist_ok=True)
+        stack = [(remote_source, target_root)]
+        while stack:
+            current_remote, current_local = stack.pop()
+            current_local.mkdir(parents=True, exist_ok=True)
+            for entry in executor.list_directory_entries(current_remote):
+                if entry.get("is_dir"):
+                    child_local = current_local / entry.get("name", "")
+                    stack.append((entry.get("path", ""), child_local))
+                else:
+                    dest = current_local / entry.get("name", "")
+                    self.log.emit(f"下载：{entry.get('path','')} -> {dest}")
+                    executor.download_file(entry.get("path", ""), dest)
+                    counters["done"] += 1
+                    self.progress.emit(counters["done"], max(1, counters["total"]), entry.get("name", ""))
+
+    def _count_remote_files(self, executor, remote_source: str) -> int:
+        info = executor.path_info(remote_source)
+        if not info.get("exists"):
+            return 0
+        if not info.get("is_dir"):
+            return 1
+        total = 0
+        stack = [remote_source]
+        while stack:
+            current = stack.pop()
+            for entry in executor.list_directory_entries(current):
+                if entry.get("is_dir"):
+                    stack.append(entry.get("path", ""))
+                else:
+                    total += 1
+        return total
+
+    def run(self):
+        host = self.context.get("host", "")
+        try:
+            executor = self._executor()
+            if self.operation == "LIST":
+                if self.remote_path:
+                    data = executor.list_directory_entries(self.remote_path)
+                    payload = {"ok": True, "kind": "entries", "path": self.remote_path, "data": data}
+                else:
+                    data = executor.list_drives()
+                    payload = {"ok": True, "kind": "drives", "path": "", "data": data}
+                self.completed.emit(payload); return
+
+            if self.operation == "UPLOAD":
+                import ntpath
+                valid = [Path(p) for p in self.paths if Path(p).exists()]
+                total = self._count_local_files(valid)
+                counters = {"done": 0, "total": max(1, total)}
+                executor.ensure_directory(self.remote_path)
+                for p in valid:
+                    self._upload_one(executor, p, self.remote_path, counters)
+                self.completed.emit({"ok": True, "kind": "upload", "count": counters["done"], "path": self.remote_path}); return
+
+            if self.operation == "DOWNLOAD":
+                local_dir = Path(self.local_path)
+                local_dir.mkdir(parents=True, exist_ok=True)
+                total = 0
+                for remote in self.paths:
+                    total += self._count_remote_files(executor, remote)
+                counters = {"done": 0, "total": max(1, total)}
+                for remote in self.paths:
+                    self._download_remote_tree(executor, remote, local_dir, counters)
+                self.completed.emit({"ok": True, "kind": "download", "count": counters["done"], "path": str(local_dir)}); return
+
+            if self.operation == "MKDIR":
+                executor.ensure_directory(self.remote_path)
+                self.completed.emit({"ok": True, "kind": "mkdir", "path": self.remote_path}); return
+
+            if self.operation == "DELETE":
+                for remote in self.paths:
+                    executor.remove_path(remote)
+                self.completed.emit({"ok": True, "kind": "delete", "count": len(self.paths)}); return
+
+            if self.operation == "RENAME":
+                executor.rename_path(self.remote_path, self.new_name)
+                self.completed.emit({"ok": True, "kind": "rename"}); return
+
+            raise ValueError(f"未知远程文件操作：{self.operation}")
+        except Exception as exc:
+            self.completed.emit({"ok": False, "kind": self.operation.lower(), "host": host, "error": str(exc)})

@@ -145,6 +145,8 @@ def _preflight_mapping(executor: WinRMExecutor, task_id: str, host: str, pm,
         else:
             backup_probe_root = _join_remote(target_root, ".fds_backup", task_id)
         try:
+            executor.ensure_directory(backup_probe_root)
+            log_cb(host, f"备份目录已就绪：{backup_probe_root}（不存在自动创建，已存在直接使用）")
             executor.test_write_path(backup_probe_root)
             _record_check(task_id, host, backup_probe_root, "BACKUP_WRITE_PERMISSION", "WINRM_WRITE_PROBE",
                           "可写", "可写", "SUCCESS", "备份目录 WinRM 写入探针通过。", audit_root)

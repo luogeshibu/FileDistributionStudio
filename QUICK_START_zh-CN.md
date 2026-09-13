@@ -192,7 +192,7 @@ WinRM 配置向导
 主机并发数：4
 ```
 
-备份根目录可留空，也可填写：
+目标主机备份根目录可留空，也可填写：
 
 ```text
 F:\FDS_Backup
@@ -340,3 +340,7 @@ v0.6.4 已将文件正文改为 WinRM/WinRS stdin 二进制流，不再把文件
 应用提供的 `TARGET_PREP_ADMS_WINRM.cmd` 只启用/启动 WinRM 并设置 `LocalAccountTokenFilterPolicy=0`；`TARGET_RESTORE_ADMS_WINRM.cmd` 只删除该注册表值并停止 WinRM。两个脚本都不会读取、创建、启用、禁用或修改 ADMS，也不会修改 Administrators、Remote Desktop Users 或 RDP 登录权限。
 
 如需现场手工检查 ADMS，请在“使用帮助 → ADMS 账号检查与管理员组（手工操作）”查看 `net user ADMS`、Administrators 成员查询以及手工加入命令。
+
+## 建议的现场执行方式
+
+正式批量升级前，先在“执行与日志”点击 **Dry Run 预演**。预演不会写目标机，只检查源清单、WinRM、路径和磁盘空间等条件。预演无失败后再点击“开始执行所选任务”。如果正式任务只有部分主机失败，可点击 **重试失败主机**；完成后可点击 **导出任务结果** 保存 Excel 证据。

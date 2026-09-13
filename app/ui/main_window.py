@@ -4,14 +4,16 @@ from datetime import datetime
 import csv
 import os
 import logging
+import ipaddress
+import subprocess
 
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, QTimer, QItemSelectionModel
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QFileDialog, QComboBox, QSpinBox, QCheckBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QPlainTextEdit, QGroupBox,
-    QAbstractItemView, QProgressBar, QFrame, QStackedWidget, QScrollArea, QApplication, QDialog, QDialogButtonBox
+    QAbstractItemView, QProgressBar, QFrame, QStackedWidget, QScrollArea, QApplication, QDialog, QDialogButtonBox, QSizePolicy, QInputDialog, QTextEdit, QMenu
 )
 
 from ..version import APP_NAME, APP_VERSION
@@ -22,13 +24,15 @@ from ..services.discovery import local_ipv4_networks, normalize_networks
 from ..services.sftp_source import SftpSource
 from ..services.remote_exec import RemoteActionPlan, WinRMExecutor, split_items, split_commands
 from ..services import audit, credential_store
+from ..services.xlsx_export import export_xlsx
 from ..utils import human_bytes, validate_windows_target_path
-from ..workers import DiscoveryThread, DistributionThread, HostnameVerificationThread, WinRMTargetTestThread, HostStatusTestThread
+from ..workers import DiscoveryThread, DistributionThread, DryRunThread, BackupThread, VersionCheckThread, HostnameVerificationThread, WinRMTargetTestThread, HostStatusTestThread, DiscoveryReconcileThread, HostEnvironmentCheckThread, RemoteFileOperationThread
 from .. import db
 from .dialogs import (HostEditDialog, TaskDetailDialog, HostnameCredentialDialog, MappingTargetDialog,
-                      SftpMappingDialog, WinRMSetupDialog, WinRMHostCredentialDialog, RemoteProcessBrowserDialog)
+                      SftpMappingDialog, WinRMSetupDialog, WinRMHostCredentialDialog, RemoteProcessBrowserDialog,
+                      RemoteBackupBrowserDialog)
 from .theme import app_icon
-from .widgets import PasswordLineEdit
+from .widgets import PasswordLineEdit, LocalFileTable, RemoteFileDropTable
 from .locale_zh import (status_text, source_text, mode_text, group_text, audit_category_text, action_text,
                          hostname_source_text)
 from ..services.host_status import status_label as online_status_text, smb_status_label, winrm_status_label
@@ -115,6 +119,7 @@ reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v Loca
 
 PAGE_META = [
     ("文件分发", "选择本地或远程源，将文件安全分发到多台 Windows 主机。", "send"),
+    ("远程文件", "像文件管理器一样浏览单台 Windows 主机，并通过 WinRM 手工上传或下载文件。", "file"),
     ("主机管理", "管理目标主机身份、分组、在线状态和远程访问能力。", "hosts"),
     ("主机发现", "跨一个或多个 IPv4 网段发现可访问的 Windows 主机。", "radar"),
     ("分发历史", "查看任务、主机、文件、备份、校验以及远程操作详情。", "history"),
@@ -135,11 +140,12 @@ def card(title: str, subtitle: str = ""):
 
 def wrap_scroll(widget: QWidget) -> QScrollArea:
     scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
+    # 主页面只允许纵向滚动。页面内容随可用宽度收缩，避免底部出现整页横向滚动条。
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
     scroll.setWidget(widget)
     # 主页面内容很长，Qt 默认滚轮步长偏小。提高页面滚动步长，只影响真正的
     # QScrollArea 滚动，不会重新让输入框/下拉框响应滚轮修改值。
     scroll.verticalScrollBar().setSingleStep(64)
-    scroll.horizontalScrollBar().setSingleStep(48)
     return scroll
 
 
@@ -148,9 +154,16 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = AppSettings.load()
         self.discovery_thread = None
+        self.discovery_reconcile_thread = None
+        self._scan_cidrs = []
+        self._scan_existing_hosts = {}
+        self._scan_discovered_ips = set()
         self.hostname_thread = None
         self.hostname_verify_context = ""
         self.distribution_thread = None
+        self.dry_run_thread = None
+        self.backup_thread = None
+        self.version_check_thread = None
         self.winrm_test_thread = None
         self.host_status_thread = None
         self.host_status_context = ""
@@ -161,11 +174,18 @@ class MainWindow(QMainWindow):
         # 自定义主机密码只保存在当前进程内；若用户选择“安全记住”，同时写入 Windows 凭据管理器。
         self._session_host_credentials: dict[str, tuple[str, str]] = {}
         self._suppress_target_selection_persist = False
+        # 分发映射与“文件分发”模块的智能联动状态。
+        # 用户明确手工关闭文件分发后，不因后续编辑/新增映射而强制重新打开；
+        # 只有从 0 条启用映射变成至少 1 条启用映射时才自动开启。
+        self._mapping_auto_toggle_guard = False
+        self._distribution_manual_off = False
+        self._last_enabled_mapping_count = 0
 
         self.setWindowTitle(f"{APP_NAME}  ·  v{APP_VERSION}")
         self.resize(1420, 900)
         self.setMinimumSize(1120, 720)
         self._build_shell()
+        # 保持正常窗口启动，不再强制最大化；页面本身按窗口宽度自适应，仅保留纵向滚动。
         self.refresh_hosts(); self.refresh_networks(); self.refresh_history(); self.refresh_audit()
         audit.operation(self.settings.audit_path, "APP", "START", "SUCCESS", "文件分发工作台已启动。",
                         details={"version": APP_VERSION})
@@ -226,7 +246,7 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.pages = [
-            self._build_distribution_page(), self._build_inventory_page(), self._build_discovery_page(),
+            self._build_distribution_page(), self._build_remote_files_page(), self._build_inventory_page(), self._build_discovery_page(),
             self._build_history_page(), self._build_audit_page(), self._build_help_page(), self._build_settings_page()
         ]
         for p in self.pages: self.stack.addWidget(p)
@@ -266,6 +286,8 @@ class MainWindow(QMainWindow):
         self.mapping_table.verticalHeader().setVisible(False)
         mh = self.mapping_table.horizontalHeader()
         mh.setSectionResizeMode(QHeaderView.ResizeToContents)
+        mh.setSectionResizeMode(0, QHeaderView.Fixed)
+        self.mapping_table.setColumnWidth(0, 44)
         mh.setSectionResizeMode(3, QHeaderView.Stretch)
         mh.setSectionResizeMode(4, QHeaderView.Stretch)
         mh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
@@ -299,8 +321,9 @@ class MainWindow(QMainWindow):
         self.remember_default_cred = QCheckBox("记住默认凭据")
         self.remember_default_cred.setChecked(bool(self.settings.remember_winrm_default_credential))
         self.remember_default_cred.setToolTip("密码仅保存到当前 Windows 用户的 Windows 凭据管理器，不写入配置、SQLite 或审计日志。")
+        # 默认凭据恢复为原有的横向自适应布局：用户名与密码输入框共同占满可用宽度。
         cred.addWidget(QLabel("默认 Windows 用户")); cred.addWidget(self.win_user, 1)
-        cred.addWidget(QLabel("密码")); cred.addWidget(self.win_password, 1)
+        cred.addSpacing(10); cred.addWidget(QLabel("密码")); cred.addWidget(self.win_password, 1)
         cred.addWidget(self.remember_default_cred)
         target_l.addLayout(cred)
         self._load_default_winrm_credential()
@@ -312,87 +335,196 @@ class MainWindow(QMainWindow):
             "大多数主机直接使用默认凭据，只有账号或密码不同的主机才需要单独设置。"
         )
         cred_hint.setObjectName("Muted"); cred_hint.setWordWrap(True); target_l.addWidget(cred_hint)
+
+        target_filter_row = QHBoxLayout(); target_filter_row.setSpacing(8)
+        target_filter_row.addWidget(QLabel("快速筛选"))
+        self.target_filter_edit = QLineEdit()
+        self.target_filter_edit.setClearButtonEnabled(True)
+        self.target_filter_edit.setPlaceholderText("输入 IP、主机名、分组、凭据或状态，例如：172.16.21 / Dispatcher / AUTH_OK")
+        self.target_filter_edit.textChanged.connect(self._apply_target_filter)
+        target_filter_row.addWidget(self.target_filter_edit, 1)
+        self.target_filter_count = QLabel("显示 0 / 0 台 · 已选 0 台")
+        self.target_filter_count.setObjectName("Muted")
+        target_filter_row.addWidget(self.target_filter_count)
+        target_l.addLayout(target_filter_row)
+
         self.target_table = QTableWidget(0, 8)
         self.target_table.setHorizontalHeaderLabels(["选择", "名称", "主机 / IP", "分组", "凭据", "在线状态", "WinRM 状态", "任务状态"])
         self.target_table.setAlternatingRowColors(True)
         self.target_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.target_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.target_table.verticalHeader().setVisible(False)
-        hdr = self.target_table.horizontalHeader(); hdr.setSectionResizeMode(QHeaderView.Stretch); hdr.setSectionResizeMode(0,QHeaderView.ResizeToContents)
+        hdr = self.target_table.horizontalHeader(); hdr.setSectionResizeMode(QHeaderView.Stretch); hdr.setSectionResizeMode(0,QHeaderView.Fixed); self.target_table.setColumnWidth(0,44)
+        # 默认至少完整显示 8 台目标主机；主机更多时由表格自身滚动，不把整页无限撑高。
+        self.target_table.verticalHeader().setDefaultSectionSize(32)
+        self.target_table.setMinimumHeight(32 * 8 + 36)
+        self.target_table.setMaximumHeight(32 * 8 + 52)
         target_l.addWidget(self.target_table)
-        tr = QHBoxLayout()
+        # 目标主机操作区：常用动作尽量铺满整行。远程桌面属于独立人工操作，不参与任何分发任务流程。
+        tr = QGridLayout(); tr.setHorizontalSpacing(8); tr.setVerticalSpacing(8)
+        target_action_buttons = []
         for text, fn, icon in [
             ("全选", lambda:self._set_all_targets(True), "check"),
             ("取消全选", lambda:self._set_all_targets(False), "clear"),
             ("刷新主机", self.refresh_hosts, "refresh"),
             ("测试在线状态", self._test_distribution_hosts_online, "radar"),
         ]:
-            b = QPushButton(text); b.setIcon(app_icon(icon)); b.clicked.connect(fn); tr.addWidget(b)
+            b = QPushButton(text); b.setIcon(app_icon(icon)); b.clicked.connect(fn); target_action_buttons.append(b)
         self.btn_winrm_test = QPushButton("测试 WinRM")
         self.btn_winrm_test.setIcon(app_icon("terminal"))
         self.btn_winrm_test.setToolTip("对所有已勾选主机执行各自主机凭据的 WinRM 身份验证，并逐一测试当前目标目录的创建、写入、读取和删除。")
         self.btn_winrm_test.clicked.connect(self._test_winrm_targets)
-        tr.addWidget(self.btn_winrm_test)
+        target_action_buttons.append(self.btn_winrm_test)
+        self.btn_target_env_check = QPushButton("ADMS 部署前检查")
+        self.btn_target_env_check.setIcon(app_icon("search"))
+        self.btn_target_env_check.setToolTip(
+            "只读检查当前勾选目标机是否满足 ADMS 客户端部署前置条件：WinRM 可连接、"
+            "与本机时间偏差不超过 2 分钟、Private/Public 防火墙均关闭；"
+            "同时显示 Domain 防火墙、时区和 Windows Time 状态供诊断，不修改目标机。"
+        )
+        self.btn_target_env_check.clicked.connect(
+            lambda: self._check_host_environment(self._selected_hosts(), "Windows 目标主机")
+        )
+        target_action_buttons.append(self.btn_target_env_check)
+        self.btn_open_rdp = QPushButton("打开远程桌面")
+        self.btn_open_rdp.setIcon(app_icon("terminal"))
+        self.btn_open_rdp.setToolTip(
+            "使用当前目标主机的有效凭据启动本机 Windows 远程桌面（mstsc）。\n"
+            "仅支持一次打开 1 台主机；会把该 RDP 凭据写入当前 Windows 用户的凭据管理器（TERMSRV/目标主机），密码不会写入日志。"
+        )
+        self.btn_open_rdp.clicked.connect(self._open_selected_rdp)
+        target_action_buttons.append(self.btn_open_rdp)
         self.btn_download_adms_setup = QPushButton("下载 ADMS WinRM 设置脚本")
         self.btn_download_adms_setup.setIcon(app_icon("file"))
-        self.btn_download_adms_setup.setToolTip("保存目标机首次使用的简化 WinRM 设置脚本；脚本不修改任何账号、用户组或 RDP 权限。")
+        self.btn_download_adms_setup.setToolTip(
+            "下载后请将该脚本放到目标主机，并在目标主机上以管理员身份运行。\n"
+            "用于首次准备 ADMS WinRM；脚本不修改任何账号、用户组或 RDP 权限。"
+        )
         self.btn_download_adms_setup.clicked.connect(lambda: self._save_bundled_cmd("TARGET_PREP_ADMS_WINRM.cmd", "保存 ADMS WinRM 设置脚本"))
-        tr.addWidget(self.btn_download_adms_setup)
+        target_action_buttons.append(self.btn_download_adms_setup)
         self.btn_download_adms_restore = QPushButton("下载 ADMS 还原脚本")
         self.btn_download_adms_restore.setIcon(app_icon("refresh"))
-        self.btn_download_adms_restore.setToolTip("保存 WinRM 还原脚本；仅删除 LocalAccountTokenFilterPolicy 并停止 WinRM，不修改任何账号、用户组或 RDP 权限。")
+        self.btn_download_adms_restore.setToolTip(
+            "下载后请将该脚本放到目标主机，并在目标主机上以管理员身份运行。\n"
+            "用于还原 ADMS WinRM 准备项；仅删除 LocalAccountTokenFilterPolicy 并停止 WinRM，"
+            "不修改任何账号、用户组或 RDP 权限。"
+        )
         self.btn_download_adms_restore.clicked.connect(lambda: self._save_bundled_cmd("TARGET_RESTORE_ADMS_WINRM.cmd", "保存 ADMS 还原脚本"))
-        tr.addWidget(self.btn_download_adms_restore)
+        target_action_buttons.append(self.btn_download_adms_restore)
         self.btn_winrm_setup = QPushButton("WinRM 配置向导")
         self.btn_winrm_setup.setIcon(app_icon("settings"))
         self.btn_winrm_setup.setToolTip("查看其他 WinRM 准备方式和脚本内容。")
         self.btn_winrm_setup.clicked.connect(self._show_winrm_setup_guide)
-        tr.addWidget(self.btn_winrm_setup); tr.addStretch(1); target_l.addLayout(tr)
+        target_action_buttons.append(self.btn_winrm_setup)
+        def _compact_action_button(button: QPushButton):
+            # 横向允许拉伸，让同一行按钮均匀填满；高度仍保持紧凑。
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setMinimumWidth(0)
+            button.setMinimumHeight(34)
 
-        cred_actions = QHBoxLayout()
-        cred_actions.addWidget(QLabel("凭据管理"))
+        # 固定呈现顺序：第二行放诊断/连接类动作，第三行放两个脚本下载。
+        target_action_buttons = target_action_buttons[:7] + [self.btn_winrm_setup, self.btn_download_adms_setup, self.btn_download_adms_restore]
+        for b in target_action_buttons:
+            _compact_action_button(b)
+        # 4 + 4 + 2（最后两个脚本按钮各跨两列），避免最后一行只剩一个按钮。
+        positions = [
+            (0, 0, 1, 1), (0, 1, 1, 1), (0, 2, 1, 1), (0, 3, 1, 1),
+            (1, 0, 1, 1), (1, 1, 1, 1), (1, 2, 1, 1), (1, 3, 1, 1),
+            (2, 0, 1, 2), (2, 2, 1, 2),
+        ]
+        for b, pos in zip(target_action_buttons, positions):
+            tr.addWidget(b, *pos)
+        for col in range(4):
+            tr.setColumnStretch(col, 1)
+        target_l.addLayout(tr)
+        adms_precheck_hint = QLabel(
+            "ADMS 部署前检查：只读检查 WinRM、与本机时间偏差（≤2 分钟）、Private/Public 防火墙（必须关闭）；"
+            "Domain 防火墙、时区和 Windows Time 仅作为诊断信息显示。"
+        )
+        adms_precheck_hint.setObjectName("Muted")
+        adms_precheck_hint.setWordWrap(True)
+        target_l.addWidget(adms_precheck_hint)
+
+        # 凭据管理同样采用内容自适应宽度，说明文字使用剩余空间。
+        cred_actions = QHBoxLayout(); cred_actions.setSpacing(8)
+        cred_title = QLabel("凭据管理")
         self.btn_set_host_cred = QPushButton("设置选中凭据")
         self.btn_set_host_cred.setIcon(app_icon("edit"))
         self.btn_set_host_cred.setToolTip("为表格中高亮选择的一台或多台主机设置自定义 WinRM 凭据。按 Ctrl / Shift 可选择多行。")
         self.btn_set_host_cred.clicked.connect(self._set_selected_host_credentials)
-        cred_actions.addWidget(self.btn_set_host_cred)
         self.btn_batch_host_cred = QPushButton("批量设置凭据")
         self.btn_batch_host_cred.setIcon(app_icon("hosts"))
         self.btn_batch_host_cred.setToolTip("为当前勾选的全部分发目标主机设置同一套自定义 WinRM 凭据。")
         self.btn_batch_host_cred.clicked.connect(self._set_checked_host_credentials)
-        cred_actions.addWidget(self.btn_batch_host_cred)
         self.btn_clear_host_cred = QPushButton("恢复默认凭据")
         self.btn_clear_host_cred.setIcon(app_icon("clear"))
         self.btn_clear_host_cred.setToolTip("清除表格中高亮选择主机的自定义凭据，恢复使用顶部默认凭据。")
         self.btn_clear_host_cred.clicked.connect(self._restore_selected_default_credentials)
+        for b in (self.btn_set_host_cred, self.btn_batch_host_cred, self.btn_clear_host_cred):
+            _compact_action_button(b)
+        cred_actions.addWidget(cred_title)
+        cred_actions.addWidget(self.btn_set_host_cred)
+        cred_actions.addWidget(self.btn_batch_host_cred)
         cred_actions.addWidget(self.btn_clear_host_cred)
         cred_note = QLabel("大多数主机使用默认凭据；只有账号/密码不同的主机才需要自定义。")
-        cred_note.setObjectName("Muted")
-        cred_actions.addWidget(cred_note); cred_actions.addStretch(1)
+        cred_note.setObjectName("Muted"); cred_note.setWordWrap(True)
+        cred_actions.addWidget(cred_note, 1)
         target_l.addLayout(cred_actions)
 
 
-        opts, opts_l = card("分发策略", "默认执行文件大小校验；启用 SHA256 后会对源文件、临时文件、备份文件和正式文件进行多阶段强校验。")
-        ol=QHBoxLayout(); self.chk_verify=QCheckBox("SHA256 强校验"); self.chk_verify.setChecked(self.settings.verify_sha256); self.chk_backup=QCheckBox("覆盖前备份"); self.chk_backup.setChecked(self.settings.backup_existing); self.chk_preflight=QCheckBox("分发前预检查"); self.chk_preflight.setChecked(self.settings.preflight_check)
+        def task_toggle(title: str, checked: bool) -> QPushButton:
+            """模块级任务开关：与普通参数 QCheckBox 做明显视觉区分。"""
+            btn = QPushButton()
+            btn.setObjectName("TaskToggle")
+            btn.setCheckable(True)
+            btn.setMinimumWidth(190)
+            btn.setToolTip("模块级任务开关：决定该步骤是否加入本次组合任务；模块内部普通复选框仅控制该步骤的参数。")
+            def refresh_text(on: bool):
+                btn.setText(("● 已加入本次任务  |  " if on else "○ 未加入本次任务  |  ") + title)
+            btn.toggled.connect(refresh_text)
+            btn.setChecked(bool(checked))
+            refresh_text(btn.isChecked())
+            return btn
+
+        def bind_task_card(toggle: QPushButton, frame: QFrame):
+            """模块开关开启时高亮整个卡片，让“加入本次任务”状态一眼可见。"""
+            def refresh_card(on: bool):
+                frame.setProperty("taskActive", "true" if on else "false")
+                frame.style().unpolish(frame)
+                frame.style().polish(frame)
+                frame.update()
+            toggle.toggled.connect(refresh_card)
+            refresh_card(toggle.isChecked())
+
+        opts, opts_l = card("文件分发", "文件分发本身作为独立任务；模块级任务开关决定是否执行，SHA256/预检查等普通复选框仅是内部参数。")
+        ol=QHBoxLayout(); self.chk_distribution=task_toggle("文件分发", bool(self.settings.distribution_enabled)); self.chk_distribution.toggled.connect(self._on_distribution_task_toggled); self.chk_verify=QCheckBox("SHA256 强校验"); self.chk_verify.setChecked(self.settings.verify_sha256); self.chk_preflight=QCheckBox("分发前预检查"); self.chk_preflight.setChecked(self.settings.preflight_check)
         self.retry_spin=QSpinBox(); self.retry_spin.setRange(0,10); self.retry_spin.setValue(self.settings.retry_count); self.concurrent_spin=QSpinBox(); self.concurrent_spin.setRange(1,32); self.concurrent_spin.setValue(self.settings.max_concurrency)
-        ol.addWidget(self.chk_verify); ol.addWidget(self.chk_backup); ol.addWidget(self.chk_preflight); ol.addWidget(QLabel("失败重试")); ol.addWidget(self.retry_spin); ol.addWidget(QLabel("主机并发数")); ol.addWidget(self.concurrent_spin); ol.addStretch(1); opts_l.addLayout(ol)
-        bf=QFormLayout(); self.backup_root=QLineEdit(self.settings.default_backup_root); self.backup_root.setPlaceholderText(r"留空：各目标目录\.fds_backup；可填目标机本地路径，例如 E:\FDS_Backup")
-        bf.addRow("备份根目录", self.backup_root); opts_l.addLayout(bf)
-        hint=QLabel(r"自定义备份根目录时，会按任务 ID、原盘符和原目录结构保存，例如 D:\ADMS\dll\a.dll 会备份到 <Backup>\<Task>\D\ADMS\dll\a.dll，避免多目标目录同名文件冲突。")
-        hint.setObjectName("Muted"); hint.setWordWrap(True); opts_l.addWidget(hint)
+        ol.addWidget(self.chk_distribution); ol.addWidget(self.chk_verify); ol.addWidget(self.chk_preflight); ol.addWidget(QLabel("失败重试")); ol.addWidget(self.retry_spin); ol.addWidget(QLabel("主机并发数")); ol.addWidget(self.concurrent_spin); ol.addStretch(1); opts_l.addLayout(ol)
+        bind_task_card(self.chk_distribution, opts)
+
+        backup_card, backup_l = card("备份（独立可选）", "备份与文件分发完全解耦：备份文件保存在各目标 Windows 主机本地；加入组合任务时备份即将被覆盖的文件，单独执行时通过 WinRM 浏览并勾选需要备份的目标。")
+        br0=QHBoxLayout(); self.chk_backup=task_toggle("分发前备份", bool(self.settings.backup_task_enabled or self.settings.backup_existing)); self.btn_run_backup=QPushButton("单独执行备份"); self.btn_run_backup.setIcon(app_icon("play")); self.btn_run_backup.clicked.connect(self._run_backup_standalone); br0.addWidget(self.chk_backup); br0.addStretch(1); br0.addWidget(self.btn_run_backup); backup_l.addLayout(br0)
+        bf=QFormLayout(); self.backup_root=QLineEdit(self.settings.default_backup_root); self.backup_root.setPlaceholderText(r"留空：在目标主机对应目录使用 .fds_backup；可填目标主机本地路径，例如 E:\Backup")
+        bf.addRow("目标主机备份根目录", self.backup_root); backup_l.addLayout(bf)
+        backup_location=QLabel("备份位置：各目标 Windows 主机本地，不会把备份文件回收到当前电脑。")
+        backup_location.setObjectName("Muted"); backup_location.setWordWrap(True); backup_l.addWidget(backup_location)
+        hint=QLabel(r"组合执行时，只备份本次将被覆盖的目标文件；单独执行备份时会打开远程文件浏览器，从盘符开始直接浏览文件夹和文件并勾选目标，文件夹会递归备份，不依赖分发映射。目标主机备份根目录不存在时自动创建，已存在时直接使用；自定义根目录按任务 ID、原盘符和原目录结构保存。")
+        hint.setObjectName("Muted"); hint.setWordWrap(True); backup_l.addWidget(hint)
+        bind_task_card(self.chk_backup, backup_card)
 
         remote, remote_l = card(
             "WinRM 连接与远程操作",
             "执行顺序：结束目标进程 → 分发前命令 → 文件分发 → 分发后命令。",
         )
-        rt=QHBoxLayout(); self.remote_enabled=QCheckBox("启用分发前 / 后操作"); self.remote_enabled.setChecked(bool(self.settings.winrm_remote_actions_enabled)); self.remote_https=QCheckBox("HTTPS"); self.remote_port=QSpinBox(); self.remote_port.setRange(1,65535); self.remote_port.setValue(int(self.settings.winrm_port or 5985)); self.remote_https.toggled.connect(lambda c:self.remote_port.setValue(5986 if c else 5985)); self.remote_https.setChecked(bool(self.settings.winrm_use_https)); self.remote_port.setValue(int(self.settings.winrm_port or (5986 if self.remote_https.isChecked() else 5985)))
+        rt=QHBoxLayout(); self.remote_enabled=task_toggle("程序 / 服务前后操作", bool(self.settings.winrm_remote_actions_enabled)); self.remote_https=QCheckBox("HTTPS"); self.remote_port=QSpinBox(); self.remote_port.setRange(1,65535); self.remote_port.setValue(int(self.settings.winrm_port or 5985)); self.remote_https.toggled.connect(lambda c:self.remote_port.setValue(5986 if c else 5985)); self.remote_https.setChecked(bool(self.settings.winrm_use_https)); self.remote_port.setValue(int(self.settings.winrm_port or (5986 if self.remote_https.isChecked() else 5985)))
         self.remote_https.setVisible(False); self.remote_port.setVisible(False)
         self.winrm_conn_summary = QLabel(); self.winrm_conn_summary.setObjectName("Muted")
         self._refresh_winrm_connection_summary()
         advanced_btn = QPushButton("高级连接…"); advanced_btn.clicked.connect(self._show_winrm_advanced_connection)
         rt.addWidget(self.remote_enabled); rt.addWidget(self.winrm_conn_summary); rt.addWidget(advanced_btn); rt.addStretch(1); remote_l.addLayout(rt)
+        bind_task_card(self.remote_enabled, remote)
 
-        pipeline = QFrame(); pipeline.setObjectName("SoftCard")
+        pipeline = QFrame(); pipeline.setObjectName("SoftCard"); self.remote_pipeline = pipeline
         pl = QVBoxLayout(pipeline); pl.setContentsMargins(14,12,14,12); pl.setSpacing(9)
         order = QLabel("0  WinRM 认证与目标目录预检查（自动，任何停服/杀进程之前完成）")
         order.setObjectName("PipelineAuto"); pl.addWidget(order)
@@ -436,6 +568,8 @@ class MainWindow(QMainWindow):
         self.post_commands=QPlainTextEdit(); self.post_commands.setMaximumHeight(82); self.post_commands.setPlaceholderText("每行一条命令，例如：\nsys_ctl start fast\necho 分发完成")
         self.post_commands.setPlainText(self.settings.winrm_post_commands_text or "")
         pl.addWidget(post_label); pl.addWidget(self.post_commands)
+        cmd_hint=QLabel("命令输入规则：每行一条命令，按从上到下顺序执行。示例：第一行 sys_ctl start fast，第二行 echo 分发完成。空行会忽略；以 # 或 REM 开头的行作为注释忽略。")
+        cmd_hint.setObjectName("Muted"); cmd_hint.setWordWrap(True); pl.addWidget(cmd_hint)
 
         self.post_on_failure=QCheckBox("失败恢复：即使文件分发失败，也尝试执行分发后 CMD")
         self.post_on_failure.setChecked(bool(self.settings.winrm_post_on_failure)); pl.addWidget(self.post_on_failure)
@@ -444,11 +578,51 @@ class MainWindow(QMainWindow):
         cwd_hint=QLabel(r"提示：当前顺序为先结束选中的 GUI/客户端进程，再执行 sys_ctl stop 等停止/准备命令，完成文件分发后再执行 sys_ctl start fast 等启动/恢复命令。命令工作目录建议设置为实际 bin 目录。上次使用的命令、进程和执行方式会自动记住。")
         cwd_hint.setObjectName("Muted"); cwd_hint.setWordWrap(True); remote_l.addWidget(cwd_hint)
 
-        run_card, run_l = card("执行与日志", "所有分发映射、WinRM 连接、真实目标路径、备份、校验、进程和命令操作都会进入本地审计链。")
-        ar=QHBoxLayout(); self.btn_start=QPushButton("开始分发"); self.btn_start.setObjectName("Primary"); self.btn_start.setIcon(app_icon("play")); self.btn_cancel=QPushButton("取消"); self.btn_cancel.setObjectName("Danger"); self.btn_cancel.setEnabled(False); self.btn_start.clicked.connect(self._start_distribution); self.btn_cancel.clicked.connect(self._cancel_distribution); ar.addStretch(1); ar.addWidget(self.btn_start); ar.addWidget(self.btn_cancel); run_l.addLayout(ar)
+        version_card, version_l = card(
+            "版本检查（独立可选）",
+            "完全独立：模块级任务开关决定是否加入本次组合任务；关闭时不会因分发成功自动执行，也可随时单独执行。",
+        )
+        vr0=QHBoxLayout()
+        self.version_after_distribution=task_toggle("Version Checker", bool(self.settings.version_checker_enabled or self.settings.version_checker_after_distribution))
+        self.btn_run_version_check=QPushButton("单独执行版本检查")
+        self.btn_run_version_check.setIcon(app_icon("play")); self.btn_run_version_check.clicked.connect(self._run_version_check_standalone)
+        vr0.addWidget(self.version_after_distribution); vr0.addStretch(1); vr0.addWidget(self.btn_run_version_check); version_l.addLayout(vr0)
+        bind_task_card(self.version_after_distribution, version_card)
+        vf=QFormLayout()
+        self.version_exe=QLineEdit(self.settings.version_checker_exe_path); self.version_exe.setPlaceholderText(r"例如 D:\ADMS\bin\version_checker.exe")
+        self.version_workdir=QLineEdit(self.settings.version_checker_workdir); self.version_workdir.setPlaceholderText(r"例如 D:\ADMS\bin")
+        self.version_output_dir=QLineEdit(self.settings.version_checker_output_dir); self.version_output_dir.setPlaceholderText("Save 后 CSV 生成目录（version_checker_result.csv）")
+        self.version_save_button=QLineEdit(self.settings.version_checker_save_button or "Save")
+        self.version_timeout=QSpinBox(); self.version_timeout.setRange(15,1800); self.version_timeout.setValue(int(self.settings.version_checker_timeout_seconds or 120)); self.version_timeout.setSuffix(" 秒")
+        self.version_local_root=QLineEdit(self.settings.version_checker_local_result_root)
+        self.btn_version_local_root=QPushButton("选择…"); self.btn_version_local_root.clicked.connect(self._choose_version_result_root)
+        local_row=QHBoxLayout(); local_row.setContentsMargins(0,0,0,0); local_row.addWidget(self.version_local_root,1); local_row.addWidget(self.btn_version_local_root)
+        vf.addRow("程序路径",self.version_exe); vf.addRow("工作目录",self.version_workdir); vf.addRow("CSV 生成目录",self.version_output_dir); vf.addRow("Save 按钮名称",self.version_save_button); vf.addRow("等待超时",self.version_timeout); vf.addRow("本机结果目录",local_row)
+        version_l.addLayout(vf)
+        vr1=QHBoxLayout(); self.version_collect=QCheckBox("回收 CSV 到本机"); self.version_collect.setChecked(bool(self.settings.version_checker_collect_excel)); self.version_close=QCheckBox("完成后关闭 Version Checker"); self.version_close.setChecked(bool(self.settings.version_checker_close_after)); vr1.addWidget(self.version_collect); vr1.addWidget(self.version_close); vr1.addStretch(1); version_l.addLayout(vr1)
+        vh=QLabel("执行方式：WinRM 负责调度，在目标机当前已登录用户的交互桌面启动 version_checker；自动执行 Save → 等待 Information 提示 → OK → 确认 version_checker_result.csv 写入完成 → 直接回收到所选本机结果目录（文件名前加主机名）→ 可选关闭程序。Save 优先使用 UI Automation/Win32 控件，必要时使用窗口相对位置点击。目标机必须已有用户登录。")
+        vh.setObjectName("Muted"); vh.setWordWrap(True); version_l.addWidget(vh)
+
+        run_card, run_l = card("执行与日志", "本次任务按已启用组件执行：备份 → 程序/服务前置操作 → 文件分发 → 后置操作 → Version Checker。未启用的步骤自动跳过。")
+        self.task_plan_label=QLabel(); self.task_plan_label.setObjectName("PipelineAuto"); self.task_plan_label.setWordWrap(True); run_l.addWidget(self.task_plan_label)
+        ar=QHBoxLayout()
+        self.btn_clear_log=QPushButton("清空日志"); self.btn_clear_log.setIcon(app_icon("clear")); self.btn_clear_log.setToolTip("仅清空当前页面的执行日志显示，不删除审计日志和分发历史"); self.btn_clear_log.clicked.connect(self._clear_distribution_log)
+        self.btn_dry_run=QPushButton("Dry Run 预演"); self.btn_dry_run.setIcon(app_icon("search")); self.btn_dry_run.setToolTip("只检查源文件、WinRM、远端路径、磁盘空间、CMD 工作目录和 Version Checker 路径；不会上传、覆盖、备份、结束进程或执行命令。")
+        self.btn_retry_failed=QPushButton("重试失败主机"); self.btn_retry_failed.setIcon(app_icon("refresh")); self.btn_retry_failed.setEnabled(False); self.btn_retry_failed.setToolTip("仅重新执行上一轮失败的主机，不重复执行已经成功的主机。")
+        self.btn_export_result=QPushButton("导出任务结果"); self.btn_export_result.setIcon(app_icon("file")); self.btn_export_result.setEnabled(False); self.btn_export_result.setToolTip("把最近一次分发任务的主机级结果导出为 Excel。")
+        self.btn_start=QPushButton("开始执行所选任务"); self.btn_start.setObjectName("Primary"); self.btn_start.setIcon(app_icon("play"))
+        self.btn_cancel=QPushButton("取消"); self.btn_cancel.setObjectName("Danger"); self.btn_cancel.setEnabled(False)
+        self.btn_dry_run.clicked.connect(self._run_dry_run); self.btn_retry_failed.clicked.connect(self._retry_failed_distribution); self.btn_export_result.clicked.connect(self._export_last_task_result)
+        self.btn_start.clicked.connect(self._start_distribution); self.btn_cancel.clicked.connect(self._cancel_distribution)
+        ar.addStretch(1); ar.addWidget(self.btn_clear_log); ar.addWidget(self.btn_dry_run); ar.addWidget(self.btn_retry_failed); ar.addWidget(self.btn_export_result); ar.addWidget(self.btn_start); ar.addWidget(self.btn_cancel); run_l.addLayout(ar)
         self.overall=QProgressBar(); self.overall.setValue(0); run_l.addWidget(self.overall); self.dist_log=QPlainTextEdit(); self.dist_log.setReadOnly(True); self.dist_log.setMaximumBlockCount(5000); self.dist_log.setMinimumHeight(150); run_l.addWidget(self.dist_log)
 
-        root.addWidget(src); root.addWidget(target); root.addWidget(opts); root.addWidget(remote); root.addWidget(run_card); root.addStretch(1)
+        root.addWidget(src); root.addWidget(target); root.addWidget(opts); root.addWidget(backup_card); root.addWidget(remote); root.addWidget(version_card); root.addWidget(run_card); root.addStretch(1)
+        for w in (self.chk_distribution,self.chk_backup,self.remote_enabled,self.version_after_distribution):
+            w.toggled.connect(self._refresh_task_plan)
+        self.remote_enabled.toggled.connect(lambda enabled:self.remote_pipeline.setEnabled(bool(enabled)))
+        self.remote_pipeline.setEnabled(bool(self.remote_enabled.isChecked()))
+        self._refresh_task_plan()
         return wrap_scroll(canvas)
 
     def _mapping_rows(self, enabled_only=True):
@@ -503,12 +677,49 @@ class MainWindow(QMainWindow):
             cell.setToolTip(host_tip)
             self.mapping_table.setItem(r,5,cell)
 
+    def _on_distribution_task_toggled(self, checked: bool):
+        """记录用户对“文件分发”模块的明确手工选择。
+
+        自动联动修改开关时使用 guard，避免把程序自动关闭误记成用户手工关闭。
+        """
+        if self._mapping_auto_toggle_guard:
+            return
+        self._distribution_manual_off = not bool(checked)
+
+    def _sync_distribution_with_mappings(self):
+        """按启用映射数量智能联动文件分发模块。
+
+        - 0 -> >=1：若用户没有明确手工关闭，则自动加入“文件分发”；
+        - >=1 -> 0：自动移出“文件分发”；
+        - 用户明确手工关闭后，编辑/新增映射不会抢夺控制权；用户再次手工开启后解除该状态。
+        """
+        if not hasattr(self, "mapping_table") or not hasattr(self, "chk_distribution"):
+            return
+        current = len(self._mapping_rows(True))
+        previous = int(getattr(self, "_last_enabled_mapping_count", 0) or 0)
+        should_enable = previous == 0 and current > 0 and not self._distribution_manual_off
+        should_disable = previous > 0 and current == 0
+        if should_enable and not self.chk_distribution.isChecked():
+            self._mapping_auto_toggle_guard = True
+            try:
+                self.chk_distribution.setChecked(True)
+            finally:
+                self._mapping_auto_toggle_guard = False
+        elif should_disable and self.chk_distribution.isChecked():
+            self._mapping_auto_toggle_guard = True
+            try:
+                self.chk_distribution.setChecked(False)
+            finally:
+                self._mapping_auto_toggle_guard = False
+        self._last_enabled_mapping_count = current
+
     def _on_mapping_enabled_changed(self, *_):
         self._refresh_mapping_scope()
+        self._sync_distribution_with_mappings()
 
     def _append_mapping(self, mapping: DistributionMapping):
         r=self.mapping_table.rowCount(); self.mapping_table.insertRow(r)
-        chk=QCheckBox(); chk.setChecked(True); chk.stateChanged.connect(self._on_mapping_enabled_changed); self.mapping_table.setCellWidget(r,0,chk)
+        chk=QCheckBox(); chk.setChecked(True); chk.setStyleSheet("QCheckBox { margin-left: 12px; margin-right: 12px; }"); chk.stateChanged.connect(self._on_mapping_enabled_changed); self.mapping_table.setCellWidget(r,0,chk)
         scope_text, scope_tip = self._target_scope_display()
         vals=["SFTP" if mapping.source_type=="SFTP" else "本地", "目录" if mapping.source_kind=="DIR" else "文件", mapping.display_source(), mapping.target_path,
               scope_text, ("复制目录本身" if mapping.folder_mode=="SELF" else "复制目录内容") if mapping.source_kind=="DIR" else "文件", "待分发"]
@@ -516,6 +727,7 @@ class MainWindow(QMainWindow):
         self.mapping_table.item(r,3).setData(ROLE_HOST_OBJECT,mapping)
         self.mapping_table.item(r,5).setToolTip(scope_tip)
         self._refresh_mapping_scope()
+        self._sync_distribution_with_mappings()
         audit.operation(self.settings.audit_path,"MAPPING","ADD","SUCCESS","已添加分发映射。",subject=mapping.mapping_id,details=mapping.safe_dict())
 
     def _remote_drive_context_for_mapping(self):
@@ -595,12 +807,12 @@ class MainWindow(QMainWindow):
     def _delete_mapping(self):
         r=self._selected_mapping_row()
         if r>=0:
-            m=self.mapping_table.item(r,3).data(ROLE_HOST_OBJECT); self.mapping_table.removeRow(r); self._refresh_mapping_scope()
+            m=self.mapping_table.item(r,3).data(ROLE_HOST_OBJECT); self.mapping_table.removeRow(r); self._refresh_mapping_scope(); self._sync_distribution_with_mappings()
             if m:audit.operation(self.settings.audit_path,"MAPPING","DELETE","SUCCESS","已删除分发映射。",subject=m.mapping_id,details=m.safe_dict());self.refresh_audit()
 
     def _clear_mappings(self):
         if self.mapping_table.rowCount() and QMessageBox.question(self,"清空映射","确定清空当前所有分发映射吗？")!=QMessageBox.Yes:return
-        self.mapping_table.setRowCount(0); self._refresh_mapping_scope(); audit.operation(self.settings.audit_path,"MAPPING","CLEAR","SUCCESS","已清空当前分发映射。");self.refresh_audit()
+        self.mapping_table.setRowCount(0); self._refresh_mapping_scope(); self._sync_distribution_with_mappings(); audit.operation(self.settings.audit_path,"MAPPING","CLEAR","SUCCESS","已清空当前分发映射。");self.refresh_audit()
 
     def _selected_hosts(self):
         out=[]
@@ -616,12 +828,15 @@ class MainWindow(QMainWindow):
         self._suppress_target_selection_persist = True
         try:
             for r in range(self.target_table.rowCount()):
+                if self.target_table.isRowHidden(r):
+                    continue
                 w=self.target_table.cellWidget(r,0)
                 if w:w.setChecked(checked)
         finally:
             self._suppress_target_selection_persist = False
         self._save_all_target_selection_preferences()
         self._refresh_mapping_scope()
+        self._apply_target_filter()
 
     def _on_target_check_changed(self, host: str, checked: bool):
         """Persist one target-host checkbox without ever storing credentials/secrets."""
@@ -637,6 +852,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             logging.getLogger("fds.settings").warning("保存目标主机选择状态失败：%s", exc)
         self._refresh_mapping_scope()
+        self._apply_target_filter()
 
     def _save_all_target_selection_preferences(self):
         """Persist the current distribution-target checkbox map.
@@ -770,6 +986,61 @@ class MainWindow(QMainWindow):
             if obj and obj.host not in seen:
                 seen.add(obj.host); out.append(obj)
         return out
+
+    def _open_selected_rdp(self):
+        """Launch local Windows Remote Desktop for exactly one target host.
+
+        This is an independent convenience action only. It does not change task selection,
+        distribution, backup, Dry Run, WinRM pre/post actions, or Version Checker.
+        """
+        hosts = self._selected_hosts()
+        if len(hosts) != 1:
+            highlighted = self._highlighted_target_hosts()
+            if len(hosts) == 0 and len(highlighted) == 1:
+                hosts = highlighted
+            else:
+                QMessageBox.information(self, "打开远程桌面", "请只勾选 1 台目标主机后再打开远程桌面。")
+                return
+        host_rec = hosts[0]
+        self._save_default_winrm_credential(show_error=True)
+        try:
+            credentials = self._resolve_credentials([host_rec])
+            username, password, source = credentials[host_rec.host]
+        except Exception as exc:
+            QMessageBox.warning(self, "打开远程桌面", str(exc))
+            return
+
+        # 对本地账号优先使用“目标主机名\用户”，避免 mstsc 把裸用户名解释成本机账号。
+        rdp_user = username.strip()
+        if "\\" not in rdp_user and "@" not in rdp_user:
+            remote_name = (host_rec.name or "").strip()
+            if remote_name and remote_name != host_rec.host and not remote_name.replace('.', '').isdigit():
+                rdp_user = f"{remote_name}\\{rdp_user}"
+
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        target = f"TERMSRV/{host_rec.host}"
+        try:
+            saved = subprocess.run(
+                ["cmdkey.exe", f"/generic:{target}", f"/user:{rdp_user}", f"/pass:{password}"],
+                capture_output=True, text=True, timeout=10, creationflags=creationflags, check=False,
+            )
+            if saved.returncode != 0:
+                detail = (saved.stderr or saved.stdout or "cmdkey 执行失败").strip()
+                raise RuntimeError(detail)
+            subprocess.Popen(["mstsc.exe", f"/v:{host_rec.host}"], creationflags=0)
+            self._append_log(f"[{host_rec.host}] 已启动 Windows 远程桌面；账号={rdp_user}；凭据来源={source}。")
+            audit.operation(
+                self.settings.audit_path, "HOST", "OPEN_RDP", "SUCCESS",
+                "已启动本机 Windows 远程桌面。", host=host_rec.host,
+                details={"name": host_rec.name, "username": rdp_user, "credential_source": source},
+            )
+            self.refresh_audit()
+        except FileNotFoundError:
+            QMessageBox.warning(self, "打开远程桌面", "当前系统未找到 Windows 远程桌面客户端 mstsc.exe / cmdkey.exe。")
+        except Exception as exc:
+            audit.operation(self.settings.audit_path, "HOST", "OPEN_RDP", "FAILED", str(exc), host=host_rec.host)
+            self.refresh_audit()
+            QMessageBox.warning(self, "打开远程桌面", f"启动远程桌面失败：\n{exc}")
 
     def _configure_host_credentials(self, hosts: list[HostRecord]):
         if not hosts:
@@ -999,6 +1270,177 @@ class MainWindow(QMainWindow):
             else:
                 self.statusBar().showMessage("已清空结束进程列表。",3000)
 
+    def _refresh_task_plan(self, *_):
+        steps=[]
+        if hasattr(self,"chk_backup") and self.chk_backup.isChecked(): steps.append("备份")
+        if hasattr(self,"remote_enabled") and self.remote_enabled.isChecked(): steps.append("前置操作")
+        if hasattr(self,"chk_distribution") and self.chk_distribution.isChecked(): steps.append("文件分发")
+        if hasattr(self,"remote_enabled") and self.remote_enabled.isChecked(): steps.append("后置操作")
+        if hasattr(self,"version_after_distribution") and self.version_after_distribution.isChecked(): steps.append("Version Checker")
+        text=" → ".join(steps) if steps else "未选择任务"
+        if hasattr(self,"task_plan_label"):
+            self.task_plan_label.setText("本次执行流程：" + text)
+        if hasattr(self,"btn_start"):
+            self.btn_start.setEnabled(bool(steps))
+
+    def _run_backup_standalone(self):
+        hosts=self._selected_hosts()
+        if not hosts:
+            QMessageBox.warning(self,"备份","请先勾选至少一台目标主机。")
+            return
+        if self.backup_thread and self.backup_thread.isRunning():
+            QMessageBox.warning(self,"备份","备份任务正在执行。")
+            return
+
+        self._save_default_winrm_credential(show_error=True)
+        contexts,hint=self._remote_drive_context_for_mapping()
+        if not contexts:
+            QMessageBox.warning(self,"备份",hint or "当前目标主机没有可用 WinRM 凭据，无法读取远程文件。")
+            return
+
+        d=RemoteBackupBrowserDialog(
+            self, contexts=contexts, preselected=getattr(self,"_standalone_backup_paths",[]),
+            use_https=self.remote_https.isChecked(), port=self.remote_port.value(),
+        )
+        if not d.exec():
+            return
+        remote_paths=d.selected_paths()
+        if not remote_paths:
+            return
+        self._standalone_backup_paths=remote_paths
+
+        root=self.backup_root.text().strip()
+        if root:
+            try: validate_windows_target_path(root, allow_unc=False)
+            except Exception as e:
+                QMessageBox.warning(self,"备份",str(e)); return
+        try: credentials=self._resolve_credentials(hosts)
+        except Exception as e:
+            QMessageBox.warning(self,"WinRM 凭据",str(e)); return
+
+        names="\n".join(f"• {(h.name or h.host)} ({h.host})" for h in hosts)
+        backup_display=root or r"各源文件所在目录\.fds_backup"
+        path_lines="\n".join(f"• {x}" for x in remote_paths)
+        msg=(f"将在 {len(hosts)} 台主机执行单独备份：\n{names}\n\n"
+             f"备份文件 / 文件夹：\n{path_lines}\n\n目标主机本地备份根目录：{backup_display}\n确定继续吗？")
+        if QMessageBox.question(self,"确认单独备份",msg)!=QMessageBox.Yes:
+            return
+
+        self.settings.max_concurrency=self.concurrent_spin.value(); self.settings.default_backup_root=root
+        self.settings.backup_task_enabled=bool(self.chk_backup.isChecked()); self.settings.save()
+        plan=RemoteActionPlan(enabled=False,use_https=self.remote_https.isChecked(),port=self.remote_port.value(),username="",password="")
+        self.btn_run_backup.setEnabled(False); self.btn_start.setEnabled(False); self._set_busy(True,"备份中")
+        self._append_log(f"开始单独备份任务：{len(hosts)} 台主机，目标={len(remote_paths)} 项，并发数={self.concurrent_spin.value()}。")
+        self.backup_thread=BackupThread([],hosts,credentials,self.settings,plan,root,remote_paths=remote_paths)
+        self.backup_thread.log.connect(self._append_log); self.backup_thread.host_status.connect(self._host_status); self.backup_thread.completed.connect(self._backup_completed); self.backup_thread.start()
+
+    def _backup_completed(self,status,success,failed):
+        self.btn_run_backup.setEnabled(True); self.btn_start.setEnabled(True); self._set_busy(False)
+        self._append_log(f"备份任务完成：{status_text(status)}，成功主机={success}，失败主机={failed}。")
+        self.refresh_audit()
+        QMessageBox.information(self,"备份",f"状态：{status_text(status)}\n成功主机：{success}\n失败主机：{failed}")
+
+    def _choose_version_result_root(self):
+        start=self.version_local_root.text().strip() or str(Path.home())
+        path=QFileDialog.getExistingDirectory(self,"选择 Version Checker 本机结果目录",start)
+        if path:self.version_local_root.setText(path)
+
+    def _save_version_checker_preferences(self):
+        self.settings.version_checker_after_distribution=bool(self.version_after_distribution.isChecked())
+        self.settings.version_checker_enabled=bool(self.version_after_distribution.isChecked())
+        self.settings.version_checker_exe_path=self.version_exe.text().strip()
+        self.settings.version_checker_workdir=self.version_workdir.text().strip()
+        self.settings.version_checker_output_dir=self.version_output_dir.text().strip()
+        self.settings.version_checker_save_button=self.version_save_button.text().strip() or "Save"
+        self.settings.version_checker_timeout_seconds=int(self.version_timeout.value())
+        self.settings.version_checker_collect_excel=bool(self.version_collect.isChecked())
+        self.settings.version_checker_close_after=bool(self.version_close.isChecked())
+        self.settings.version_checker_local_result_root=self.version_local_root.text().strip()
+        self.settings.save()
+
+    def _run_version_check_standalone(self):
+        hosts=self._selected_hosts()
+        if not hosts:
+            QMessageBox.warning(self,"版本检查","请先勾选至少一台目标主机。")
+            return
+        self._start_version_check_for_hosts(hosts,False)
+
+    def _start_version_check_for_hosts(self,hosts,chained=False):
+        if self.version_check_thread and self.version_check_thread.isRunning():
+            QMessageBox.warning(self,"版本检查","Version Checker 任务正在执行。")
+            return
+        exe=self.version_exe.text().strip(); workdir=self.version_workdir.text().strip(); outdir=self.version_output_dir.text().strip()
+        if not exe or not workdir or not outdir:
+            QMessageBox.warning(self,"版本检查","请填写 Version Checker 程序路径、工作目录和 CSV 生成目录。")
+            return
+        if self.version_collect.isChecked() and not self.version_local_root.text().strip():
+            QMessageBox.warning(self,"版本检查","已启用 CSV 回收，请填写本机结果目录。")
+            return
+        self._save_version_checker_preferences(); self._save_default_winrm_credential(show_error=True)
+        try: credentials=self._resolve_credentials(hosts)
+        except Exception as e:
+            QMessageBox.warning(self,"WinRM 凭据",str(e)); return
+        if not chained:
+            names="\n".join(f"• {(h.name or h.host)} ({h.host})" for h in hosts)
+            msg=(f"将在 {len(hosts)} 台主机并发执行 Version Checker：\n{names}\n\n"
+                 f"程序：{exe}\nCSV 目录：{outdir}\nSave 按钮：{self.version_save_button.text().strip() or 'Save'}\n"
+                 f"执行步骤：Save → OK → version_checker_result.csv → {'回收到本机' if self.version_collect.isChecked() else '仅远端保留'} → {'关闭程序' if self.version_close.isChecked() else '保留程序'}\n确定继续吗？")
+            if QMessageBox.question(self,"确认版本检查",msg)!=QMessageBox.Yes:return
+        plan=RemoteActionPlan(enabled=False,use_https=self.remote_https.isChecked(),port=self.remote_port.value(),username="",password="",command_timeout=max(90,self.version_timeout.value()+30))
+        self.btn_run_version_check.setEnabled(False); self.btn_start.setEnabled(False); self._set_busy(True,"版本检查中")
+        self._append_log(f"开始 Version Checker 任务：{len(hosts)} 台主机，并发数={self.concurrent_spin.value()}。")
+        self.settings.max_concurrency=self.concurrent_spin.value()
+        self.version_check_thread=VersionCheckThread(hosts,credentials,self.settings,plan,exe,workdir,outdir,
+            self.version_save_button.text().strip() or "Save",self.version_timeout.value(),self.version_collect.isChecked(),
+            self.version_close.isChecked(),self.version_local_root.text().strip())
+        # Version Checker 进度独立计算。组合任务时文件分发只占前 90%，
+        # Version Checker 使用最后 10%；单独执行时则从 0% 开始。
+        self._version_progress_chained=bool(chained)
+        self._version_progress_total=max(1,len(hosts))
+        self._version_progress_done=set()
+        if chained:
+            self.overall.setValue(90)
+            self.overall.setFormat("90% · 文件分发完成，正在执行 Version Checker")
+        else:
+            self.overall.setValue(0)
+            self.overall.setFormat("Version Checker %p%")
+        self.version_check_thread.log.connect(self._append_log)
+        self.version_check_thread.host_status.connect(self._version_check_host_status)
+        self.version_check_thread.completed.connect(self._version_check_completed)
+        self.version_check_thread.start()
+
+    def _version_check_host_status(self,host,status,detail):
+        # 保留原有目标主机状态更新，同时按“已完成主机数”推进版本检查进度。
+        self._host_status(host,status,detail)
+        if status not in {"SUCCESS","FAILED","CANCELLED"}:
+            return
+        done=getattr(self,"_version_progress_done",None)
+        if done is None:
+            return
+        done.add(host)
+        total=max(1,int(getattr(self,"_version_progress_total",1)))
+        ratio=min(1.0,len(done)/total)
+        chained=bool(getattr(self,"_version_progress_chained",False))
+        base=90 if chained else 0
+        # completed 信号到达前最多显示 99%，避免任务仍在收尾时提前显示 100%。
+        value=min(99,base+int(ratio*(99-base)))
+        self.overall.setValue(value)
+        if chained:
+            self.overall.setFormat(f"{value}% · Version Checker {len(done)}/{total} 台完成")
+        else:
+            self.overall.setFormat(f"{value}% · Version Checker {len(done)}/{total} 台完成")
+
+    def _version_check_completed(self,status,success,failed,result_dir):
+        self.btn_run_version_check.setEnabled(True); self._refresh_task_plan(); self.btn_dry_run.setEnabled(True)
+        self.btn_retry_failed.setEnabled(bool(getattr(self,"_last_failed_hosts",set())))
+        self.overall.setValue(100)
+        self.overall.setFormat("100% · 全部完成" if status=="SUCCESS" else ("100% · 已结束（已取消）" if status=="CANCELLED" else "100% · 已结束（版本检查有失败）"))
+        self._set_busy(False)
+        self._append_log(f"Version Checker 完成：{status_text(status)}，成功={success}，失败={failed}。")
+        self.refresh_audit()
+        extra=f"\n结果目录：{result_dir}" if self.version_collect.isChecked() else ""
+        QMessageBox.information(self,"版本检查",f"状态：{status_text(status)}\n成功主机：{success}\n失败主机：{failed}{extra}")
+
     def _validate_mappings(self,mappings,host_for_path):
         if not mappings:raise ValueError("请至少添加一条分发映射。")
         for m in mappings:
@@ -1006,20 +1448,208 @@ class MainWindow(QMainWindow):
             if m.source_type=="LOCAL" and not Path(m.source_path).exists():raise FileNotFoundError(f"本地分发源不存在：{m.source_path}")
             if m.source_type=="SFTP" and not all([m.sftp_host,m.sftp_username,m.source_path]):raise ValueError(f"SFTP 映射配置不完整：{m.display_source()}")
 
-    def _start_distribution(self):
-        hosts=self._selected_hosts();mappings=self._mapping_rows(True)
+    def _run_dry_run(self):
+        hosts=self._selected_hosts(); mappings=self._mapping_rows(True)
         if not hosts:
-            QMessageBox.warning(self,"文件分发","请至少选择一台目标主机。")
+            QMessageBox.warning(self,"Dry Run","请至少选择一台目标主机。")
+            return
+        if not self.chk_distribution.isChecked():
+            QMessageBox.information(self,"Dry Run","Dry Run 当前用于验证文件分发组合任务，请先启用“文件分发”。")
+            return
+        if not mappings:
+            QMessageBox.warning(self,"Dry Run","当前没有启用的分发映射。")
+            return
+        if self.dry_run_thread and self.dry_run_thread.isRunning():
+            QMessageBox.information(self,"Dry Run","当前预演正在执行。")
             return
         try:
             self._validate_mappings(mappings,hosts[0].host)
             if self.chk_backup.isChecked() and self.backup_root.text().strip():
                 validate_windows_target_path(self.backup_root.text().strip(), allow_unc=False)
         except Exception as e:
-            QMessageBox.warning(self,"分发计划检查",str(e));return
+            QMessageBox.warning(self,"Dry Run",str(e)); return
+        self._save_default_winrm_credential(show_error=True)
+        try:
+            credentials=self._resolve_credentials(hosts)
+        except Exception as e:
+            QMessageBox.warning(self,"WinRM 凭据",str(e)); return
 
-        self.settings.verify_sha256=self.chk_verify.isChecked();self.settings.backup_existing=self.chk_backup.isChecked();self.settings.preflight_check=self.chk_preflight.isChecked();self.settings.retry_count=self.retry_spin.value();self.settings.max_concurrency=self.concurrent_spin.value();self.settings.default_backup_root=self.backup_root.text().strip();self.settings.winrm_use_https=self.remote_https.isChecked();self.settings.winrm_port=self.remote_port.value();self.settings.winrm_command_workdir=self.command_workdir.text().strip()
+        # Dry Run 使用当前界面的即时配置，但不会触发任何实际写入/停服/命令执行。
+        self.settings.verify_sha256=self.chk_verify.isChecked()
+        self.settings.backup_existing=self.chk_backup.isChecked()
+        self.settings.preflight_check=self.chk_preflight.isChecked()
+        self.settings.max_concurrency=self.concurrent_spin.value()
+        self.settings.min_free_space_margin_mb=max(0,int(self.settings.min_free_space_margin_mb))
+        remote_plan=RemoteActionPlan(
+            enabled=self.remote_enabled.isChecked(), use_https=self.remote_https.isChecked(), port=self.remote_port.value(),
+            username="", password="", pre_commands=split_commands(self.pre_commands.toPlainText()),
+            kill_processes=split_items(self.kill_processes.text()), post_commands=split_commands(self.post_commands.toPlainText()),
+            post_on_failure=self.post_on_failure.isChecked(), command_workdir=self.command_workdir.text().strip(),
+            command_execution_mode=self.command_execution_mode.currentData() or "INTERACTIVE",
+        )
+        version_config={
+            "enabled": bool(self.version_after_distribution.isChecked()),
+            "exe_path": self.version_exe.text().strip(),
+            "workdir": self.version_workdir.text().strip(),
+            "output_dir": self.version_output_dir.text().strip(),
+        }
+        self._append_log(f"开始 Dry Run：{len(hosts)} 台主机，{len(mappings)} 条启用映射。")
+        self._dry_run_total_hosts=max(1,len(hosts)); self._dry_run_done_hosts=0
+        self.overall.setFormat("Dry Run %p%"); self.overall.setValue(0)
+        self.btn_dry_run.setEnabled(False); self.btn_start.setEnabled(False); self.btn_cancel.setEnabled(True)
+        self._set_busy(True,"Dry Run 预演中")
+        self.dry_run_thread=DryRunThread(
+            mappings,hosts,credentials,self.settings,remote_plan,
+            self.backup_root.text().strip(),version_config,
+        )
+        self.dry_run_thread.log.connect(self._append_log)
+        self.dry_run_thread.prepared.connect(self._dry_run_prepared)
+        self.dry_run_thread.host_status.connect(self._dry_run_host_status)
+        self.dry_run_thread.mapping_status.connect(self._mapping_status)
+        self.dry_run_thread.dry_completed.connect(self._dry_run_completed)
+        self.dry_run_thread.start()
+
+    def _dry_run_prepared(self,task_id,files,total_bytes):
+        self._last_dry_run_id=task_id
+        self._append_log(f"{task_id}：Dry Run 清单完成，{files} 个文件，共 {human_bytes(total_bytes)}。")
+        self.overall.setValue(25)
+
+    def _dry_run_host_status(self,host,status,detail):
+        self._dry_run_done_hosts=int(getattr(self,"_dry_run_done_hosts",0))+1
+        total=max(1,int(getattr(self,"_dry_run_total_hosts",1)))
+        self.overall.setValue(min(95,25+int(self._dry_run_done_hosts/total*70)))
+        label={"SUCCESS":"预演通过","WARNING":"预演警告","FAILED":"预演失败"}.get(status,status)
+        for r in range(self.target_table.rowCount()):
+            if self.target_table.item(r,2).text()==host:
+                cell=QTableWidgetItem(f"{label} {detail}".strip())
+                cell.setToolTip(detail)
+                self.target_table.setItem(r,7,cell)
+                break
+
+    def _dry_run_completed(self,summary):
+        self.btn_cancel.setEnabled(False); self.btn_dry_run.setEnabled(True)
+        self._refresh_task_plan(); self._set_busy(False)
+        status=str(summary.get("status") or "FAILED")
+        if status=="CANCELLED":
+            self.overall.setFormat("Dry Run 已取消")
+        elif status=="SUCCESS":
+            self.overall.setValue(100); self.overall.setFormat("Dry Run 100% · 全部通过")
+        elif status=="WARNING":
+            self.overall.setValue(100); self.overall.setFormat("Dry Run 100% · 有警告")
+        else:
+            self.overall.setValue(100); self.overall.setFormat("Dry Run 100% · 有失败")
+        ok=int(summary.get("success",0)); warn=int(summary.get("warning",0)); fail=int(summary.get("failed",0))
+        self._append_log(f"Dry Run 完成：通过={ok}，警告={warn}，失败={fail}。")
+        text=(f"Dry Run 结果\n\n通过：{ok} 台\n警告：{warn} 台\n失败：{fail} 台\n"
+              f"映射：{int(summary.get('mapping_count',0))} 条\n文件：{int(summary.get('file_count',0))} 个\n"
+              f"总大小：{human_bytes(int(summary.get('total_bytes',0)))}")
+        if summary.get("error"):
+            text += "\n\n" + str(summary.get("error"))
+        if fail:
+            text += "\n\n存在失败项，不建议直接开始正式分发；请先查看执行日志修复。"
+            QMessageBox.warning(self,"Dry Run",text)
+        elif warn:
+            text += "\n\n警告项通常表示目标/备份目录尚不存在，正式任务会尝试创建；建议确认后再执行。"
+            QMessageBox.information(self,"Dry Run",text)
+        else:
+            QMessageBox.information(self,"Dry Run",text+"\n\n当前执行计划可以进入正式分发。")
+
+    def _retry_failed_distribution(self):
+        failed_hosts=set(getattr(self,"_last_failed_hosts",set()) or set())
+        if not failed_hosts:
+            QMessageBox.information(self,"重试失败主机","上一轮没有可重试的失败主机。")
+            return
+        records={h.host:h for h in db.list_hosts()}
+        hosts=[records[h] for h in sorted(failed_hosts) if h in records]
+        if not hosts:
+            QMessageBox.warning(self,"重试失败主机","失败主机已不在主机管理中，无法重试。")
+            return
+        self._start_distribution_for_hosts(hosts,retry_mode=True)
+
+    def _export_last_task_result(self):
+        task_id=str(getattr(self,"_last_task_id","") or "")
+        if not task_id:
+            QMessageBox.information(self,"导出任务结果","当前还没有可导出的分发任务结果。")
+            return
+        task=db.get_task(task_id)
+        host_rows=list(db.list_task_hosts(task_id))
+        file_rows=list(db.list_task_files(task_id))
+        if not task:
+            QMessageBox.warning(self,"导出任务结果",f"找不到任务记录：{task_id}")
+            return
+        host_names={h.host:(h.name or h.host) for h in db.list_hosts()}
+        host_summary={r["host"]:r for r in host_rows}
+        headers=[
+            "Task ID","Task Status","Host Name","Host / IP","Host Status",
+            "New Files","Updated Files","Skipped Files","Failed Files","Transferred Bytes",
+            "Mapping ID","Source Path","Target Path","Relative Path","Action","File Size",
+            "Source SHA256","Target SHA256","File Status","Error",
+        ]
+        rows=[]
+        if file_rows:
+            for f in file_rows:
+                h=host_summary.get(f["host"])
+                rows.append([
+                    task_id,status_text(task["status"]),host_names.get(f["host"],f["host"]),f["host"],
+                    status_text(h["status"]) if h else "",
+                    h["new_files"] if h else 0,h["updated_files"] if h else 0,h["skipped_files"] if h else 0,
+                    h["failed_files"] if h else 0,h["transferred_bytes"] if h else 0,
+                    f["mapping_id"],f["source_path"],f["target_path"],f["relative_path"],f["action"],f["size"],
+                    f["source_sha256"],f["target_sha256"],status_text(f["status"]),f["error_message"],
+                ])
+        else:
+            # 认证/预检查阶段就失败时可能还没有文件明细；仍导出主机级失败原因。
+            for h in host_rows:
+                rows.append([
+                    task_id,status_text(task["status"]),host_names.get(h["host"],h["hostname"] or h["host"]),h["host"],
+                    status_text(h["status"]),h["new_files"],h["updated_files"],h["skipped_files"],h["failed_files"],h["transferred_bytes"],
+                    "","","","","","","","","",h["error_message"],
+                ])
+        default=Path.home()/"Downloads"/f"FileDistributionStudio_Result_{task_id}.xlsx"
+        path,_=QFileDialog.getSaveFileName(self,"导出任务结果",str(default),"Excel 工作簿 (*.xlsx)")
+        if not path:return
+        if not path.lower().endswith(".xlsx"):path += ".xlsx"
+        try:
+            saved=export_xlsx(path,headers,rows,sheet_name="任务结果")
+        except Exception as e:
+            logging.exception("Export task result failed"); QMessageBox.critical(self,"导出任务结果",str(e)); return
+        audit.operation(self.settings.audit_path,"EXPORT","TASK_RESULT_XLSX","SUCCESS","已导出分发任务结果 Excel。",task_id=task_id,subject=str(saved),details={"rows":len(rows),"file_detail":bool(file_rows)})
+        QMessageBox.information(self,"导出任务结果",f"已保存：\n{saved}\n\n共导出 {len(rows)} 行；包含主机结果、文件动作及 SHA256 对比。")
+
+    def _start_distribution(self):
+        return self._start_distribution_for_hosts()
+
+    def _start_distribution_for_hosts(self, hosts_override=None, retry_mode=False):
+        hosts=list(hosts_override) if hosts_override is not None else self._selected_hosts();mappings=self._mapping_rows(True)
+        if not hosts:
+            QMessageBox.warning(self,"执行任务","请至少选择一台目标主机。")
+            return
+        distribution_enabled=bool(self.chk_distribution.isChecked())
+        backup_enabled=bool(self.chk_backup.isChecked())
+        remote_enabled=bool(self.remote_enabled.isChecked())
+        version_enabled=bool(self.version_after_distribution.isChecked())
+        if not any((distribution_enabled,backup_enabled,remote_enabled,version_enabled)):
+            QMessageBox.warning(self,"执行任务","请至少启用一个任务组件。")
+            return
+        if not distribution_enabled:
+            # 无文件分发时，独立任务使用各自按钮执行，避免把“前/后”语义误套到不存在的分发步骤上。
+            if backup_enabled and not remote_enabled and not version_enabled:
+                self._run_backup_standalone(); return
+            if version_enabled and not backup_enabled and not remote_enabled:
+                self._run_version_check_standalone(); return
+            QMessageBox.information(self,"执行任务","当前未启用“文件分发”。\n\n备份、程序/服务操作、Version Checker 均支持独立执行；请使用对应模块右侧的“单独执行”按钮。\n需要组合执行时，请启用“文件分发”，任务链会按：备份 → 前置操作 → 文件分发 → 后置操作 → Version Checker 执行。")
+            return
+        try:
+            self._validate_mappings(mappings,hosts[0].host)
+            if backup_enabled and self.backup_root.text().strip():
+                validate_windows_target_path(self.backup_root.text().strip(), allow_unc=False)
+        except Exception as e:
+            QMessageBox.warning(self,"执行计划检查",str(e));return
+
+        self.settings.distribution_enabled=distribution_enabled; self.settings.backup_task_enabled=backup_enabled; self.settings.version_checker_enabled=version_enabled
+        self.settings.verify_sha256=self.chk_verify.isChecked();self.settings.backup_existing=backup_enabled;self.settings.preflight_check=self.chk_preflight.isChecked();self.settings.retry_count=self.retry_spin.value();self.settings.max_concurrency=self.concurrent_spin.value();self.settings.default_backup_root=self.backup_root.text().strip();self.settings.winrm_use_https=self.remote_https.isChecked();self.settings.winrm_port=self.remote_port.value();self.settings.winrm_command_workdir=self.command_workdir.text().strip()
         self._save_remote_action_preferences()
+        self._save_version_checker_preferences()
         self._save_default_winrm_credential(show_error=True)
         try:
             credentials=self._resolve_credentials(hosts)
@@ -1041,26 +1671,33 @@ class MainWindow(QMainWindow):
         host_lines="\n".join(f"  • {(h.name or h.host)} ({h.host})" if (h.name or h.host) != h.host else f"  • {h.host}" for h in hosts)
         msg=(f"分发映射：{len(mappings)} 条\n目标目录：{targets} 个\n目标主机：{len(hosts)} 台\n{host_lines}\n"
              f"凭据：默认 {default_count} 台 / 自定义 {custom_count} 台\n"
-             f"备份目录：{self.backup_root.text().strip() or '各目标目录\\.fds_backup'}\n"
-             f"校验策略：{'文件大小 + SHA256' if self.chk_verify.isChecked() else '文件大小'}\n"
+             + (f"目标主机本地备份目录：{self.backup_root.text().strip() or '各目标目录\\.fds_backup'}\n" if backup_enabled else "")
+             + f"校验策略：{'文件大小 + SHA256' if self.chk_verify.isChecked() else '文件大小'}\n"
              f"分发前预检查：{'启用' if self.chk_preflight.isChecked() else '关闭'}\n传输方式：WinRM\n"
              f"附加远程操作：{'已启用' if remote_plan.enabled else '未启用'}\n"
+             f"分发后版本检查：{'已启用' if self.version_after_distribution.isChecked() else '未启用'}\n"
              f"CMD 工作目录：{remote_plan.command_workdir or 'WinRM 默认目录'}\n"
              f"CMD 执行方式：{'目标机登录桌面（交互式）' if remote_plan.command_execution_mode == 'INTERACTIVE' else 'WinRM 后台'}\n"
              "执行顺序：预检查 → 结束目标进程 → 分发前 CMD → 文件分发 → 分发后 CMD\n\n"
              "所有主机会执行同一套映射，但每台主机会使用自己的有效 WinRM 凭据。"
              "本操作可能结束远程进程并覆盖目标文件。\n确定继续吗？")
-        if QMessageBox.question(self,"确认分发",msg)!=QMessageBox.Yes:return
-        self._append_log("开始执行多源多目标分发任务……")
-        self.btn_start.setEnabled(False); self.btn_cancel.setEnabled(True)
+        if retry_mode:
+            msg = "【仅重试上一轮失败主机】\n\n" + msg
+        if QMessageBox.question(self,"确认执行任务",msg)!=QMessageBox.Yes:return
+        self._append_log("开始重试失败主机……" if retry_mode else "开始执行所选任务链……")
+        self.btn_start.setEnabled(False); self.btn_dry_run.setEnabled(False); self.btn_retry_failed.setEnabled(False); self.btn_cancel.setEnabled(True)
         self.overall.setFormat("%p%")
         self.overall.setValue(0)
         # 进度条表示完整主机工作流，而不是仅表示文件数量。文件全部上传完成时最多到 90%，
         # 每台主机的分发后 CMD / 收尾完成后逐步到 99%，只有 completed 信号到达才显示 100%。
         self._dist_progress_hosts = {h.host: 0.0 for h in hosts}
+        self._dist_success_hosts = set()
         self._dist_progress_finished = set()
         self._dist_progress_host_count = max(1, len(hosts))
-        self._set_busy(True,"正在分发")
+        self._last_distribution_hosts = {h.host: h for h in hosts}
+        self._dist_plan_prepared = False
+        self._last_failed_hosts = set()
+        self._set_busy(True,"任务执行中")
         audit.operation(
             self.settings.audit_path,"TASK","USER_START","SUCCESS","用户确认开始多源多目标分发。",
             details={"mappings":[m.safe_dict() for m in mappings],"hosts":[h.host for h in hosts],
@@ -1074,12 +1711,23 @@ class MainWindow(QMainWindow):
         self.distribution_thread=DistributionThread(
             mappings,hosts,credentials,self.settings,remote_plan,self.backup_root.text().strip()
         )
+        self._last_task_id=self.distribution_thread.task_id
+        self.btn_export_result.setEnabled(False)
         self.distribution_thread.log.connect(self._append_log);self.distribution_thread.prepared.connect(self._dist_prepared);self.distribution_thread.host_status.connect(self._host_status);self.distribution_thread.mapping_status.connect(self._mapping_status);self.distribution_thread.file_progress.connect(self._file_progress);self.distribution_thread.completed.connect(self._dist_completed);self.distribution_thread.start()
 
     def _cancel_distribution(self):
-        if self.distribution_thread:self.distribution_thread.cancel();self._append_log("已请求取消当前任务……")
+        if self.dry_run_thread and self.dry_run_thread.isRunning():
+            self.dry_run_thread.cancel(); self._append_log("已请求取消 Dry Run……"); return
+        if self.distribution_thread and self.distribution_thread.isRunning():
+            self.distribution_thread.cancel(); self._append_log("已请求取消当前任务……")
+    def _clear_distribution_log(self):
+        if hasattr(self, "dist_log"):
+            self.dist_log.clear()
+
     def _append_log(self,text):self.dist_log.appendPlainText(f"{datetime.now().strftime('%H:%M:%S')}  {text}");logging.getLogger("fds.ui").info(text)
     def _dist_prepared(self,task_id,files,total_bytes):
+        self._last_task_id=task_id
+        self._dist_plan_prepared=True
         self._append_log(f"{task_id}：{files} 个文件，共 {human_bytes(total_bytes)}")
         if self.overall.value() < 5:
             self.overall.setValue(5)
@@ -1089,14 +1737,25 @@ class MainWindow(QMainWindow):
         count = max(1, int(getattr(self, "_dist_progress_host_count", len(hosts) or 1)))
         file_ratio = sum(max(0.0, min(1.0, float(v))) for v in hosts.values()) / count
         finished_ratio = len(getattr(self, "_dist_progress_finished", set())) / count
-        # 文件处理占 5~90%，完整主机收尾（包含分发后 CMD）占 90~99%。
-        value = int(5 + file_ratio * 85 + finished_ratio * 9)
-        self.overall.setValue(max(self.overall.value(), min(99, value)))
+        # 如果本次还包含 Version Checker，则为版本检查保留最后 10%：
+        # 文件分发完整结束最多到 90%；否则普通分发最多到 99%，completed 后才到 100%。
+        cap = 90 if bool(self.version_after_distribution.isChecked()) else 99
+        file_span = max(1, cap - 14)
+        value = int(5 + file_ratio * file_span + finished_ratio * 9)
+        self.overall.setValue(max(self.overall.value(), min(cap, value)))
 
     def _host_status(self,host,status,detail):
+        if self.distribution_thread and self.distribution_thread.isRunning():
+            if status == "SUCCESS" and hasattr(self,"_dist_success_hosts"):
+                self._dist_success_hosts.add(host)
+                if hasattr(self,"_last_failed_hosts"):
+                    self._last_failed_hosts.discard(host)
+            elif status == "FAILED" and hasattr(self,"_last_failed_hosts"):
+                self._last_failed_hosts.add(host)
         for r in range(self.target_table.rowCount()):
             if self.target_table.item(r,2).text()==host:
-                self.target_table.setItem(r,7,QTableWidgetItem(f"{status_text(status)} {detail}".strip()));break
+                cell=QTableWidgetItem(f"{status_text(status)} {detail}".strip()); cell.setToolTip(detail)
+                self.target_table.setItem(r,7,cell);break
         if status in {"SUCCESS", "FAILED", "CANCELLED"}:
             if hasattr(self, "_dist_progress_finished"):
                 self._dist_progress_finished.add(host)
@@ -1116,46 +1775,740 @@ class MainWindow(QMainWindow):
             self._append_log(f"[{host}] 分发失败：{rel}")
 
     def _dist_completed(self,status,success,failed):
-        self.btn_start.setEnabled(True); self.btn_cancel.setEnabled(False); self._set_busy(False)
-        # 100% 只在整个任务真正结束时出现：此时所有主机的文件、分发后 CMD 和审计收尾均已完成。
-        self.overall.setValue(100)
-        if status == "SUCCESS":
-            self.overall.setFormat("100% · 已完成")
-        elif status == "CANCELLED":
-            self.overall.setFormat("100% · 已结束（已取消）")
+        self.btn_cancel.setEnabled(False)
+        # 若成功主机还需要继续执行 Version Checker，此时整个任务尚未完成，
+        # 进度保持在 90%，不能提前显示 100%。
+        will_chain_version=bool(self.version_after_distribution.isChecked() and success>0 and status!="CANCELLED")
+        if will_chain_version:
+            self.overall.setValue(90)
+            self.overall.setFormat("90% · 文件分发完成，等待 Version Checker")
         else:
-            self.overall.setFormat("100% · 已结束（有失败）")
+            self.overall.setValue(100)
+            self.overall.setFormat("100% · 已完成" if status=="SUCCESS" else ("100% · 已结束（已取消）" if status=="CANCELLED" else "100% · 已结束（有失败）"))
+        # 如果任务在生成正式分发计划前就整体失败（例如 WinRM 前置认证未全部通过），
+        # 则这一轮所有目标主机都没有真正完成分发，重试时应包含整批主机。
+        all_hosts=set(getattr(self,"_last_distribution_hosts",{}).keys())
+        succeeded=set(getattr(self,"_dist_success_hosts",set()))
+        if failed:
+            if not getattr(self,"_dist_plan_prepared",False):
+                self._last_failed_hosts=set(all_hosts)
+            else:
+                self._last_failed_hosts=set(all_hosts)-succeeded
+        else:
+            self._last_failed_hosts=set()
+        self.btn_retry_failed.setEnabled(bool(self._last_failed_hosts) and status!="CANCELLED")
+        task_id=str(getattr(self,"_last_task_id","") or "")
+        self.btn_export_result.setEnabled(bool(task_id and db.get_task(task_id)))
         self._append_log(f"任务完成：{status_text(status)}，成功主机={success}，失败主机={failed}")
-        self.refresh_history(); self.refresh_audit()
-        QApplication.processEvents()  # 先让用户真正看到 100%，再弹出最终结果。
+        if self._last_failed_hosts:
+            self._append_log("可直接点击“重试失败主机”，仅重新执行：" + ", ".join(sorted(self._last_failed_hosts)))
+        self.refresh_history(); self.refresh_audit(); QApplication.processEvents()
+        if self.version_after_distribution.isChecked() and success>0 and status!="CANCELLED":
+            records=getattr(self,"_last_distribution_hosts",{})
+            hosts=[records[h] for h in sorted(succeeded) if h in records]
+            if hosts:
+                self._append_log(f"文件分发结束，按当前设置继续执行 Version Checker：{len(hosts)} 台成功主机。")
+                self._start_version_check_for_hosts(hosts,True)
+                return
+        self._refresh_task_plan(); self.btn_dry_run.setEnabled(True); self._set_busy(False)
         QMessageBox.information(self,"文件分发",f"状态：{status_text(status)}\n成功主机：{success}\n失败主机：{failed}\n\n详细记录请查看“分发历史”和“审计日志”。")
 
     # ---------- Inventory ----------
+    def _apply_table_filter(self, table: QTableWidget, query: str, count_label: QLabel | None = None):
+        """Case-insensitive contains filter across all textual cells; preserves checkbox state."""
+        q=(query or "").strip().casefold()
+        visible=0
+        for r in range(table.rowCount()):
+            values=[]
+            for c in range(table.columnCount()):
+                item=table.item(r,c)
+                if item:
+                    values.append(item.text())
+            matched=(not q) or (q in " ".join(values).casefold())
+            table.setRowHidden(r, not matched)
+            if matched:
+                visible += 1
+        if count_label is not None:
+            if table is getattr(self, "target_table", None):
+                selected = 0
+                for r in range(table.rowCount()):
+                    chk = table.cellWidget(r, 0)
+                    if chk and chk.isChecked():
+                        selected += 1
+                count_label.setText(f"显示 {visible} / {table.rowCount()} 台 · 已选 {selected} 台")
+            else:
+                count_label.setText(f"显示 {visible} / {table.rowCount()} 台")
+        return visible
+
+    def _apply_target_filter(self, _text=None):
+        if not hasattr(self, "target_table"):
+            return
+        query=self.target_filter_edit.text() if hasattr(self, "target_filter_edit") else ""
+        self._apply_table_filter(self.target_table, query, getattr(self, "target_filter_count", None))
+
+    def _apply_inventory_filter(self, _text=None):
+        if not hasattr(self, "host_table"):
+            return
+        query=self.inventory_filter_edit.text() if hasattr(self, "inventory_filter_edit") else ""
+        self._apply_table_filter(self.host_table, query, getattr(self, "inventory_filter_count", None))
+
+    def _check_host_environment(self, hosts: list[HostRecord], source_title: str = "主机"):
+        """Read-only system-time/firewall inspection over WinRM."""
+        hosts=list(hosts or [])
+        if not hosts:
+            QMessageBox.information(self, "ADMS 部署前检查", f"请先在“{source_title}”中勾选或选择至少一台主机。")
+            return
+        try:
+            credentials=self._resolve_credentials(hosts)
+        except Exception as exc:
+            QMessageBox.warning(self, "ADMS 部署前检查", str(exc))
+            return
+        if getattr(self, "host_env_thread", None) and self.host_env_thread.isRunning():
+            QMessageBox.information(self, "ADMS 部署前检查", "已有环境检查正在执行，请等待完成。")
+            return
+        self._append_log(f"开始 ADMS 部署前检查：{len(hosts)} 台；检查 WinRM、时间偏差、Private/Public 防火墙，并读取诊断信息。")
+        self._env_check_results=[]
+        self.host_env_thread=HostEnvironmentCheckThread(
+            hosts, credentials, use_https=self.remote_https.isChecked(), port=self.remote_port.value(),
+            max_workers=min(8, max(1, len(hosts))))
+        self.host_env_thread.result.connect(self._host_environment_result)
+        self.host_env_thread.completed.connect(self._host_environment_completed)
+        self.host_env_thread.start()
+
+    @staticmethod
+    def _environment_firewall_states(data: dict) -> dict[str, str]:
+        """Return readable Domain/Private/Public firewall states."""
+        states={"Domain":"未知", "Private":"未知", "Public":"未知"}
+        profiles=data.get("firewall_profiles") or []
+        if isinstance(profiles, dict):
+            profiles=[profiles]
+        for item in profiles:
+            name=str(item.get("Name", "") or "").strip()
+            if name in states:
+                states[name]="开启" if bool(item.get("Enabled")) else "关闭"
+        return states
+
+    @classmethod
+    def _environment_alarm_state(cls, data: dict) -> tuple[bool, bool, bool, dict[str, str]]:
+        """Alarm when either |clock drift| > 2 min OR Private/Public are not both disabled."""
+        drift=abs(float(data.get("time_drift_seconds", 0.0) or 0.0))
+        states=cls._environment_firewall_states(data)
+        time_bad=drift > 120.0
+        firewall_bad=not (states.get("Private") == "关闭" and states.get("Public") == "关闭")
+        return bool(time_bad or firewall_bad), time_bad, firewall_bad, states
+
+    def _host_environment_result(self, host: str, ok: bool, data):
+        data=dict(data or {}) if isinstance(data, dict) else {"error": str(data or "")}
+        data["host"]=host; data["ok"]=bool(ok)
+        self._env_check_results.append(data)
+        if ok:
+            drift=float(data.get("time_drift_seconds",0.0) or 0.0)
+            tz=data.get("time_zone", "未知")
+            svc=data.get("time_service", "未知")
+            alarm,time_bad,firewall_bad,states=self._environment_alarm_state(data)
+            level="告警" if alarm else "正常"
+            self._append_log(
+                f"[{host}] ADMS 部署前检查：{level}；时间偏差={drift:+.1f}s "
+                f"({'超过2分钟' if time_bad else '未超过2分钟'})；时区={tz}；W32Time={svc}；"
+                f"防火墙 Domain={states['Domain']}，Private={states['Private']}，Public={states['Public']}；"
+                f"防火墙条件={'异常' if firewall_bad else '满足要求'}。"
+            )
+        else:
+            self._append_log(f"[{host}] ADMS 部署前检查失败：{data.get('error','未知错误')}")
+
+    def _host_environment_completed(self, success: int, failed: int):
+        rows=list(getattr(self,"_env_check_results",[]) or [])
+        rows.sort(key=lambda x: x.get("host", ""))
+        lines=[]; alarms=[]
+        for x in rows:
+            host=x.get("host","")
+            if not x.get("ok"):
+                lines.append(f"✗ {host}\n  检查失败：{x.get('error','未知错误')}")
+                continue
+            drift=float(x.get("time_drift_seconds",0.0) or 0.0)
+            tz=x.get("time_zone","未知")
+            svc=x.get("time_service","未知")
+            alarm,time_bad,firewall_bad,states=self._environment_alarm_state(x)
+            mark="⚠" if alarm else "✓"
+            if alarm:
+                alarms.append(host)
+            lines.append(
+                f"{mark} {host}  {'告警' if alarm else '正常'}\n"
+                f"  时间偏差：{drift:+.1f}s（{'超过2分钟' if time_bad else '未超过2分钟'}）\n"
+                f"  时区：{tz}\n"
+                f"  Windows Time：{svc}\n"
+                f"  防火墙：Domain={states['Domain']}，Private={states['Private']}，Public={states['Public']}\n"
+                f"  ADMS 前置结论：{'不满足（告警）' if alarm else '满足'}；要求：时间偏差≤2分钟，Private=关闭，Public=关闭"
+            )
+        summary=f"ADMS 部署前检查完成：成功 {success} 台，失败 {failed} 台。"
+        summary += f"\n满足前置条件 {max(0, success-len(alarms))} 台，告警 {len(alarms)} 台。规则：时间偏差必须 ≤ 2 分钟，且 Private/Public 防火墙必须全部关闭；任一条件不满足即告警。"
+        # 使用固定的中等尺寸结果窗口，避免 QMessageBox 的 DetailedText
+        # 因长行 sizeHint 把窗口横向撑到接近全屏。结果直接展示，无需再点“Show Details”。
+        dlg=QDialog(self)
+        dlg.setWindowTitle("ADMS 部署前检查")
+        dlg.setModal(True)
+        dlg.resize(760, 560)
+        dlg.setMinimumSize(680, 480)
+        dlg.setMaximumWidth(860)
+
+        layout=QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(12)
+
+        summary_label=QLabel(summary)
+        summary_label.setWordWrap(True)
+        summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        summary_label.setStyleSheet("font-size:13px; font-weight:600; padding:4px 2px 8px 2px;")
+        layout.addWidget(summary_label)
+
+        detail=QPlainTextEdit()
+        detail.setReadOnly(True)
+        detail.setPlainText("\n\n".join(lines) if lines else "没有结果。")
+        detail.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        detail.setStyleSheet("font-family:Consolas, 'Microsoft YaHei UI'; font-size:12px;")
+        layout.addWidget(detail, 1)
+
+        buttons=QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.exec()
+
+
+    # ---------- Remote files (independent manual tool) ----------
+    def _build_remote_files_page(self):
+        canvas, root = self._page_canvas()
+        c, l = card(
+            "远程文件",
+            "独立的单机人工文件管理工具：通过 WinRM 浏览目标 Windows 文件系统，并在本机与远程之间上传/下载。"
+            "它不会加入文件分发、备份、Dry Run、Version Checker 或任何组合任务。",
+        )
+
+        top = QHBoxLayout(); top.setSpacing(8)
+        top.addWidget(QLabel("目标主机"))
+        self.remote_file_host_combo = QComboBox()
+        self.remote_file_host_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.remote_file_host_combo.currentIndexChanged.connect(self._remote_file_host_changed)
+        top.addWidget(self.remote_file_host_combo, 1)
+        self.remote_file_connect_btn = QPushButton("连接 / 刷新")
+        self.remote_file_connect_btn.setIcon(app_icon("refresh"))
+        self.remote_file_connect_btn.clicked.connect(self._remote_file_connect)
+        top.addWidget(self.remote_file_connect_btn)
+        self.remote_file_status = QLabel("未连接")
+        self.remote_file_status.setObjectName("Muted")
+        top.addWidget(self.remote_file_status)
+        l.addLayout(top)
+
+        help_label = QLabel(
+            "一次只连接 1 台主机，使用“文件分发 → Windows 目标主机”中相同的有效 WinRM 凭据。"
+            "左侧是本机，右侧是远程主机；可把 Windows 资源管理器中的文件/文件夹直接拖到右侧上传。"
+        )
+        help_label.setWordWrap(True); help_label.setObjectName("Muted"); l.addWidget(help_label)
+
+        panes = QHBoxLayout(); panes.setSpacing(12)
+
+        # Local pane
+        local_box, local_l = card("本机", "文件和文件夹都可以选择；Ctrl/Shift 可多选，双击文件夹进入，也可以直接拖到右侧上传。")
+        local_nav = QHBoxLayout(); local_nav.setSpacing(6)
+        self.remote_local_pc_btn = QPushButton("此电脑"); self.remote_local_pc_btn.setToolTip("显示本机所有可用磁盘。")
+        self.remote_local_pc_btn.clicked.connect(self._remote_local_show_drives)
+        self.remote_local_up_btn = QPushButton("上一级"); self.remote_local_up_btn.clicked.connect(self._remote_local_up)
+        self.remote_local_path = QLineEdit()
+        self.remote_local_path.setClearButtonEnabled(False)
+        self.remote_local_path.returnPressed.connect(self._remote_local_go)
+        self.remote_local_browse_btn = QPushButton("选择…")
+        self.remote_local_browse_btn.setToolTip("选择本机文件或文件夹。文件可多选；选中后会在左侧列表中定位并选中。")
+        choose_menu = QMenu(self.remote_local_browse_btn)
+        choose_files_action = choose_menu.addAction("选择文件…")
+        choose_files_action.triggered.connect(self._remote_local_choose_files)
+        choose_dir_action = choose_menu.addAction("选择文件夹…")
+        choose_dir_action.triggered.connect(self._remote_local_choose_directory)
+        self.remote_local_browse_btn.setMenu(choose_menu)
+        self.remote_local_refresh_btn = QPushButton("刷新"); self.remote_local_refresh_btn.clicked.connect(self._refresh_remote_local_table)
+        local_nav.addWidget(self.remote_local_pc_btn); local_nav.addWidget(self.remote_local_up_btn); local_nav.addWidget(self.remote_local_path, 1)
+        local_nav.addWidget(self.remote_local_browse_btn); local_nav.addWidget(self.remote_local_refresh_btn)
+        local_l.addLayout(local_nav)
+        self.remote_local_table = LocalFileTable(0, 4)
+        self.remote_local_table.setHorizontalHeaderLabels(["名称", "类型", "大小", "修改时间"])
+        self.remote_local_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.remote_local_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.remote_local_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.remote_local_table.setDragEnabled(True)
+        self.remote_local_table.verticalHeader().setVisible(False)
+        lh = self.remote_local_table.horizontalHeader(); lh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in (1,2,3): lh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self.remote_local_table.cellDoubleClicked.connect(self._remote_local_double_clicked)
+        local_l.addWidget(self.remote_local_table, 1)
+        panes.addWidget(local_box, 1)
+
+        # Transfer controls
+        controls = QVBoxLayout(); controls.setSpacing(8); controls.addStretch(1)
+        self.remote_upload_btn = QPushButton("上传  →")
+        self.remote_upload_btn.setToolTip("把左侧选中的本地文件/目录上传到右侧当前远程目录。也可以直接把资源管理器文件拖到右侧。")
+        self.remote_upload_btn.clicked.connect(self._remote_upload_selected)
+        self.remote_download_btn = QPushButton("←  下载")
+        self.remote_download_btn.setToolTip("把右侧选中的远程文件/目录下载到左侧当前本机目录。")
+        self.remote_download_btn.clicked.connect(self._remote_download_selected)
+        controls.addWidget(self.remote_upload_btn); controls.addWidget(self.remote_download_btn); controls.addStretch(1)
+        panes.addLayout(controls)
+
+        # Remote pane
+        remote_box, remote_l = card("远程主机", "双击文件夹进入；支持上传、下载、新建目录、重命名和删除。")
+        remote_nav = QHBoxLayout(); remote_nav.setSpacing(6)
+        self.remote_file_up_btn = QPushButton("上一级"); self.remote_file_up_btn.clicked.connect(self._remote_file_up)
+        self.remote_file_path = QLineEdit()
+        self.remote_file_path.setPlaceholderText(r"连接后显示远程路径，例如 D:\ADMS\bin")
+        self.remote_file_path.returnPressed.connect(self._remote_file_go)
+        self.remote_file_refresh_btn = QPushButton("刷新"); self.remote_file_refresh_btn.clicked.connect(self._remote_file_refresh)
+        remote_nav.addWidget(self.remote_file_up_btn); remote_nav.addWidget(self.remote_file_path, 1); remote_nav.addWidget(self.remote_file_refresh_btn)
+        remote_l.addLayout(remote_nav)
+        self.remote_file_table = RemoteFileDropTable(0, 4)
+        self.remote_file_table.setHorizontalHeaderLabels(["名称", "类型", "大小 / 可用", "修改时间"])
+        self.remote_file_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.remote_file_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.remote_file_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.remote_file_table.verticalHeader().setVisible(False)
+        rh = self.remote_file_table.horizontalHeader(); rh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in (1,2,3): rh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self.remote_file_table.cellDoubleClicked.connect(self._remote_file_double_clicked)
+        self.remote_file_table.localPathsDropped.connect(self._remote_file_drop_upload)
+        remote_l.addWidget(self.remote_file_table, 1)
+        remote_actions = QHBoxLayout(); remote_actions.setSpacing(6)
+        self.remote_mkdir_btn = QPushButton("新建目录"); self.remote_mkdir_btn.clicked.connect(self._remote_file_mkdir)
+        self.remote_rename_btn = QPushButton("重命名"); self.remote_rename_btn.clicked.connect(self._remote_file_rename)
+        self.remote_delete_btn = QPushButton("删除"); self.remote_delete_btn.clicked.connect(self._remote_file_delete)
+        remote_actions.addWidget(self.remote_mkdir_btn); remote_actions.addWidget(self.remote_rename_btn); remote_actions.addWidget(self.remote_delete_btn); remote_actions.addStretch(1)
+        remote_l.addLayout(remote_actions)
+        panes.addWidget(remote_box, 1)
+        l.addLayout(panes, 1)
+
+        transfer = QHBoxLayout(); transfer.setSpacing(8)
+        self.remote_file_progress = QProgressBar(); self.remote_file_progress.setRange(0,100); self.remote_file_progress.setValue(0)
+        self.remote_file_progress.setFormat("就绪")
+        self.remote_file_clear_log_btn = QPushButton("清空日志"); self.remote_file_clear_log_btn.clicked.connect(lambda: self.remote_file_log.clear())
+        transfer.addWidget(self.remote_file_progress, 1); transfer.addWidget(self.remote_file_clear_log_btn)
+        l.addLayout(transfer)
+        self.remote_file_log = QPlainTextEdit(); self.remote_file_log.setReadOnly(True); self.remote_file_log.setMaximumHeight(130)
+        l.addWidget(self.remote_file_log)
+
+        root.addWidget(c, 1)
+        self._remote_file_thread = None
+        self._remote_file_connected_host = ""
+        self._refresh_remote_file_hosts()
+        initial_local = (getattr(self.settings, "remote_file_local_path", "") or "").strip()
+        if initial_local and Path(initial_local).is_dir():
+            self.remote_local_path.setText(initial_local)
+            self._refresh_remote_local_table()
+        else:
+            self._remote_local_show_drives()
+        return canvas
+
+    def _remote_file_append_log(self, text: str):
+        if hasattr(self, "remote_file_log"):
+            self.remote_file_log.appendPlainText(f"{datetime.now().strftime('%H:%M:%S')}  {text}")
+
+    def _refresh_remote_file_hosts(self):
+        if not hasattr(self, "remote_file_host_combo"):
+            return
+        hosts = db.list_hosts()
+        current_host = ""
+        data = self.remote_file_host_combo.currentData()
+        if isinstance(data, HostRecord): current_host = data.host
+        desired = current_host or getattr(self.settings, "remote_file_last_host", "") or ""
+        self.remote_file_host_combo.blockSignals(True)
+        self.remote_file_host_combo.clear()
+        chosen = -1
+        for i, h in enumerate(hosts):
+            label = f"{h.name}  ({h.host})" if h.name and h.name != h.host else h.host
+            self.remote_file_host_combo.addItem(label, h)
+            if h.host == desired: chosen = i
+        if chosen >= 0: self.remote_file_host_combo.setCurrentIndex(chosen)
+        self.remote_file_host_combo.blockSignals(False)
+        self.remote_file_status.setText(f"{len(hosts)} 台可选 · 未连接" if hosts else "暂无已保存主机")
+
+    def _remote_file_current_host(self):
+        if not hasattr(self, "remote_file_host_combo"):
+            return None
+        obj = self.remote_file_host_combo.currentData()
+        return obj if isinstance(obj, HostRecord) else None
+
+    def _remote_file_context(self):
+        host = self._remote_file_current_host()
+        if not host:
+            raise ValueError("请先选择一台目标主机。")
+        self._save_default_winrm_credential(show_error=False)
+        creds = self._resolve_credentials([host])
+        username, password, source = creds[host.host]
+        return host, {"host": host.host, "name": host.name, "username": username, "password": password, "credential_source": source}
+
+    def _remote_file_host_changed(self, *_):
+        host = self._remote_file_current_host()
+        self._remote_file_connected_host = ""
+        self.remote_file_table.setRowCount(0)
+        self.remote_file_path.clear()
+        if host:
+            self.settings.remote_file_last_host = host.host; self.settings.save()
+            self.remote_file_status.setText(f"{host.host} · 未连接")
+
+    def _remote_file_set_busy(self, busy: bool, text=""):
+        widgets = [self.remote_file_host_combo, self.remote_file_connect_btn, self.remote_file_up_btn,
+                   self.remote_file_path, self.remote_file_refresh_btn, self.remote_upload_btn,
+                   self.remote_download_btn, self.remote_mkdir_btn, self.remote_rename_btn, self.remote_delete_btn]
+        for w in widgets:
+            w.setEnabled(not busy)
+        if text: self.remote_file_status.setText(text)
+
+    def _start_remote_file_op(self, operation: str, **kwargs):
+        if self._remote_file_thread and self._remote_file_thread.isRunning():
+            QMessageBox.information(self, "远程文件", "已有远程文件操作正在执行，请等待完成。")
+            return False
+        try:
+            host, ctx = self._remote_file_context()
+        except Exception as exc:
+            QMessageBox.warning(self, "远程文件", str(exc)); return False
+        self._remote_file_set_busy(True, f"{host.host} · 正在执行 {operation} …")
+        self.remote_file_progress.setValue(0); self.remote_file_progress.setFormat("处理中…")
+        self._remote_file_thread = RemoteFileOperationThread(
+            ctx, operation, use_https=self.remote_https.isChecked(), port=self.remote_port.value(), **kwargs)
+        self._remote_file_thread.progress.connect(self._remote_file_progress_changed)
+        self._remote_file_thread.log.connect(self._remote_file_append_log)
+        self._remote_file_thread.completed.connect(self._remote_file_op_done)
+        self._remote_file_thread.start()
+        return True
+
+    def _remote_file_progress_changed(self, done: int, total: int, name: str):
+        total=max(1,int(total)); done=max(0,int(done)); pct=min(99,int(done*100/total))
+        self.remote_file_progress.setValue(pct); self.remote_file_progress.setFormat(f"{pct}% · {done}/{total} · {name}")
+
+    def _remote_file_connect(self):
+        self._start_remote_file_op("LIST", remote_path="")
+
+    def _remote_file_refresh(self):
+        path=self.remote_file_path.text().strip().replace("/", "\\")
+        self._start_remote_file_op("LIST", remote_path=path)
+
+    def _remote_file_go(self):
+        path=self.remote_file_path.text().strip().replace("/", "\\")
+        if path and len(path)==2 and path[1]==':': path += "\\"
+        self._start_remote_file_op("LIST", remote_path=path)
+
+    def _remote_file_up(self):
+        import ntpath
+        path=self.remote_file_path.text().strip().replace("/", "\\")
+        if not path:
+            self._remote_file_connect(); return
+        drive, _ = ntpath.splitdrive(path)
+        root=drive+"\\" if drive else ""
+        if path.rstrip("\\").lower()==drive.lower():
+            self._remote_file_connect(); return
+        parent=ntpath.dirname(path.rstrip("\\")) or root
+        self._start_remote_file_op("LIST", remote_path=parent)
+
+    def _remote_file_double_clicked(self, row: int, _column: int):
+        item=self.remote_file_table.item(row,0)
+        if not item: return
+        path=str(item.data(Qt.UserRole+401) or "")
+        is_dir=bool(item.data(Qt.UserRole+402))
+        if is_dir and path:
+            self._start_remote_file_op("LIST", remote_path=path)
+
+    def _remote_file_populate(self, payload: dict):
+        self.remote_file_table.setRowCount(0)
+        kind=payload.get("kind")
+        if kind=="drives":
+            self.remote_file_path.clear()
+            for d in payload.get("data") or []:
+                r=self.remote_file_table.rowCount(); self.remote_file_table.insertRow(r)
+                name=d.get("name","")
+                item=QTableWidgetItem(f"{name}  {d.get('volume_label','')}".strip())
+                item.setData(Qt.UserRole+401,name); item.setData(Qt.UserRole+402,True); self.remote_file_table.setItem(r,0,item)
+                self.remote_file_table.setItem(r,1,QTableWidgetItem("磁盘"))
+                self.remote_file_table.setItem(r,2,QTableWidgetItem(f"可用 {human_bytes(int(d.get('free_size',0) or 0))} / {human_bytes(int(d.get('total_size',0) or 0))}"))
+                self.remote_file_table.setItem(r,3,QTableWidgetItem(""))
+        else:
+            path=str(payload.get("path") or "")
+            self.remote_file_path.setText(path)
+            self.settings.remote_file_remote_path=path; self.settings.save()
+            for e in payload.get("data") or []:
+                r=self.remote_file_table.rowCount(); self.remote_file_table.insertRow(r)
+                item=QTableWidgetItem(str(e.get("name", "")))
+                item.setData(Qt.UserRole+401,e.get("path", "")); item.setData(Qt.UserRole+402,bool(e.get("is_dir"))); self.remote_file_table.setItem(r,0,item)
+                self.remote_file_table.setItem(r,1,QTableWidgetItem("文件夹" if e.get("is_dir") else "文件"))
+                self.remote_file_table.setItem(r,2,QTableWidgetItem("—" if e.get("is_dir") else human_bytes(int(e.get("size",0) or 0))))
+                self.remote_file_table.setItem(r,3,QTableWidgetItem(str(e.get("modified", ""))))
+
+    def _remote_file_op_done(self, payload):
+        payload=dict(payload or {})
+        self._remote_file_set_busy(False)
+        if not payload.get("ok"):
+            self.remote_file_progress.setValue(0); self.remote_file_progress.setFormat("失败")
+            self.remote_file_status.setText("操作失败")
+            error=str(payload.get("error") or "未知错误")
+            self._remote_file_append_log("失败："+error)
+            QMessageBox.warning(self, "远程文件", error)
+            return
+        kind=payload.get("kind")
+        host=self._remote_file_current_host()
+        if kind in ("drives","entries"):
+            self._remote_file_connected_host = host.host if host else ""
+            self._remote_file_populate(payload)
+            self.remote_file_status.setText(f"{self._remote_file_connected_host} · 已连接")
+            self.remote_file_progress.setValue(100); self.remote_file_progress.setFormat("已连接")
+            self._remote_file_append_log(f"[{self._remote_file_connected_host}] 目录读取完成。")
+            return
+        self.remote_file_progress.setValue(100); self.remote_file_progress.setFormat("100% · 完成")
+        self.remote_file_status.setText(f"{host.host if host else ''} · 已完成")
+        self._remote_file_append_log(f"{kind} 完成。")
+        if kind in ("upload","mkdir","delete","rename"):
+            QTimer.singleShot(80, self._remote_file_refresh)
+        if kind=="download":
+            self._refresh_remote_local_table()
+
+    def _remote_local_go(self):
+        raw=self.remote_local_path.text().strip()
+        if raw in ("", "此电脑"):
+            self._remote_local_show_drives(); return
+        path=Path(raw).expanduser()
+        if not path.is_dir():
+            QMessageBox.warning(self, "本机目录", f"目录不存在：\n{path}"); return
+        self.remote_local_path.setText(str(path)); self._refresh_remote_local_table()
+
+    def _remote_local_show_drives(self):
+        self.remote_local_path.setText("此电脑")
+        self.remote_local_table.setRowCount(0)
+        drives=[]
+        if os.name == "nt":
+            for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                root=f"{letter}:\\"
+                try:
+                    if os.path.exists(root):
+                        drives.append(root)
+                except Exception:
+                    pass
+        else:
+            drives=[os.path.abspath(os.sep)]
+        for drive in drives:
+            try:
+                import shutil
+                usage=shutil.disk_usage(drive)
+                size_text=f"可用 {human_bytes(usage.free)} / {human_bytes(usage.total)}"
+            except Exception:
+                size_text="—"
+            r=self.remote_local_table.rowCount(); self.remote_local_table.insertRow(r)
+            item=QTableWidgetItem(drive)
+            item.setData(LocalFileTable.ROLE_PATH, drive); item.setData(Qt.UserRole+302, True); item.setData(Qt.UserRole+303, True)
+            self.remote_local_table.setItem(r,0,item)
+            self.remote_local_table.setItem(r,1,QTableWidgetItem("磁盘"))
+            self.remote_local_table.setItem(r,2,QTableWidgetItem(size_text))
+            self.remote_local_table.setItem(r,3,QTableWidgetItem(""))
+
+    def _remote_local_choose_files(self):
+        start=self.remote_local_path.text().strip()
+        if start == "此电脑" or not Path(start).is_dir(): start=str(Path.home())
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择要上传的本机文件（可多选）", start, "所有文件 (*.*)")
+        if paths:
+            self._remote_local_reveal_and_select(paths)
+
+    def _remote_local_choose_directory(self):
+        start=self.remote_local_path.text().strip()
+        if start == "此电脑" or not Path(start).is_dir(): start=str(Path.home())
+        path=QFileDialog.getExistingDirectory(self, "选择要上传的本机文件夹", start)
+        if path:
+            self._remote_local_reveal_and_select([path])
+
+    def _remote_local_reveal_and_select(self, paths):
+        paths=[str(Path(p)) for p in paths if p]
+        if not paths: return
+        parents={str(Path(p).parent) for p in paths}
+        parent=next(iter(parents)) if len(parents)==1 else str(Path(paths[0]).parent)
+        self.remote_local_path.setText(parent)
+        self._refresh_remote_local_table()
+        wanted={os.path.normcase(os.path.normpath(p)) for p in paths}
+        self.remote_local_table.clearSelection()
+        first_row=None
+        for r in range(self.remote_local_table.rowCount()):
+            item=self.remote_local_table.item(r,0)
+            item_path=str(item.data(LocalFileTable.ROLE_PATH) or "") if item else ""
+            if item_path and os.path.normcase(os.path.normpath(item_path)) in wanted:
+                idx=self.remote_local_table.model().index(r, 0)
+                self.remote_local_table.selectionModel().select(idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+                if first_row is None: first_row=r
+        if first_row is not None:
+            self.remote_local_table.scrollToItem(self.remote_local_table.item(first_row,0), QAbstractItemView.PositionAtCenter)
+
+    def _remote_local_browse(self):
+        # 兼容旧调用：默认进入“选择文件夹”。
+        self._remote_local_choose_directory()
+
+    def _remote_local_up(self):
+        raw=self.remote_local_path.text().strip()
+        if raw in ("", "此电脑"):
+            self._remote_local_show_drives(); return
+        p=Path(raw)
+        if os.name == "nt" and p.parent == p:
+            self._remote_local_show_drives(); return
+        # Windows 盘符根目录（C:\）的上一级是“此电脑”。
+        if os.name == "nt" and len(str(p)) <= 3 and str(p)[1:2] == ":":
+            self._remote_local_show_drives(); return
+        parent=p.parent
+        if parent==p:
+            self._remote_local_show_drives(); return
+        self.remote_local_path.setText(str(parent)); self._refresh_remote_local_table()
+
+    def _refresh_remote_local_table(self):
+        raw=self.remote_local_path.text().strip()
+        if raw == "此电脑":
+            self._remote_local_show_drives(); return
+        p=Path(raw or Path.home()).expanduser()
+        if not p.is_dir(): return
+        self.settings.remote_file_local_path=str(p); self.settings.save()
+        self.remote_local_table.setRowCount(0)
+        try:
+            entries=sorted(p.iterdir(), key=lambda x:(not x.is_dir(), x.name.lower()))
+        except Exception as exc:
+            self._remote_file_append_log(f"读取本机目录失败：{exc}"); return
+        for entry in entries:
+            try:
+                stat=entry.stat(); is_dir=entry.is_dir()
+                r=self.remote_local_table.rowCount(); self.remote_local_table.insertRow(r)
+                item=QTableWidgetItem(entry.name); item.setData(LocalFileTable.ROLE_PATH,str(entry)); item.setData(Qt.UserRole+302,is_dir); item.setData(Qt.UserRole+303,False); self.remote_local_table.setItem(r,0,item)
+                self.remote_local_table.setItem(r,1,QTableWidgetItem("文件夹" if is_dir else "文件"))
+                self.remote_local_table.setItem(r,2,QTableWidgetItem("—" if is_dir else human_bytes(stat.st_size)))
+                self.remote_local_table.setItem(r,3,QTableWidgetItem(datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")))
+            except Exception:
+                continue
+
+    def _remote_local_double_clicked(self, row: int, _column: int):
+        item=self.remote_local_table.item(row,0)
+        if item and bool(item.data(Qt.UserRole+302)):
+            path=str(item.data(LocalFileTable.ROLE_PATH) or "")
+            if path:
+                self.remote_local_path.setText(path); self._refresh_remote_local_table()
+
+    def _selected_local_paths(self):
+        rows=sorted({idx.row() for idx in self.remote_local_table.selectionModel().selectedRows()})
+        out=[]
+        for r in rows:
+            item=self.remote_local_table.item(r,0); path=str(item.data(LocalFileTable.ROLE_PATH) or "") if item else ""
+            if path: out.append(path)
+        return out
+
+    def _selected_remote_paths(self):
+        rows=sorted({idx.row() for idx in self.remote_file_table.selectionModel().selectedRows()})
+        out=[]
+        for r in rows:
+            item=self.remote_file_table.item(r,0); path=str(item.data(Qt.UserRole+401) or "") if item else ""
+            if path: out.append(path)
+        return out
+
+    def _remote_upload_selected(self):
+        paths=self._selected_local_paths()
+        if not paths:
+            QMessageBox.information(self,"远程文件","请先在左侧选择要上传的文件或文件夹。") ; return
+        self._remote_file_drop_upload(paths)
+
+    def _remote_file_drop_upload(self, paths):
+        remote_dir=self.remote_file_path.text().strip().replace("/", "\\")
+        if not remote_dir:
+            QMessageBox.information(self,"远程文件","请先进入右侧某个远程磁盘/目录，再上传文件。") ; return
+        names="\n".join(Path(p).name for p in list(paths)[:8])
+        if len(paths)>8: names += f"\n……另有 {len(paths)-8} 项"
+        if QMessageBox.question(self,"确认上传",f"上传到：{remote_dir}\n\n{names}\n\n确定继续？", QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes:
+            return
+        self._start_remote_file_op("UPLOAD", remote_path=remote_dir, paths=list(paths))
+
+    def _remote_download_selected(self):
+        paths=self._selected_remote_paths()
+        if not paths:
+            QMessageBox.information(self,"远程文件","请先在右侧选择要下载的文件或文件夹。") ; return
+        local_dir=self.remote_local_path.text().strip()
+        if QMessageBox.question(self,"确认下载",f"下载 {len(paths)} 项到本机：\n{local_dir}\n\n确定继续？", QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes:
+            return
+        self._start_remote_file_op("DOWNLOAD", local_path=local_dir, paths=paths)
+
+    def _remote_file_mkdir(self):
+        import ntpath
+        parent=self.remote_file_path.text().strip().replace("/", "\\")
+        if not parent:
+            QMessageBox.information(self,"远程文件","请先进入一个远程磁盘/目录。") ; return
+        name, ok=QInputDialog.getText(self,"新建远程目录","目录名称：")
+        if not ok or not name.strip(): return
+        self._start_remote_file_op("MKDIR", remote_path=ntpath.join(parent,name.strip()))
+
+    def _remote_file_rename(self):
+        paths=self._selected_remote_paths()
+        if len(paths)!=1:
+            QMessageBox.information(self,"远程文件","重命名时请只选择 1 个远程文件或文件夹。") ; return
+        import ntpath
+        old_name=ntpath.basename(paths[0].rstrip("\\"))
+        name, ok=QInputDialog.getText(self,"重命名远程项目","新名称：", text=old_name)
+        if not ok or not name.strip() or name.strip()==old_name: return
+        self._start_remote_file_op("RENAME", remote_path=paths[0], new_name=name.strip())
+
+    def _remote_file_delete(self):
+        paths=self._selected_remote_paths()
+        if not paths:
+            QMessageBox.information(self,"远程文件","请先选择要删除的远程文件或文件夹。") ; return
+        preview="\n".join(paths[:6])
+        if len(paths)>6: preview += f"\n……另有 {len(paths)-6} 项"
+        if QMessageBox.warning(self,"确认删除",f"以下远程项目将被直接删除，不进入回收站：\n\n{preview}\n\n确定删除？", QMessageBox.Yes|QMessageBox.No, QMessageBox.No)!=QMessageBox.Yes:
+            return
+        self._start_remote_file_op("DELETE", paths=paths)
+
     def _build_inventory_page(self):
         canvas,root=self._page_canvas(); c,l=card(
             "已保存主机",
             "主机管理只维护机器身份、分组和连接能力；“WinRM 凭据”在此处仅显示状态，不直接编辑，实际凭据统一在“文件分发 → Windows 目标主机”管理。所有实际分发和远程操作只使用 WinRM；Ping、SMB 445、RDP 3389、DNS/NetBIOS/SMB 身份仅用于发现与辅助诊断。",
         )
+        # 主机数量直接展示给用户，不再需要通过行数或数据库 ID 猜测。
+        self.inventory_count_label = QLabel("当前共 0 台主机")
+        self.inventory_count_label.setObjectName("Muted")
+        self.inventory_count_label.setStyleSheet("font-weight: 700; padding: 2px 0 0 0;")
+        l.addWidget(self.inventory_count_label)
+
+        inventory_filter_row = QHBoxLayout(); inventory_filter_row.setSpacing(8)
+        inventory_filter_row.addWidget(QLabel("快速筛选"))
+        self.inventory_filter_edit = QLineEdit()
+        self.inventory_filter_edit.setClearButtonEnabled(True)
+        self.inventory_filter_edit.setPlaceholderText("输入 IP、主机名、分组、在线状态、WinRM 状态或备注")
+        self.inventory_filter_edit.textChanged.connect(self._apply_inventory_filter)
+        inventory_filter_row.addWidget(self.inventory_filter_edit, 1)
+        self.inventory_filter_count = QLabel("显示 0 / 0 台")
+        self.inventory_filter_count.setObjectName("Muted")
+        inventory_filter_row.addWidget(self.inventory_filter_count)
+        l.addLayout(inventory_filter_row)
+
         self.host_table=QTableWidget(0,18)
         self.host_table.setHorizontalHeaderLabels([
             "选择","ID","名称","主机 / IP","名称来源","名称状态","分组","WinRM 凭据",
             "在线状态","Ping","445 SMB（识别）","3389 RDP（识别）","WinRM 端口","WinRM 状态","SMB 辅助状态","最后测试","最后发现","备注"
         ])
         self.host_table.setAlternatingRowColors(True); self.host_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.host_table.setSelectionMode(QAbstractItemView.ExtendedSelection); self.host_table.setEditTriggers(QAbstractItemView.NoEditTriggers); self.host_table.verticalHeader().setVisible(False)
-        self.host_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.host_table.horizontalHeader().setStretchLastSection(True)
+        # 主机管理表随窗口宽度自适应：除“选择”列外全部按可用宽度伸展，默认不再因为 ResizeToContents 产生超宽横向滚动。
+        host_header=self.host_table.horizontalHeader()
+        host_header.setSectionResizeMode(QHeaderView.Stretch)
+        host_header.setSectionResizeMode(0, QHeaderView.Fixed)
+        self.host_table.setColumnWidth(0, 44)
+        # SQLite 自增 ID 仅用于程序内部关联。删除/重新发现主机后数字不会连续，
+        # 对用户没有业务意义，因此主机管理界面隐藏，避免误解为“机器数量”。
+        self.host_table.setColumnHidden(1, True)
+        host_header.setMinimumSectionSize(42)
+        host_header.setStretchLastSection(False)
         l.addWidget(self.host_table)
         row=QHBoxLayout()
         for text,fn,icon in [
             ("添加",self._add_host,"add"),("编辑",self._edit_host,"edit"),("删除",self._delete_host,"delete"),
             ("全选",lambda:self._set_inventory_checks(True),"check"),("取消全选",lambda:self._set_inventory_checks(False),"clear"),
             ("测试在线状态",self._test_inventory_online,"radar"),
-            ("验证主机名",self._verify_inventory_names,"terminal"),("刷新",self.refresh_hosts,"refresh")
+            ("ADMS 部署前检查",lambda:self._check_host_environment(self._selected_inventory_hosts(), "主机管理"),"search"),
+            ("验证主机名",self._verify_inventory_names,"terminal"),("导出 Excel",self._export_inventory_excel,"file"),("刷新",self.refresh_hosts,"refresh")
         ]:
             b=QPushButton(text); b.setIcon(app_icon(icon)); b.clicked.connect(fn); row.addWidget(b)
         row.addStretch(1); l.addLayout(row); root.addWidget(c); return canvas
 
     def refresh_hosts(self):
         hosts=db.list_hosts()
+        if hasattr(self, "inventory_count_label"):
+            self.inventory_count_label.setText(f"当前共 {len(hosts)} 台主机")
 
         # 刷新主机状态时绝不能改变用户已经勾选的分发目标。
         # v0.5.0 的问题就在这里：每次 refresh_hosts() 都重新创建 QCheckBox 并 setChecked(True)，
@@ -1186,18 +2539,20 @@ class MainWindow(QMainWindow):
                     inventory_check_state[host_item.text().strip()] = bool(chk.isChecked())
             self.host_table.setRowCount(len(hosts))
             for r,h in enumerate(hosts):
-                chk=QCheckBox(); chk.setChecked(inventory_check_state.get(h.host, False)); self.host_table.setCellWidget(r,0,chk)
+                chk=QCheckBox(); chk.setChecked(inventory_check_state.get(h.host, False)); chk.setStyleSheet("QCheckBox { margin-left: 12px; margin-right: 12px; }"); self.host_table.setCellWidget(r,0,chk)
                 verify_text="已验证" if h.hostname_verified else ("未验证" if h.name and h.name != h.host else "未识别")
                 cred_status,_cred_tip=self._credential_status_for_host(h.host)
                 vals=[h.id,h.name,h.host,hostname_source_text(h.hostname_source),verify_text,group_text(h.group_name),cred_status,
                       online_status_text(h.online_status),"是" if h.ping_ok else "","是" if h.smb_port_ok else "","是" if h.rdp_port_ok else "","是" if h.winrm_port_ok else "",winrm_status_label(h.winrm_status),smb_status_label(h.smb_status),h.last_test_at,h.last_seen,h.notes]
                 for c,v in enumerate(vals, start=1):self.host_table.setItem(r,c,QTableWidgetItem(str(v if v is not None else "")))
             self.host_table.verticalScrollBar().setValue(inventory_scroll)
+            self._apply_inventory_filter()
 
         if hasattr(self,"target_table"):
             self.target_table.setRowCount(len(hosts))
             for r,h in enumerate(hosts):
                 chk=QCheckBox()
+                chk.setStyleSheet("QCheckBox { margin-left: 12px; margin-right: 12px; }")
                 # v0.6.20：目标主机选择跨启动持久化。
                 # 1) 当前会话已有表格时，刷新只恢复当前会话状态；
                 # 2) 新启动且已有历史记录时，恢复上次每台主机的勾选状态；
@@ -1218,11 +2573,55 @@ class MainWindow(QMainWindow):
                 online=QTableWidgetItem(online_status_text(h.online_status)); online.setToolTip(f"Ping={'是' if h.ping_ok else '否'}，445={'是' if h.smb_port_ok else '否'}，3389={'是' if h.rdp_port_ok else '否'}，WinRM={'是' if h.winrm_port_ok else '否'}\n最后测试：{h.last_test_at or '未测试'}"); self.target_table.setItem(r,5,online)
                 self.target_table.setItem(r,6,QTableWidgetItem(winrm_status_label(h.winrm_status))); self.target_table.setItem(r,7,QTableWidgetItem(""))
             self.target_table.verticalScrollBar().setValue(target_scroll)
+            self._apply_target_filter()
             # 首次初始化：只有实际存在主机时才消费“一次性默认全选”规则。
             # 这样全新安装若尚未发现任何主机，首次发现主机后仍会默认全部勾选。
             if hosts and not target_selection_initialized:
                 self._save_all_target_selection_preferences()
             self._refresh_mapping_scope()
+
+        if hasattr(self, "remote_file_host_combo"):
+            self._refresh_remote_file_hosts()
+
+    def _export_inventory_excel(self):
+        hosts = db.list_hosts()
+        if not hosts:
+            QMessageBox.information(self, "导出主机信息", "当前没有可导出的主机信息。")
+            return
+        default_name = f"FileDistributionStudio_Hosts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        default_path = str(Path.home() / "Downloads" / default_name)
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出主机信息", default_path, "Excel 工作簿 (*.xlsx)")
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".xlsx"):
+            file_path += ".xlsx"
+        headers = [
+            "名称", "主机 / IP", "名称来源", "名称状态", "分组", "WinRM 凭据",
+            "在线状态", "Ping", "445 SMB（识别）", "3389 RDP（识别）", "WinRM 端口",
+            "WinRM 状态", "SMB 辅助状态", "最后测试", "最后发现", "备注"
+        ]
+        rows = []
+        for h in hosts:
+            verify_text = "已验证" if h.hostname_verified else ("未验证" if h.name and h.name != h.host else "未识别")
+            cred_status, _ = self._credential_status_for_host(h.host)
+            rows.append([
+                h.name, h.host, hostname_source_text(h.hostname_source), verify_text,
+                group_text(h.group_name), cred_status, online_status_text(h.online_status),
+                "是" if h.ping_ok else "否", "是" if h.smb_port_ok else "否",
+                "是" if h.rdp_port_ok else "否", "是" if h.winrm_port_ok else "否",
+                winrm_status_label(h.winrm_status), smb_status_label(h.smb_status),
+                h.last_test_at or "", h.last_seen or "", h.notes or ""
+            ])
+        try:
+            saved = export_xlsx(file_path, headers, rows, sheet_name="主机信息")
+        except Exception as exc:
+            logging.exception("Export host inventory failed")
+            QMessageBox.critical(self, "导出主机信息", f"Excel 导出失败：\n{exc}")
+            return
+        audit.operation(self.settings.audit_path, "HOST", "EXPORT", "SUCCESS",
+                        "已导出主机信息 Excel。", details={"count": len(rows), "path": str(saved)})
+        self.refresh_audit()
+        QMessageBox.information(self, "导出主机信息", f"导出成功。\n\n主机数量：{len(rows)}\n文件：{saved}")
 
     def _add_host(self):
         d=HostEditDialog(self)
@@ -1233,6 +2632,8 @@ class MainWindow(QMainWindow):
 
     def _set_inventory_checks(self, checked: bool):
         for r in range(self.host_table.rowCount()):
+            if self.host_table.isRowHidden(r):
+                continue
             chk=self.host_table.cellWidget(r,0)
             if chk: chk.setChecked(checked)
 
@@ -1310,13 +2711,26 @@ class MainWindow(QMainWindow):
 
     # ---------- Discovery ----------
     def _build_discovery_page(self):
-        canvas,root=self._page_canvas(); c,l=card("扫描范围","不限制为当前网卡所在网段。可以一次添加多个可路由的 IPv4 CIDR，每行一个网段并统一扫描。主机发现允许使用 Ping、445、3389、5985/5986、DNS、NetBIOS 和 SMB 身份等多种只读信号；这些方式只负责识别主机，不参与文件分发或远程修改。")
-        ad=QHBoxLayout(); self.network_combo=QComboBox(); self.btn_refresh_networks=QPushButton("刷新网卡"); self.btn_add_adapter_range=QPushButton("添加网卡网段"); self.btn_refresh_networks.setIcon(app_icon("refresh")); self.btn_add_adapter_range.setIcon(app_icon("add")); self.btn_refresh_networks.clicked.connect(self.refresh_networks); self.btn_add_adapter_range.clicked.connect(self._add_adapter_cidr); ad.addWidget(QLabel("本机网卡")); ad.addWidget(self.network_combo,1); ad.addWidget(self.btn_refresh_networks); ad.addWidget(self.btn_add_adapter_range); l.addLayout(ad)
-        ranges=QHBoxLayout(); self.cidr_edit=QPlainTextEdit(); self.cidr_edit.setMaximumHeight(90); self.cidr_edit.setPlaceholderText("172.16.22.0/24\n172.16.21.0/24\n10.20.30.0/24")
-        quick=QVBoxLayout(); self.quick_cidr=QLineEdit(); self.quick_cidr.setPlaceholderText("添加网段，例如 172.16.21.0/24"); qb=QPushButton("添加网段"); cb=QPushButton("清空网段"); qb.clicked.connect(self._add_quick_cidr); cb.clicked.connect(lambda:self.cidr_edit.clear()); quick.addWidget(self.quick_cidr); quick.addWidget(qb); quick.addWidget(cb); quick.addStretch(1); ranges.addWidget(self.cidr_edit,2); ranges.addLayout(quick,1); l.addLayout(ranges)
-        action=QHBoxLayout(); self.btn_scan=QPushButton("扫描全部网段"); self.btn_scan.setObjectName("Primary"); self.btn_scan.setIcon(app_icon("radar")); self.btn_stop_scan=QPushButton("停止"); self.btn_stop_scan.setObjectName("Danger"); self.btn_stop_scan.setEnabled(False); self.btn_scan.clicked.connect(self._start_scan); self.btn_stop_scan.clicked.connect(self._stop_scan); self.discovery_progress=QProgressBar(); self.discovery_progress.setValue(0); action.addWidget(self.discovery_progress,1); action.addWidget(self.btn_scan); action.addWidget(self.btn_stop_scan); l.addLayout(action); root.addWidget(c)
+        canvas,root=self._page_canvas()
+        c,l=card(
+            "主机发现",
+            "跨一个或多个 IPv4 网段发现可访问的 Windows 主机。扫描范围由用户直接设置；扫描完成后仍会与主机管理自动比对并提示新增、疑似变化和离线主机。",
+        )
+        top=QHBoxLayout(); top.setSpacing(10)
+        self.discovery_ranges_edit=QLineEdit()
+        self.discovery_ranges_edit.setPlaceholderText("例如：172.16.21.0/24, 172.16.22.0/24")
+        self.discovery_ranges_edit.returnPressed.connect(self._edit_discovery_ranges)
+        self.btn_edit_ranges=QPushButton("保存范围")
+        self.btn_edit_ranges.setIcon(app_icon("edit")); self.btn_edit_ranges.clicked.connect(self._edit_discovery_ranges)
+        top.addWidget(QLabel("扫描范围")); top.addWidget(self.discovery_ranges_edit,1); top.addWidget(self.btn_edit_ranges); l.addLayout(top)
+        action=QHBoxLayout(); action.setSpacing(10)
+        self.discovery_progress=QProgressBar(); self.discovery_progress.setValue(0)
+        self.btn_scan=QPushButton("扫描内网"); self.btn_scan.setObjectName("Primary"); self.btn_scan.setIcon(app_icon("radar")); self.btn_scan.clicked.connect(self._start_scan)
+        self.btn_stop_scan=QPushButton("停止"); self.btn_stop_scan.setObjectName("Danger"); self.btn_stop_scan.setEnabled(False); self.btn_stop_scan.clicked.connect(self._stop_scan)
+        action.addWidget(self.discovery_progress,1); action.addWidget(self.btn_scan); action.addWidget(self.btn_stop_scan); l.addLayout(action)
+        root.addWidget(c)
 
-        rcard,rl=card("发现的主机","445/3389/5985/5986 仅用于轻量存活与 Windows 服务特征探测；主机名可通过 Windows 工作站 API、SMB 身份、DNS PTR、NetBIOS 或 WinRM hostname 识别。正式文件上传、目录操作、备份、校验、服务和进程控制始终只走 WinRM。")
+        rcard,rl=card("发现的 Windows 主机","发现结果仅使用 Ping/445/3389/5985/5986、DNS、NetBIOS、SMB/WKSSVC 等只读信号进行识别。正式文件分发、备份、服务与进程控制仍只使用 WinRM。")
         self.discovery_table=QTableWidget(0,12)
         self.discovery_table.setHorizontalHeaderLabels(["添加","来源网段","IP","识别名称","名称来源","名称状态","445 SMB","3389 RDP","5985 WinRM","5986 WinRM","主机状态","名称说明"])
         self.discovery_table.setAlternatingRowColors(True); self.discovery_table.verticalHeader().setVisible(False)
@@ -1324,37 +2738,96 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.discovery_table)
         bottom=QHBoxLayout(); self.discovery_status=QLabel("就绪"); self.discovery_status.setObjectName("Muted")
         b_verify=QPushButton("深度验证主机名"); b_verify.setIcon(app_icon("terminal")); b_verify.clicked.connect(self._verify_discovered_names)
-        b_add=QPushButton("添加选中主机"); b_add.setIcon(app_icon("hosts")); b_add.clicked.connect(self._add_discovered)
+        b_add=QPushButton("手动同步选中主机"); b_add.setIcon(app_icon("hosts")); b_add.clicked.connect(self._add_discovered)
         bottom.addWidget(self.discovery_status); bottom.addStretch(1); bottom.addWidget(b_verify); bottom.addWidget(b_add); rl.addLayout(bottom); root.addWidget(rcard); return canvas
 
+    def _default_discovery_ranges(self):
+        """Return conservative local defaults only when the user has no saved range.
+
+        Link-local/APIPA networks (169.254/16) are deliberately ignored.  They can
+        make a scan enormous and are not useful as a routed Windows discovery range.
+        """
+        ranges=[]
+        for _ifname,ip,cidr in local_ipv4_networks():
+            try:
+                addr=ipaddress.ip_address(ip)
+                net=ipaddress.ip_network(cidr,strict=False)
+                if not addr.is_private or addr.is_link_local or net.network_address.is_link_local:
+                    continue
+                # Keep automatic defaults practical. Larger routed ranges can still
+                # be entered explicitly by the user.
+                if net.num_addresses > 4096:
+                    continue
+                n=str(net)
+                if n not in ranges:ranges.append(n)
+            except Exception:
+                continue
+        return ranges
+
+    def _configured_discovery_ranges(self):
+        ranges=[]
+        for x in (self.settings.discovery_ranges or []):
+            try:
+                n=ipaddress.ip_network(x,strict=False)
+                # Remove the APIPA range that older automatic-discovery versions may
+                # have persisted into settings.
+                if n.network_address.is_link_local:
+                    continue
+                c=str(n)
+                if c not in ranges:ranges.append(c)
+            except Exception:
+                continue
+        return ranges
+
     def refresh_networks(self):
-        if not hasattr(self,"network_combo"):return
-        self.network_combo.clear(); nets=local_ipv4_networks()
-        for ifname,ip,cidr in nets:self.network_combo.addItem(f"{ifname}  ·  {ip}  ·  {cidr}",cidr)
-        if hasattr(self,"cidr_edit") and not self.cidr_edit.toPlainText().strip():
-            initial=self.settings.discovery_ranges or ([nets[0][2]] if nets else [])
-            self.cidr_edit.setPlainText("\n".join(initial))
+        if not hasattr(self,"discovery_ranges_edit"):return
+        ranges=self._configured_discovery_ranges()
+        if not ranges:
+            ranges=self._default_discovery_ranges()
+            if ranges:
+                self.settings.discovery_ranges=list(ranges); self.settings.save()
+        self.discovery_ranges_edit.setText(", ".join(ranges))
 
-    def _append_cidr(self,cidr):
-        try: canonical=normalize_networks([cidr])[0]
-        except Exception as e: QMessageBox.warning(self,"CIDR",str(e)); return
-        current=normalize_networks(self.cidr_edit.toPlainText()) if self.cidr_edit.toPlainText().strip() else []
-        if canonical not in current: current.append(canonical)
-        self.cidr_edit.setPlainText("\n".join(current))
+    def _edit_discovery_ranges(self):
+        text=self.discovery_ranges_edit.text().strip()
+        try:
+            ranges=normalize_networks(text)
+            if not ranges:
+                raise ValueError("请至少填写一个 IPv4 CIDR 网段。")
+            total=sum(max(0,ipaddress.ip_network(x,strict=False).num_addresses-2) for x in ranges)
+            if total>4096:
+                raise ValueError(f"当前扫描范围约包含 {total} 个可用地址，超过单次扫描上限 4096。请缩小或拆分扫描范围。")
+        except Exception as e:
+            QMessageBox.warning(self,"扫描范围",str(e)); return False
+        self.settings.discovery_ranges=ranges; self.settings.save()
+        self.discovery_ranges_edit.setText(", ".join(ranges))
+        self.discovery_status.setText("扫描范围已保存："+"、".join(ranges))
+        return True
 
-    def _add_adapter_cidr(self):
-        cidr=self.network_combo.currentData()
-        if cidr:self._append_cidr(cidr)
-
-    def _add_quick_cidr(self):
-        if self.quick_cidr.text().strip():self._append_cidr(self.quick_cidr.text().strip());self.quick_cidr.clear()
+    def _host_in_scan_ranges(self,host,cidrs):
+        try:addr=ipaddress.ip_address(host)
+        except Exception:return False
+        for cidr in cidrs:
+            try:
+                if addr in ipaddress.ip_network(cidr,strict=False):return True
+            except Exception:
+                pass
+        return False
 
     def _start_scan(self):
-        try: cidrs=normalize_networks(self.cidr_edit.toPlainText())
+        # Always scan exactly the range currently shown to the user.  Do not append
+        # networks from adapters behind the scenes.
+        if not self._edit_discovery_ranges():
+            return
+        cidrs=list(self.settings.discovery_ranges or [])
+        try: cidrs=normalize_networks(cidrs)
         except Exception as e: QMessageBox.warning(self,"主机发现",str(e)); return
-        if not cidrs: QMessageBox.warning(self,"主机发现","请至少添加一个 CIDR 网段。"); return
-        self.settings.discovery_ranges=cidrs; self.settings.save(); self.discovery_table.setRowCount(0); self.btn_scan.setEnabled(False); self.btn_stop_scan.setEnabled(True); self.discovery_progress.setValue(0); self.discovery_status.setText("正在扫描：" + ", ".join(cidrs)); self._set_busy(True,"正在扫描")
-        audit.operation(self.settings.audit_path,"DISCOVERY","START","SUCCESS","开始扫描 Windows 主机。",details={"ranges":cidrs})
+        self._scan_cidrs=list(cidrs)
+        self._scan_existing_hosts={h.host:h for h in db.list_hosts() if self._host_in_scan_ranges(h.host,cidrs)}
+        self._scan_discovered_ips=set()
+        self.discovery_table.setRowCount(0); self.btn_scan.setEnabled(False); self.btn_stop_scan.setEnabled(True); self.btn_edit_ranges.setEnabled(False); self.discovery_progress.setValue(0)
+        self.discovery_status.setText("正在扫描：" + "、".join(cidrs)); self._set_busy(True,"正在扫描")
+        audit.operation(self.settings.audit_path,"DISCOVERY","START","SUCCESS","开始智能扫描 Windows 主机。",details={"ranges":cidrs,"known_hosts_in_scope":len(self._scan_existing_hosts)})
         self.discovery_thread=DiscoveryThread(cidrs,self.settings.socket_timeout,self.settings.discovery_workers); self.discovery_thread.result_found.connect(self._discovery_result); self.discovery_thread.log.connect(self.discovery_status.setText); self.discovery_thread.progress.connect(self._scan_progress); self.discovery_thread.completed.connect(self._scan_completed); self.discovery_thread.start()
 
     def _stop_scan(self):
@@ -1365,59 +2838,121 @@ class MainWindow(QMainWindow):
         self.discovery_progress.setValue(int(done*100/total) if total else 0)
 
     def _discovery_result(self,x):
+        self._scan_discovered_ips.add(x.host)
         for r in range(self.discovery_table.rowCount()):
             if self.discovery_table.item(r,2).text()==x.host:return
         r=self.discovery_table.rowCount(); self.discovery_table.insertRow(r)
-        chk=QCheckBox(); chk.setChecked(True); self.discovery_table.setCellWidget(r,0,chk)
+        chk=QCheckBox(); chk.setChecked(True); holder=QWidget(); hl=QHBoxLayout(holder); hl.setContentsMargins(0,0,0,0); hl.setAlignment(Qt.AlignCenter); hl.addWidget(chk); self.discovery_table.setCellWidget(r,0,holder)
         verify="已验证" if x.hostname_verified else ("未验证" if x.hostname else "未识别")
         vals=[x.network,x.host,x.hostname,hostname_source_text(x.hostname_source),verify,
               "是" if x.port_445 else "","是" if x.port_3389 else "","是" if x.port_5985 else "","是" if x.port_5986 else "",status_text(x.status),x.hostname_note]
         for c,v in enumerate(vals,1):self.discovery_table.setItem(r,c,QTableWidgetItem(v))
-        # Store stable source/verification values separately from presentation text.
         self.discovery_table.item(r,3).setData(Qt.UserRole,x.hostname_source)
         self.discovery_table.item(r,5).setData(Qt.UserRole,bool(x.hostname_verified))
         self.discovery_table.item(r,5).setData(Qt.UserRole + 1, "")
         self._mark_duplicate_discovery_names()
-        audit.operation(self.settings.audit_path,"DISCOVERY","HOST_FOUND","SUCCESS","扫描发现主机。",host=x.host,details={"network":x.network,"hostname":x.hostname,"hostname_source":x.hostname_source,"hostname_verified":x.hostname_verified,"hostname_note":x.hostname_note,"smb_445":x.port_445,"rdp_3389":x.port_3389,"winrm_5985":x.port_5985,"winrm_5986":x.port_5986,"status":x.status})
+        audit.operation(self.settings.audit_path,"DISCOVERY","HOST_FOUND","SUCCESS","扫描发现 Windows 主机。",host=x.host,details={"network":x.network,"hostname":x.hostname,"hostname_source":x.hostname_source,"hostname_verified":x.hostname_verified,"hostname_note":x.hostname_note,"smb_445":x.port_445,"rdp_3389":x.port_3389,"winrm_5985":x.port_5985,"winrm_5986":x.port_5986,"status":x.status})
 
     def _mark_duplicate_discovery_names(self):
         names={}
         for r in range(self.discovery_table.rowCount()):
-            item=self.discovery_table.item(r,3)
-            name=(item.text().strip() if item else "")
-            if name:
-                names.setdefault(name.casefold(),[]).append(r)
+            item=self.discovery_table.item(r,3); name=(item.text().strip() if item else "")
+            if name:names.setdefault(name.casefold(),[]).append(r)
         duplicate_rows={r for rows in names.values() if len(rows)>1 for r in rows}
         for r in range(self.discovery_table.rowCount()):
             name_item=self.discovery_table.item(r,3); state_item=self.discovery_table.item(r,5); note_item=self.discovery_table.item(r,11)
-            verified=bool(state_item.data(Qt.UserRole)) if state_item else False
-            verify_error=(state_item.data(Qt.UserRole + 1) if state_item else "") or ""
-            name=name_item.text().strip() if name_item else ""
-            if verified:
-                state_item.setText("已验证")
-            elif verify_error == "FAILED":
-                state_item.setText("验证失败")
+            verified=bool(state_item.data(Qt.UserRole)) if state_item else False; verify_error=(state_item.data(Qt.UserRole + 1) if state_item else "") or ""; name=name_item.text().strip() if name_item else ""
+            if verified:state_item.setText("已验证")
+            elif verify_error == "FAILED":state_item.setText("验证失败")
             elif r in duplicate_rows:
-                state_item.setText("名称重复，建议验证")
-                note=(note_item.text().strip() if note_item else "")
-                if "重复" not in note:
-                    note_item.setText((note+" ").strip()+"同一次扫描中有多个 IP 返回相同名称，建议执行 SMB/WKSSVC 或 WinRM 深度验证实际计算机名。")
-            elif name:
-                state_item.setText("未验证")
-            else:
-                state_item.setText("未识别")
+                state_item.setText("名称重复，建议验证"); note=(note_item.text().strip() if note_item else "")
+                if "重复" not in note:note_item.setText((note+" ").strip()+"同一次扫描中有多个 IP 返回相同名称，建议执行 SMB/WKSSVC 或 WinRM 深度验证实际计算机名。")
+            elif name:state_item.setText("未验证")
+            else:state_item.setText("未识别")
 
     def _scan_completed(self,status):
-        self.btn_scan.setEnabled(True); self.btn_stop_scan.setEnabled(False); self._set_busy(False)
+        self.btn_scan.setEnabled(True); self.btn_stop_scan.setEnabled(False); self.btn_edit_ranges.setEnabled(True); self._set_busy(False)
         if status=="Completed":self.discovery_progress.setValue(100)
-        self.discovery_status.setText(f"{status_text(status)}：发现 {self.discovery_table.rowCount()} 台主机")
-        audit_status={"Completed":"SUCCESS","Cancelled":"CANCELLED","Failed":"FAILED"}.get(status,str(status).upper()); audit.operation(self.settings.audit_path,"DISCOVERY","FINISH",audit_status,"主机扫描结束。",details={"found":self.discovery_table.rowCount(),"ranges":self.settings.discovery_ranges})
+        self.discovery_status.setText(f"{status_text(status)}：发现 {self.discovery_table.rowCount()} 台 Windows 主机")
+        audit_status={"Completed":"SUCCESS","Cancelled":"CANCELLED","Failed":"FAILED"}.get(status,str(status).upper()); audit.operation(self.settings.audit_path,"DISCOVERY","FINISH",audit_status,"主机扫描结束。",details={"found":self.discovery_table.rowCount(),"ranges":self._scan_cidrs})
         self.refresh_audit()
+        if status=="Completed":self._start_discovery_reconcile()
+
+    def _start_discovery_reconcile(self):
+        missing=[ip for ip in self._scan_existing_hosts if ip not in self._scan_discovered_ips]
+        if not missing:
+            self._show_discovery_sync_dialog([]); return
+        self.discovery_status.setText(f"扫描完成：发现 {self.discovery_table.rowCount()} 台；正在复查主机库中 {len(missing)} 个未发现 IP…")
+        self.discovery_reconcile_thread=DiscoveryReconcileThread(missing,self.settings.socket_timeout,max_workers=min(24,max(8,self.settings.discovery_workers)))
+        self.discovery_reconcile_thread.completed.connect(self._discovery_reconcile_completed); self.discovery_reconcile_thread.start()
+
+    def _discovery_reconcile_completed(self,results):
+        self._show_discovery_sync_dialog(results)
+
+    def _discovery_row_data(self,r):
+        return {
+            "row":r,"ip":self.discovery_table.item(r,2).text(),"hostname":self.discovery_table.item(r,3).text().strip(),
+            "source_text":self.discovery_table.item(r,4).text(),"source_code":self.discovery_table.item(r,3).data(Qt.UserRole),
+            "verified":bool(self.discovery_table.item(r,5).data(Qt.UserRole)),"note":self.discovery_table.item(r,11).text(),
+            "status":self.discovery_table.item(r,10).text(),"smb":self.discovery_table.item(r,6).text()=="是",
+            "rdp":self.discovery_table.item(r,7).text()=="是","w1":self.discovery_table.item(r,8).text()=="是","w2":self.discovery_table.item(r,9).text()=="是",
+        }
+
+    def _upsert_discovery_data(self,d):
+        now=datetime.now().isoformat(timespec="seconds")
+        source_map={"DNS PTR":"DNS_PTR","NetBIOS":"NETBIOS","Windows 名称解析":"WINDOWS_RESOLVER","Windows 工作站 API":"NETAPI_WKSTA","SMB/NTLM 指纹":"SMB_NTLM","SMB/WKSSVC 验证":"SMB_RPC","WinRM hostname":"WINRM","手工维护":"MANUAL"}
+        stable_source=d["source_code"] or source_map.get(d["source_text"],"")
+        online_status="ONLINE_WINRM" if (d["w1"] or d["w2"]) else ("ONLINE_SMB" if d["smb"] else ("ONLINE" if d["rdp"] else "UNTESTED"))
+        db.upsert_host(HostRecord(id=None,name=d["hostname"] or d["ip"],host=d["ip"],group_name="自动发现",target_mode="WINRM",default_target="",os_hint=d["status"],last_seen=now,notes="",hostname_source=stable_source,hostname_verified=int(d["verified"]),hostname_note=d["note"],online_status=online_status,ping_ok=0,smb_port_ok=int(d["smb"]),rdp_port_ok=int(d["rdp"]),winrm_port_ok=int(d["w1"] or d["w2"]),smb_status="UNTESTED",last_test_at=now))
+
+    def _show_discovery_sync_dialog(self,recheck_results):
+        known=set(self._scan_existing_hosts)
+        new_rows=[self._discovery_row_data(r) for r in range(self.discovery_table.rowCount()) if self.discovery_table.item(r,2).text() not in known]
+        non_windows=[]; offline=[]
+        for ip,res in recheck_results:
+            h=self._scan_existing_hosts.get(ip)
+            if res is None:
+                offline.append((h,"复查失败")); continue
+            windows_signal=bool(res.smb_port_ok or res.rdp_port_ok or res.winrm_port_ok)
+            if windows_signal:
+                db.update_host_connectivity(ip,online_status=res.online_status,ping_ok=res.ping_ok,smb_port_ok=res.smb_port_ok,rdp_port_ok=res.rdp_port_ok,winrm_port_ok=res.winrm_port_ok,last_test_at=datetime.now().isoformat(timespec="seconds"))
+            elif res.ping_ok:
+                non_windows.append((h,"IP 可达，但 445/3389/5985/5986 均未检测到 Windows 服务特征"))
+            else:
+                offline.append((h,"本次扫描和复查均不可达，可能关机、断网或被防火墙阻断"))
+        if not new_rows and not non_windows and not offline:
+            self.discovery_status.setText(f"扫描完成：发现 {self.discovery_table.rowCount()} 台 Windows 主机；主机库无需变更。")
+            return
+        d=QDialog(self); d.setWindowTitle("智能同步主机库 - File Distribution Studio"); d.resize(900,560)
+        vl=QVBoxLayout(d); title=QLabel("扫描完成，发现主机库变化"); title.setStyleSheet("font-size:18px;font-weight:700;"); vl.addWidget(title)
+        desc=QLabel(f"新发现 Windows 主机 {len(new_rows)} 台；疑似已不是 Windows 的已保存 IP {len(non_windows)} 个；暂时不可达 {len(offline)} 个。\n新增项默认勾选；移除属于删除操作，默认不勾选，由你确认。离线主机只提醒并保留。")
+        desc.setWordWrap(True); desc.setObjectName("Muted"); vl.addWidget(desc)
+        table=QTableWidget(0,6); table.setHorizontalHeaderLabels(["处理","变化类型","名称","IP","检测结果","建议"]); table.verticalHeader().setVisible(False); table.setAlternatingRowColors(True); table.horizontalHeader().setStretchLastSection(True); table.setSelectionMode(QAbstractItemView.NoSelection)
+        actions=[]
+        def add_row(kind,hname,ip,result,suggestion,checked,action,payload):
+            r=table.rowCount(); table.insertRow(r); holder=QWidget(); lay=QHBoxLayout(holder); lay.setContentsMargins(0,0,0,0); lay.setAlignment(Qt.AlignCenter); chk=QCheckBox(); chk.setChecked(checked); chk.setEnabled(action in ("ADD","REMOVE")); lay.addWidget(chk); table.setCellWidget(r,0,holder)
+            for c,val in enumerate([kind,hname,ip,result,suggestion],1):table.setItem(r,c,QTableWidgetItem(val))
+            actions.append((chk,action,payload))
+        for x in new_rows:add_row("新发现 Windows",x["hostname"] or x["ip"],x["ip"],x["status"],"添加到主机管理",True,"ADD",x)
+        for h,msg in non_windows:add_row("Windows 特征消失",(h.name if h else ""),(h.host if h else ""),msg,"确认环境变化后可移除",False,"REMOVE",h)
+        for h,msg in offline:add_row("暂时不可达",(h.name if h else ""),(h.host if h else ""),msg,"保留；稍后重新扫描",False,"KEEP",h)
+        table.resizeColumnsToContents(); vl.addWidget(table,1)
+        buttons=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); buttons.button(QDialogButtonBox.Ok).setText("应用所选变更"); buttons.button(QDialogButtonBox.Cancel).setText("暂不处理"); buttons.accepted.connect(d.accept); buttons.rejected.connect(d.reject); vl.addWidget(buttons)
+        if not d.exec():
+            self.discovery_status.setText(f"扫描完成：发现 {self.discovery_table.rowCount()} 台 Windows 主机；主机库变化暂未处理。")
+            return
+        added=removed=0
+        for chk,action,payload in actions:
+            if not chk.isEnabled() or not chk.isChecked():continue
+            if action=="ADD":self._upsert_discovery_data(payload); added+=1
+            elif action=="REMOVE" and payload and payload.id is not None:db.delete_host(payload.id); removed+=1
+        self.refresh_hosts(); self.refresh_audit(); self.discovery_status.setText(f"智能同步完成：新增 {added} 台，移除 {removed} 台；发现 {self.discovery_table.rowCount()} 台 Windows 主机。")
+        audit.operation(self.settings.audit_path,"DISCOVERY","SMART_SYNC","SUCCESS","已应用主机发现智能同步。",details={"added":added,"removed":removed,"new_found":len(new_rows),"non_windows_candidates":len(non_windows),"offline_kept":len(offline)})
 
     def _verify_discovered_names(self):
         hosts=[]
         for r in range(self.discovery_table.rowCount()):
-            chk=self.discovery_table.cellWidget(r,0)
+            w=self.discovery_table.cellWidget(r,0); chk=w.findChild(QCheckBox) if w else None
             if chk and chk.isChecked():hosts.append(self.discovery_table.item(r,2).text())
         if not hosts:
             QMessageBox.warning(self,"主机名验证","请先勾选需要验证的已发现主机。")
@@ -1425,17 +2960,12 @@ class MainWindow(QMainWindow):
         self._request_hostname_verification(hosts,context="discovery")
 
     def _request_hostname_verification(self, hosts, context):
-        if self.hostname_thread and self.hostname_thread.isRunning():
-            QMessageBox.information(self,"主机名验证","已有主机名验证任务正在执行，请等待完成。")
-            return
+        if self.hostname_thread and self.hostname_thread.isRunning():QMessageBox.information(self,"主机名验证","已有主机名验证任务正在执行，请等待完成。"); return
         d=HostnameCredentialDialog(self)
         if not d.exec():return
         cfg=d.value(); self.hostname_verify_context=context
         self.hostname_thread=HostnameVerificationThread(hosts,cfg["username"],cfg["password"],cfg["use_https"],cfg["port"],max_workers=min(8,self.settings.max_concurrency*2),method=cfg["method"])
-        self.hostname_thread.result.connect(self._hostname_verify_result)
-        self.hostname_thread.progress.connect(self._hostname_verify_progress)
-        self.hostname_thread.log.connect(self._hostname_verify_log)
-        self.hostname_thread.completed.connect(self._hostname_verify_completed)
+        self.hostname_thread.result.connect(self._hostname_verify_result); self.hostname_thread.progress.connect(self._hostname_verify_progress); self.hostname_thread.log.connect(self._hostname_verify_log); self.hostname_thread.completed.connect(self._hostname_verify_completed)
         audit.operation(self.settings.audit_path,"DISCOVERY" if context=="discovery" else "HOST","VERIFY_HOSTNAME_START","SUCCESS","开始主机名深度验证。",details={"host_count":len(hosts),"username":cfg["username"],"method":cfg["method"],"use_https":cfg["use_https"],"port":cfg["port"]})
         self._set_busy(True,"验证名称"); self.hostname_thread.start()
 
@@ -1443,8 +2973,7 @@ class MainWindow(QMainWindow):
         if hasattr(self,"discovery_status") and self.hostname_verify_context=="discovery":self.discovery_status.setText(text)
 
     def _hostname_verify_progress(self,done,total):
-        if self.hostname_verify_context=="discovery" and hasattr(self,"discovery_progress"):
-            self.discovery_progress.setValue(int(done*100/total) if total else 0)
+        if self.hostname_verify_context=="discovery" and hasattr(self,"discovery_progress"):self.discovery_progress.setValue(int(done*100/total) if total else 0)
 
     def _hostname_verify_result(self,host,hostname,source,verified,message):
         audit.operation(self.settings.audit_path,"DISCOVERY" if self.hostname_verify_context=="discovery" else "HOST","VERIFY_HOSTNAME","SUCCESS" if verified else "FAILED",message,host=host,subject=hostname,details={"source":source,"verified":verified})
@@ -1452,48 +2981,30 @@ class MainWindow(QMainWindow):
             for r in range(self.discovery_table.rowCount()):
                 if self.discovery_table.item(r,2).text()!=host:continue
                 if verified and hostname:
-                    self.discovery_table.item(r,3).setText(hostname)
-                    self.discovery_table.item(r,3).setData(Qt.UserRole,source)
-                    self.discovery_table.item(r,4).setText(hostname_source_text(source))
-                    self.discovery_table.item(r,5).setText("已验证")
-                    self.discovery_table.item(r,5).setData(Qt.UserRole,True)
-                    self.discovery_table.item(r,5).setData(Qt.UserRole + 1, "")
-                    self.discovery_table.item(r,11).setText(message)
+                    self.discovery_table.item(r,3).setText(hostname); self.discovery_table.item(r,3).setData(Qt.UserRole,source); self.discovery_table.item(r,4).setText(hostname_source_text(source)); self.discovery_table.item(r,5).setText("已验证"); self.discovery_table.item(r,5).setData(Qt.UserRole,True); self.discovery_table.item(r,5).setData(Qt.UserRole + 1, ""); self.discovery_table.item(r,11).setText(message)
                 else:
-                    self.discovery_table.item(r,5).setText("验证失败")
-                    self.discovery_table.item(r,5).setData(Qt.UserRole,False)
-                    self.discovery_table.item(r,5).setData(Qt.UserRole + 1,"FAILED")
-                    self.discovery_table.item(r,11).setText(message)
+                    self.discovery_table.item(r,5).setText("验证失败"); self.discovery_table.item(r,5).setData(Qt.UserRole,False); self.discovery_table.item(r,5).setData(Qt.UserRole + 1,"FAILED"); self.discovery_table.item(r,11).setText(message)
                 break
             self._mark_duplicate_discovery_names()
         else:
-            if verified and hostname:
-                db.update_host_hostname(host,hostname,source,True,message)
-            else:
-                db.mark_host_hostname_verification_failed(host,message)
+            if verified and hostname:db.update_host_hostname(host,hostname,source,True,message)
+            else:db.mark_host_hostname_verification_failed(host,message)
 
     def _hostname_verify_completed(self,success,failed):
-        context=self.hostname_verify_context
-        self._set_busy(False)
+        context=self.hostname_verify_context; self._set_busy(False)
         if context=="inventory":self.refresh_hosts()
         if context=="discovery":self.discovery_status.setText(f"主机名验证完成：成功 {success}，失败 {failed}")
         audit.operation(self.settings.audit_path,"DISCOVERY" if context=="discovery" else "HOST","VERIFY_HOSTNAME_FINISH","SUCCESS" if failed==0 else "PARTIAL_FAILED","主机名深度验证结束。",details={"success":success,"failed":failed})
         self.refresh_audit(); QMessageBox.information(self,"主机名验证",f"验证完成。\n成功：{success}\n失败：{failed}")
 
     def _add_discovered(self):
-        added=0; now=datetime.now().isoformat(timespec="seconds")
+        added=0
+        existing={h.host for h in db.list_hosts()}
         for r in range(self.discovery_table.rowCount()):
-            chk=self.discovery_table.cellWidget(r,0)
+            w=self.discovery_table.cellWidget(r,0); chk=w.findChild(QCheckBox) if w else None
             if chk and chk.isChecked():
-                ip=self.discovery_table.item(r,2).text(); hostname=self.discovery_table.item(r,3).text().strip(); source=self.discovery_table.item(r,4).text(); source_code=self.discovery_table.item(r,3).data(Qt.UserRole)
-                source_map={"DNS PTR":"DNS_PTR","NetBIOS":"NETBIOS","Windows 名称解析":"WINDOWS_RESOLVER","Windows 工作站 API":"NETAPI_WKSTA","SMB/NTLM 指纹":"SMB_NTLM","SMB/WKSSVC 验证":"SMB_RPC","WinRM hostname":"WINRM","手工维护":"MANUAL"}
-                stable_source=source_code or source_map.get(source, "")
-                verified=bool(self.discovery_table.item(r,5).data(Qt.UserRole))
-                note=self.discovery_table.item(r,11).text(); status=self.discovery_table.item(r,10).text()
-                smb_open=self.discovery_table.item(r,6).text()=="是"; rdp_open=self.discovery_table.item(r,7).text()=="是"; w1=self.discovery_table.item(r,8).text()=="是"; w2=self.discovery_table.item(r,9).text()=="是"
-                online_status="ONLINE_WINRM" if (w1 or w2) else ("ONLINE_SMB" if smb_open else ("ONLINE" if rdp_open else "UNTESTED"))
-                db.upsert_host(HostRecord(id=None,name=hostname or ip,host=ip,group_name="自动发现",target_mode="WINRM",default_target="",os_hint=status,last_seen=now,notes="",hostname_source=stable_source,hostname_verified=int(verified),hostname_note=note,online_status=online_status,ping_ok=0,smb_port_ok=int(smb_open),rdp_port_ok=int(rdp_open),winrm_port_ok=int(w1 or w2),smb_status="UNTESTED",last_test_at=now)); added+=1
-        self.refresh_hosts(); audit.operation(self.settings.audit_path,"DISCOVERY","ADD_HOSTS","SUCCESS","已将扫描结果加入主机库。",details={"count":added}); self.refresh_audit(); QMessageBox.information(self,"主机发现",f"已添加 / 更新 {added} 台主机。")
+                d=self._discovery_row_data(r); self._upsert_discovery_data(d); added+=1
+        self.refresh_hosts(); audit.operation(self.settings.audit_path,"DISCOVERY","ADD_HOSTS","SUCCESS","已手动将扫描结果同步到主机库。",details={"count":added}); self.refresh_audit(); QMessageBox.information(self,"主机发现",f"已添加 / 更新 {added} 台主机。")
 
     # ---------- History ----------
     def _build_history_page(self):
@@ -1592,7 +3103,7 @@ class MainWindow(QMainWindow):
         root.addWidget(u)
 
         d,l4=card(
-            "远程盘符自动读取",
+            "远程目录浏览",
             "添加或编辑分发映射时，只要先勾选目标主机并配置好 WinRM 凭据，程序会通过 WinRM 自动读取目标 Windows 的 C:\\、D:\\、E:\\ 等可用盘符、卷标和剩余空间。单主机直接选择；多主机会显示每个盘符在多少台主机上存在。选择盘符后仍可继续输入子目录，例如 E:\\ADMS\\bin。盘符读取不使用 SMB/C$/D$/E$。",
         )
         drive_help=QLabel("建议：先勾选本次真正要分发的目标主机，再添加映射。多主机时优先选择带 ✓ 的共同盘符；正式分发前程序仍会逐台执行目录写入和空间预检查。")
@@ -1673,6 +3184,10 @@ class MainWindow(QMainWindow):
     def _save_remote_action_preferences(self):
         """Persist non-secret remote-operation choices for the next launch."""
         self.settings.winrm_remote_actions_enabled=bool(self.remote_enabled.isChecked())
+        if hasattr(self,"chk_distribution"): self.settings.distribution_enabled=bool(self.chk_distribution.isChecked())
+        if hasattr(self,"chk_backup"):
+            self.settings.backup_task_enabled=bool(self.chk_backup.isChecked())
+            self.settings.backup_existing=bool(self.chk_backup.isChecked())
         self.settings.winrm_command_workdir=self.command_workdir.text().strip()
         self.settings.winrm_pre_commands_text=self.pre_commands.toPlainText()
         self.settings.winrm_kill_processes=split_items(self.kill_processes.text())
@@ -1687,6 +3202,8 @@ class MainWindow(QMainWindow):
         try: self._save_all_target_selection_preferences()
         except Exception: pass
         try: self._save_remote_action_preferences()
+        except Exception: pass
+        try: self._save_version_checker_preferences()
         except Exception: pass
         try: self._save_default_winrm_credential(show_error=False)
         except Exception: pass
