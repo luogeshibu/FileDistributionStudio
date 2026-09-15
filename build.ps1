@@ -21,6 +21,32 @@ if ($LASTEXITCODE -ne 0) { throw 'PyInstaller 打包失败。' }
 $App=Join-Path $Stage 'FileDistributionStudio'
 $Exe=Join-Path $App 'FileDistributionStudio.exe'
 if (-not (Test-Path $Exe)) { throw '未找到打包后的 EXE。' }
+
+# Windows Smart App Control / Defender can block loose Python source files that
+# are loaded beside an unsigned EXE.  Application Python modules must live in
+# PyInstaller's PYZ archive, never as runtime .py/.pyw files in the release tree.
+# Some dependency/build combinations may emit _context_attributes.py as a loose
+# helper. It is not part of File Distribution Studio's runtime contract, so
+# remove it before the executable is ever started.  If removal makes the app
+# unusable, the self-test below will fail the build instead of publishing it.
+$KnownLooseHelpers = @('_context_attributes.py')
+foreach ($helper in $KnownLooseHelpers) {
+    Get-ChildItem -Path $App -Recurse -File -Filter $helper -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Write-Host "移除打包产生的外部 Python 源文件：$($_.FullName)" -ForegroundColor Yellow
+            Remove-Item $_.FullName -Force
+        }
+}
+
+# Hard release guard: never ship loose Python source next to the EXE.  This
+# prevents the same Windows Security warning from silently returning later.
+$LoosePython = @(Get-ChildItem -Path $App -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -in @('.py', '.pyw') })
+if ($LoosePython.Count -gt 0) {
+    $Names = ($LoosePython | ForEach-Object { $_.FullName }) -join [Environment]::NewLine
+    throw "发布目录包含外部 Python 源文件，已阻止发布：`n$Names"
+}
+
 & $Exe --self-test
 if ($LASTEXITCODE -ne 0) { throw '打包后的 EXE 自检失败。' }
 $Product="FileDistributionStudio-v$Version-Windows-x64"

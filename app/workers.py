@@ -221,7 +221,8 @@ class WinRMTargetTestThread(QThread):
 
     def __init__(self, hosts: list[str], target_paths: list[str] | str,
                  credentials: dict[str, tuple[str, str, str]], use_https: bool = False,
-                 port: int = 5985, max_workers: int = 8):
+                 port: int = 5985, max_workers: int = 8,
+                 host_names: dict[str, str] | None = None):
         super().__init__()
         self.hosts = list(dict.fromkeys(hosts))
         if isinstance(target_paths, str):
@@ -231,13 +232,14 @@ class WinRMTargetTestThread(QThread):
         self.use_https = bool(use_https)
         self.port = int(port)
         self.max_workers = max(1, min(16, max_workers))
+        self.host_names = dict(host_names or {})
 
     def _one(self, host: str):
         username, password, source = self.credentials.get(host, ("", "", "未设置"))
         if not username or not password:
             return host, False, f"{source}缺少用户名或密码。"
         try:
-            resolved_username = qualify_windows_username(username, "")
+            resolved_username = qualify_windows_username(username, self.host_names.get(host, ""))
             plan = RemoteActionPlan(
                 enabled=False, use_https=self.use_https, port=self.port,
                 username=resolved_username, password=password, command_timeout=30,
@@ -347,6 +349,7 @@ class DistributionThread(QThread):
     host_status = Signal(str, str, str)  # host, status, detail
     mapping_status = Signal(str, str, str)  # mapping_id, status, detail
     file_progress = Signal(str, int, int, str, str)
+    byte_progress = Signal(str, int, int, str)  # host, transferred bytes, host total bytes, current file
     completed = Signal(str, int, int)  # status, success, failed
 
     def __init__(self, mappings: list[DistributionMapping], hosts: list[HostRecord],
@@ -623,6 +626,9 @@ class DistributionThread(QThread):
                         self.settings.retry_count, self._cancel.is_set,
                         lambda host, msg: self._log(f"[{host}] {msg}"),
                         lambda host, i, total, rel, status: self.file_progress.emit(host, i, total, rel, status),
+                        lambda host, done_bytes, total_bytes, rel: self.byte_progress.emit(
+                            host, done_bytes, total_bytes, rel
+                        ),
                         host_plan, self.backup_root_path, self.settings.audit_path,
                         self.settings.preflight_check, self.settings.min_free_space_margin_mb,
                     )
@@ -1077,6 +1083,7 @@ class RemoteFileOperationThread(QThread):
     只服务“远程文件”人工运维模块，不参与文件分发、备份、Dry Run、版本检查等任务流程。
     """
     progress = Signal(int, int, str)
+    byte_progress = Signal(int, int, str)
     log = Signal(str)
     completed = Signal(object)
 
@@ -1091,6 +1098,13 @@ class RemoteFileOperationThread(QThread):
         self.local_path = str(local_path or "")
         self.paths = list(paths or [])
         self.new_name = str(new_name or "")
+
+    @staticmethod
+    def _emit_byte_progress(counters: dict, done_bytes: int, name: str):
+        counters["done_bytes"] = max(0, int(done_bytes))
+        counters["thread"].byte_progress.emit(
+            counters["done_bytes"], max(1, int(counters["total_bytes"])), name
+        )
 
     def _executor(self):
         plan = RemoteActionPlan(
@@ -1108,7 +1122,16 @@ class RemoteFileOperationThread(QThread):
         if source.is_file():
             dest = ntpath.join(remote_dir, source.name)
             self.log.emit(f"上传：{source} -> {dest}")
-            executor.upload_file(source, dest)
+            base = counters["done_bytes"]
+            size = int(source.stat().st_size)
+            executor.upload_file(
+                source,
+                dest,
+                progress_cb=lambda sent, _total: self._emit_byte_progress(
+                    counters, base + int(sent), source.name
+                ),
+            )
+            self._emit_byte_progress(counters, base + size, source.name)
             counters["done"] += 1
             self.progress.emit(counters["done"], counters["total"], source.name)
             return
@@ -1121,7 +1144,16 @@ class RemoteFileOperationThread(QThread):
                 executor.ensure_directory(remote_item)
             elif item.is_file():
                 self.log.emit(f"上传：{item} -> {remote_item}")
-                executor.upload_file(item, remote_item)
+                base = counters["done_bytes"]
+                size = int(item.stat().st_size)
+                executor.upload_file(
+                    item,
+                    remote_item,
+                    progress_cb=lambda sent, _total, name=item.name: self._emit_byte_progress(
+                        counters, base + int(sent), name
+                    ),
+                )
+                self._emit_byte_progress(counters, base + size, item.name)
                 counters["done"] += 1
                 self.progress.emit(counters["done"], counters["total"], item.name)
 
@@ -1136,6 +1168,17 @@ class RemoteFileOperationThread(QThread):
                 total += sum(1 for x in p.rglob("*") if x.is_file())
         return total
 
+    @staticmethod
+    def _count_local_bytes(paths):
+        total = 0
+        for raw in paths:
+            p = Path(raw)
+            if p.is_file():
+                total += int(p.stat().st_size)
+            elif p.is_dir():
+                total += sum(int(x.stat().st_size) for x in p.rglob("*") if x.is_file())
+        return total
+
     def _download_remote_tree(self, executor, remote_source: str, local_dir: Path, counters: dict):
         import ntpath
         info = executor.path_info(remote_source)
@@ -1144,7 +1187,16 @@ class RemoteFileOperationThread(QThread):
         if not info.get("is_dir"):
             dest = local_dir / ntpath.basename(remote_source)
             self.log.emit(f"下载：{remote_source} -> {dest}")
-            executor.download_file(remote_source, dest)
+            base = counters["done_bytes"]
+            size = int(info.get("size", 0) or 0)
+            executor.download_file(
+                remote_source,
+                dest,
+                progress_cb=lambda done, _total: self._emit_byte_progress(
+                    counters, base + int(done), ntpath.basename(remote_source)
+                ),
+            )
+            self._emit_byte_progress(counters, base + size, ntpath.basename(remote_source))
             counters["done"] += 1
             self.progress.emit(counters["done"], max(1, counters["total"]), ntpath.basename(remote_source))
             return
@@ -1162,7 +1214,16 @@ class RemoteFileOperationThread(QThread):
                 else:
                     dest = current_local / entry.get("name", "")
                     self.log.emit(f"下载：{entry.get('path','')} -> {dest}")
-                    executor.download_file(entry.get("path", ""), dest)
+                    base = counters["done_bytes"]
+                    size = int(entry.get("size", 0) or 0)
+                    executor.download_file(
+                        entry.get("path", ""),
+                        dest,
+                        progress_cb=lambda done, _total, name=entry.get("name", ""): self._emit_byte_progress(
+                            counters, base + int(done), name
+                        ),
+                    )
+                    self._emit_byte_progress(counters, base + size, entry.get("name", ""))
                     counters["done"] += 1
                     self.progress.emit(counters["done"], max(1, counters["total"]), entry.get("name", ""))
 
@@ -1181,6 +1242,23 @@ class RemoteFileOperationThread(QThread):
                     stack.append(entry.get("path", ""))
                 else:
                     total += 1
+        return total
+
+    def _count_remote_bytes(self, executor, remote_source: str) -> int:
+        info = executor.path_info(remote_source)
+        if not info.get("exists"):
+            return 0
+        if not info.get("is_dir"):
+            return int(info.get("size", 0) or 0)
+        total = 0
+        stack = [remote_source]
+        while stack:
+            current = stack.pop()
+            for entry in executor.list_directory_entries(current):
+                if entry.get("is_dir"):
+                    stack.append(entry.get("path", ""))
+                else:
+                    total += int(entry.get("size", 0) or 0)
         return total
 
     def run(self):
@@ -1206,7 +1284,10 @@ class RemoteFileOperationThread(QThread):
                 import ntpath
                 valid = [Path(p) for p in self.paths if Path(p).exists()]
                 total = self._count_local_files(valid)
-                counters = {"done": 0, "total": max(1, total)}
+                total_bytes = self._count_local_bytes(valid)
+                counters = {"thread": self, "done": 0, "total": max(1, total),
+                            "done_bytes": 0, "total_bytes": max(1, total_bytes)}
+                self._emit_byte_progress(counters, 0, "准备上传")
                 executor.ensure_directory(self.remote_path)
                 for p in valid:
                     self._upload_one(executor, p, self.remote_path, counters)
@@ -1216,9 +1297,13 @@ class RemoteFileOperationThread(QThread):
                 local_dir = Path(self.local_path)
                 local_dir.mkdir(parents=True, exist_ok=True)
                 total = 0
+                total_bytes = 0
                 for remote in self.paths:
                     total += self._count_remote_files(executor, remote)
-                counters = {"done": 0, "total": max(1, total)}
+                    total_bytes += self._count_remote_bytes(executor, remote)
+                counters = {"thread": self, "done": 0, "total": max(1, total),
+                            "done_bytes": 0, "total_bytes": max(1, total_bytes)}
+                self._emit_byte_progress(counters, 0, "准备下载")
                 for remote in self.paths:
                     self._download_remote_tree(executor, remote, local_dir, counters)
                 self.completed.emit({"ok": True, "kind": "download", "count": counters["done"], "path": str(local_dir)}); return

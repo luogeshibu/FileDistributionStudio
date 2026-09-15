@@ -22,7 +22,7 @@ from ..models import HostRecord, DistributionMapping
 from ..resources import asset_path, script_path
 from ..services.discovery import local_ipv4_networks, normalize_networks
 from ..services.sftp_source import SftpSource
-from ..services.remote_exec import RemoteActionPlan, WinRMExecutor, split_items, split_commands
+from ..services.remote_exec import RemoteActionPlan, WinRMExecutor, qualify_windows_username, split_items, split_commands
 from ..services import audit, credential_store
 from ..services.xlsx_export import export_xlsx
 from ..utils import human_bytes, validate_windows_target_path
@@ -32,7 +32,7 @@ from .dialogs import (HostEditDialog, TaskDetailDialog, HostnameCredentialDialog
                       SftpMappingDialog, WinRMSetupDialog, WinRMHostCredentialDialog, RemoteProcessBrowserDialog,
                       RemoteBackupBrowserDialog)
 from .theme import app_icon
-from .widgets import PasswordLineEdit, LocalFileTable, RemoteFileDropTable
+from .widgets import PasswordLineEdit, LocalFileTable, RemoteFileDropTable, configure_full_content_table, fit_full_content_table
 from .locale_zh import (status_text, source_text, mode_text, group_text, audit_category_text, action_text,
                          hostname_source_text)
 from ..services.host_status import status_label as online_status_text, smb_status_label, winrm_status_label
@@ -284,13 +284,7 @@ class MainWindow(QMainWindow):
         self.mapping_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.mapping_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.mapping_table.verticalHeader().setVisible(False)
-        mh = self.mapping_table.horizontalHeader()
-        mh.setSectionResizeMode(QHeaderView.ResizeToContents)
-        mh.setSectionResizeMode(0, QHeaderView.Fixed)
-        self.mapping_table.setColumnWidth(0, 44)
-        mh.setSectionResizeMode(3, QHeaderView.Stretch)
-        mh.setSectionResizeMode(4, QHeaderView.Stretch)
-        mh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        configure_full_content_table(self.mapping_table, fixed_columns={0: 44})
         # 默认完整显示 10 条分发映射；更多映射继续使用表格内部滚动。
         self.mapping_table.verticalHeader().setDefaultSectionSize(32)
         self.mapping_table.setMinimumHeight(32 * 10 + 36)
@@ -321,7 +315,7 @@ class MainWindow(QMainWindow):
         )
         cred = QHBoxLayout()
         self.win_user = QLineEdit(self.settings.winrm_default_username); self.win_password = PasswordLineEdit()
-        self.win_user.setPlaceholderText(r"本地账号直接填 ADMS；域账号填 DOMAIN\user")
+        self.win_user.setPlaceholderText(r"本地账号填 COMPUTER\user；域账号填 DOMAIN\user")
         self.remember_default_cred = QCheckBox("记住默认凭据")
         self.remember_default_cred.setChecked(bool(self.settings.remember_winrm_default_credential))
         self.remember_default_cred.setToolTip("密码仅保存到当前 Windows 用户的 Windows 凭据管理器，不写入配置、SQLite 或审计日志。")
@@ -336,7 +330,7 @@ class MainWindow(QMainWindow):
         self.remember_default_cred.toggled.connect(lambda _checked: self._save_default_winrm_credential(show_error=False))
         cred_hint = QLabel(
             "默认使用 WinRM HTTP 5985。首次使用目标机可下载 WinRM 设置脚本；脚本不会修改任何 Windows 账号、用户组或 RDP 权限。"
-            "大多数主机直接使用默认凭据，只有账号或密码不同的主机才需要单独设置。"
+            "记住凭据时密码来自 Windows 凭据管理器；取消勾选并重新输入可清除旧密码。本地账号会按目标主机名发送。"
         )
         cred_hint.setObjectName("Muted"); cred_hint.setWordWrap(True); target_l.addWidget(cred_hint)
 
@@ -358,7 +352,7 @@ class MainWindow(QMainWindow):
         self.target_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.target_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.target_table.verticalHeader().setVisible(False)
-        hdr = self.target_table.horizontalHeader(); hdr.setSectionResizeMode(QHeaderView.Stretch); hdr.setSectionResizeMode(0,QHeaderView.Fixed); self.target_table.setColumnWidth(0,44)
+        configure_full_content_table(self.target_table, fixed_columns={0: 44})
         # 默认至少完整显示 10 台目标主机；主机更多时由表格自身滚动，不把整页无限撑高。
         self.target_table.verticalHeader().setDefaultSectionSize(32)
         self.target_table.setMinimumHeight(32 * 10 + 36)
@@ -732,6 +726,7 @@ class MainWindow(QMainWindow):
         self.mapping_table.item(r,5).setToolTip(scope_tip)
         self._refresh_mapping_scope()
         self._sync_distribution_with_mappings()
+        fit_full_content_table(self.mapping_table)
         audit.operation(self.settings.audit_path,"MAPPING","ADD","SUCCESS","已添加分发映射。",subject=mapping.mapping_id,details=mapping.safe_dict())
 
     def _remote_drive_context_for_mapping(self):
@@ -806,7 +801,7 @@ class MainWindow(QMainWindow):
             if not d.exec():return
             v=d.value();m.target_path=v["target_path"];m.folder_mode=v["folder_mode"]
         scope_text,scope_tip=self._target_scope_display(); self.mapping_table.setItem(r,1,QTableWidgetItem("SFTP" if m.source_type=="SFTP" else "本地"));self.mapping_table.setItem(r,2,QTableWidgetItem("目录" if m.source_kind=="DIR" else "文件"));src=QTableWidgetItem(m.display_source());src.setData(ROLE_HOST_OBJECT,m);self.mapping_table.setItem(r,3,src);self.mapping_table.setItem(r,4,QTableWidgetItem(m.target_path));scope_item=QTableWidgetItem(scope_text);scope_item.setToolTip(scope_tip);self.mapping_table.setItem(r,5,scope_item);self.mapping_table.setItem(r,6,QTableWidgetItem(("合并覆盖（安全）·复制目录本身" if m.folder_mode=="SELF" else "合并覆盖（安全）·复制目录内容") if m.source_kind=="DIR" else "文件"));self.mapping_table.setItem(r,7,QTableWidgetItem("待分发"))
-        self._refresh_mapping_scope(); audit.operation(self.settings.audit_path,"MAPPING","EDIT","SUCCESS","已修改分发映射。",subject=m.mapping_id,details=m.safe_dict());self.refresh_audit()
+        self._refresh_mapping_scope(); fit_full_content_table(self.mapping_table); audit.operation(self.settings.audit_path,"MAPPING","EDIT","SUCCESS","已修改分发映射。",subject=m.mapping_id,details=m.safe_dict());self.refresh_audit()
 
     def _delete_mapping(self):
         r=self._selected_mapping_row()
@@ -1204,6 +1199,7 @@ class MainWindow(QMainWindow):
             [h.host for h in hosts], targets, credentials,
             use_https=self.remote_https.isChecked(), port=self.remote_port.value(),
             max_workers=min(self.concurrent_spin.value(),8),
+            host_names={h.host: h.name for h in hosts},
         )
         self.winrm_test_thread.result.connect(self._winrm_target_test_result)
         self.winrm_test_thread.completed.connect(self._winrm_target_test_completed)
@@ -1242,6 +1238,7 @@ class MainWindow(QMainWindow):
         try:
             credentials=self._resolve_credentials(hosts[:1])
             username,password,source=credentials[hosts[0].host]
+            username=qualify_windows_username(username, hosts[0].name)
             plan=RemoteActionPlan(enabled=True,use_https=self.remote_https.isChecked(),port=self.remote_port.value(),username=username,password=password)
             result=WinRMExecutor(hosts[0].host,plan).test()
             detail=result["stdout"] or result["stderr"] or f"退出码={result['exit_code']}"
@@ -1695,6 +1692,7 @@ class MainWindow(QMainWindow):
         # 进度条表示完整主机工作流，而不是仅表示文件数量。文件全部上传完成时最多到 90%，
         # 每台主机的分发后 CMD / 收尾完成后逐步到 99%，只有 completed 信号到达才显示 100%。
         self._dist_progress_hosts = {h.host: 0.0 for h in hosts}
+        self._dist_progress_bytes = {h.host: 0.0 for h in hosts}
         self._dist_success_hosts = set()
         self._dist_progress_finished = set()
         self._dist_progress_host_count = max(1, len(hosts))
@@ -1717,7 +1715,7 @@ class MainWindow(QMainWindow):
         )
         self._last_task_id=self.distribution_thread.task_id
         self.btn_export_result.setEnabled(False)
-        self.distribution_thread.log.connect(self._append_log);self.distribution_thread.prepared.connect(self._dist_prepared);self.distribution_thread.host_status.connect(self._host_status);self.distribution_thread.mapping_status.connect(self._mapping_status);self.distribution_thread.file_progress.connect(self._file_progress);self.distribution_thread.completed.connect(self._dist_completed);self.distribution_thread.start()
+        self.distribution_thread.log.connect(self._append_log);self.distribution_thread.prepared.connect(self._dist_prepared);self.distribution_thread.host_status.connect(self._host_status);self.distribution_thread.mapping_status.connect(self._mapping_status);self.distribution_thread.file_progress.connect(self._file_progress);self.distribution_thread.byte_progress.connect(self._dist_byte_progress);self.distribution_thread.completed.connect(self._dist_completed);self.distribution_thread.start()
 
     def _cancel_distribution(self):
         if self.dry_run_thread and self.dry_run_thread.isRunning():
@@ -1740,6 +1738,9 @@ class MainWindow(QMainWindow):
         hosts = getattr(self, "_dist_progress_hosts", {})
         count = max(1, int(getattr(self, "_dist_progress_host_count", len(hosts) or 1)))
         file_ratio = sum(max(0.0, min(1.0, float(v))) for v in hosts.values()) / count
+        byte_hosts = getattr(self, "_dist_progress_bytes", {})
+        byte_ratio = sum(max(0.0, min(1.0, float(v))) for v in byte_hosts.values()) / count if byte_hosts else 0.0
+        file_ratio = max(file_ratio, byte_ratio)
         finished_ratio = len(getattr(self, "_dist_progress_finished", set())) / count
         # 如果本次还包含 Version Checker，则为版本检查保留最后 10%：
         # 文件分发完整结束最多到 90%；否则普通分发最多到 99%，completed 后才到 100%。
@@ -1777,6 +1778,11 @@ class MainWindow(QMainWindow):
             self._refresh_distribution_progress()
         if status=="FAILED":
             self._append_log(f"[{host}] 分发失败：{rel}")
+
+    def _dist_byte_progress(self, host, done_bytes, total_bytes, rel):
+        if total_bytes and hasattr(self, "_dist_progress_bytes"):
+            self._dist_progress_bytes[host] = max(0.0, min(1.0, float(done_bytes) / float(total_bytes)))
+            self._refresh_distribution_progress()
 
     def _dist_completed(self,status,success,failed):
         self.btn_cancel.setEnabled(False)
@@ -2038,8 +2044,7 @@ class MainWindow(QMainWindow):
         self.remote_local_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.remote_local_table.setDragEnabled(True)
         self.remote_local_table.verticalHeader().setVisible(False)
-        lh = self.remote_local_table.horizontalHeader(); lh.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in (1,2,3): lh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        configure_full_content_table(self.remote_local_table)
         self.remote_local_table.cellDoubleClicked.connect(self._remote_local_double_clicked)
         local_l.addWidget(self.remote_local_table, 1)
         panes.addWidget(local_box, 1)
@@ -2074,8 +2079,7 @@ class MainWindow(QMainWindow):
         self.remote_file_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.remote_file_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.remote_file_table.verticalHeader().setVisible(False)
-        rh = self.remote_file_table.horizontalHeader(); rh.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in (1,2,3): rh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        configure_full_content_table(self.remote_file_table)
         self.remote_file_table.cellDoubleClicked.connect(self._remote_file_double_clicked)
         self.remote_file_table.localPathsDropped.connect(self._remote_file_drop_upload)
         remote_l.addWidget(self.remote_file_table, 1)
@@ -2177,6 +2181,7 @@ class MainWindow(QMainWindow):
         self._remote_file_thread = RemoteFileOperationThread(
             ctx, operation, use_https=self.remote_https.isChecked(), port=self.remote_port.value(), **kwargs)
         self._remote_file_thread.progress.connect(self._remote_file_progress_changed)
+        self._remote_file_thread.byte_progress.connect(self._remote_file_byte_progress_changed)
         self._remote_file_thread.log.connect(self._remote_file_append_log)
         self._remote_file_thread.completed.connect(self._remote_file_op_done)
         self._remote_file_thread.start()
@@ -2185,6 +2190,10 @@ class MainWindow(QMainWindow):
     def _remote_file_progress_changed(self, done: int, total: int, name: str):
         total=max(1,int(total)); done=max(0,int(done)); pct=min(99,int(done*100/total))
         self.remote_file_progress.setValue(pct); self.remote_file_progress.setFormat(f"{pct}% · {done}/{total} · {name}")
+
+    def _remote_file_byte_progress_changed(self, done: int, total: int, name: str):
+        total=max(1,int(total)); done=max(0,min(int(done),total)); pct=min(99,int(done*100/total))
+        self.remote_file_progress.setValue(pct); self.remote_file_progress.setFormat(f"{pct}% · {human_bytes(done)}/{human_bytes(total)} · {name}")
 
     def _remote_file_connect(self):
         self._start_remote_file_op("LIST", remote_path="")
@@ -2251,6 +2260,7 @@ class MainWindow(QMainWindow):
                 self.remote_file_table.setItem(r,1,QTableWidgetItem("文件夹" if e.get("is_dir") else "文件"))
                 self.remote_file_table.setItem(r,2,QTableWidgetItem("—" if e.get("is_dir") else human_bytes(int(e.get("size",0) or 0))))
                 self.remote_file_table.setItem(r,3,QTableWidgetItem(str(e.get("modified", ""))))
+        fit_full_content_table(self.remote_file_table)
 
     def _remote_file_op_done(self, payload):
         payload=dict(payload or {})
@@ -2345,6 +2355,7 @@ class MainWindow(QMainWindow):
             self.remote_local_table.setItem(r,1,QTableWidgetItem("磁盘"))
             self.remote_local_table.setItem(r,2,QTableWidgetItem(size_text))
             self.remote_local_table.setItem(r,3,QTableWidgetItem(""))
+        fit_full_content_table(self.remote_local_table)
 
     def _remote_local_choose_files(self):
         start=self.remote_local_path.text().strip()
@@ -2421,6 +2432,7 @@ class MainWindow(QMainWindow):
                 self.remote_local_table.setItem(r,3,QTableWidgetItem(datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")))
             except Exception:
                 continue
+        fit_full_content_table(self.remote_local_table)
 
     def _remote_local_double_clicked(self, row: int, _column: int):
         item=self.remote_local_table.item(row,0)
@@ -2527,17 +2539,10 @@ class MainWindow(QMainWindow):
             "选择","ID","名称","主机 / IP","名称来源","名称状态","分组","WinRM 凭据",
             "在线状态","Ping","445 SMB（识别）","3389 RDP（识别）","WinRM 端口","WinRM 状态","SMB 辅助状态","最后测试","最后发现","备注"
         ])
-        self.host_table.setAlternatingRowColors(True); self.host_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.host_table.setSelectionMode(QAbstractItemView.ExtendedSelection); self.host_table.setEditTriggers(QAbstractItemView.NoEditTriggers); self.host_table.verticalHeader().setVisible(False)
-        # 主机管理表随窗口宽度自适应：除“选择”列外全部按可用宽度伸展，默认不再因为 ResizeToContents 产生超宽横向滚动。
-        host_header=self.host_table.horizontalHeader()
-        host_header.setSectionResizeMode(QHeaderView.Stretch)
-        host_header.setSectionResizeMode(0, QHeaderView.Fixed)
-        self.host_table.setColumnWidth(0, 44)
+        self.host_table.setAlternatingRowColors(True); self.host_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.host_table.setSelectionMode(QAbstractItemView.ExtendedSelection); self.host_table.setEditTriggers(QAbstractItemView.NoEditTriggers); self.host_table.verticalHeader().setVisible(False); configure_full_content_table(self.host_table, fixed_columns={0: 44})
         # SQLite 自增 ID 仅用于程序内部关联。删除/重新发现主机后数字不会连续，
         # 对用户没有业务意义，因此主机管理界面隐藏，避免误解为“机器数量”。
         self.host_table.setColumnHidden(1, True)
-        host_header.setMinimumSectionSize(42)
-        host_header.setStretchLastSection(False)
         l.addWidget(self.host_table)
         row=QHBoxLayout()
         for text,fn,icon in [
@@ -2590,6 +2595,7 @@ class MainWindow(QMainWindow):
                 vals=[h.id,h.name,h.host,hostname_source_text(h.hostname_source),verify_text,group_text(h.group_name),cred_status,
                       online_status_text(h.online_status),"是" if h.ping_ok else "","是" if h.smb_port_ok else "","是" if h.rdp_port_ok else "","是" if h.winrm_port_ok else "",winrm_status_label(h.winrm_status),smb_status_label(h.smb_status),h.last_test_at,h.last_seen,h.notes]
                 for c,v in enumerate(vals, start=1):self.host_table.setItem(r,c,QTableWidgetItem(str(v if v is not None else "")))
+            fit_full_content_table(self.host_table)
             self.host_table.verticalScrollBar().setValue(inventory_scroll)
             self._apply_inventory_filter()
 
@@ -2617,6 +2623,7 @@ class MainWindow(QMainWindow):
                 cred_text,cred_tip=self._credential_status_for_host(h.host); cred_item=QTableWidgetItem(cred_text); cred_item.setToolTip(cred_tip); self.target_table.setItem(r,4,cred_item)
                 online=QTableWidgetItem(online_status_text(h.online_status)); online.setToolTip(f"Ping={'是' if h.ping_ok else '否'}，445={'是' if h.smb_port_ok else '否'}，3389={'是' if h.rdp_port_ok else '否'}，WinRM={'是' if h.winrm_port_ok else '否'}\n最后测试：{h.last_test_at or '未测试'}"); self.target_table.setItem(r,5,online)
                 self.target_table.setItem(r,6,QTableWidgetItem(winrm_status_label(h.winrm_status))); self.target_table.setItem(r,7,QTableWidgetItem(""))
+            fit_full_content_table(self.target_table)
             self.target_table.verticalScrollBar().setValue(target_scroll)
             self._apply_target_filter()
             # 首次初始化：只有实际存在主机时才消费“一次性默认全选”规则。
@@ -2778,8 +2785,7 @@ class MainWindow(QMainWindow):
         rcard,rl=card("发现的 Windows 主机","发现结果仅使用 Ping/445/3389/5985/5986、DNS、NetBIOS、SMB/WKSSVC 等只读信号进行识别。正式文件分发、备份、服务与进程控制仍只使用 WinRM。")
         self.discovery_table=QTableWidget(0,12)
         self.discovery_table.setHorizontalHeaderLabels(["添加","来源网段","IP","识别名称","名称来源","名称状态","445 SMB","3389 RDP","5985 WinRM","5986 WinRM","主机状态","名称说明"])
-        self.discovery_table.setAlternatingRowColors(True); self.discovery_table.verticalHeader().setVisible(False)
-        h=self.discovery_table.horizontalHeader(); h.setSectionResizeMode(QHeaderView.ResizeToContents); h.setStretchLastSection(True); h.setSectionResizeMode(0,QHeaderView.ResizeToContents)
+        self.discovery_table.setAlternatingRowColors(True); self.discovery_table.verticalHeader().setVisible(False); configure_full_content_table(self.discovery_table, fixed_columns={0: 44})
         rl.addWidget(self.discovery_table)
         bottom=QHBoxLayout(); self.discovery_status=QLabel("就绪"); self.discovery_status.setObjectName("Muted")
         b_verify=QPushButton("深度验证主机名"); b_verify.setIcon(app_icon("terminal")); b_verify.clicked.connect(self._verify_discovered_names)
@@ -2895,6 +2901,7 @@ class MainWindow(QMainWindow):
         self.discovery_table.item(r,3).setData(Qt.UserRole,x.hostname_source)
         self.discovery_table.item(r,5).setData(Qt.UserRole,bool(x.hostname_verified))
         self.discovery_table.item(r,5).setData(Qt.UserRole + 1, "")
+        fit_full_content_table(self.discovery_table)
         self._mark_duplicate_discovery_names()
         audit.operation(self.settings.audit_path,"DISCOVERY","HOST_FOUND","SUCCESS","扫描发现 Windows 主机。",host=x.host,details={"network":x.network,"hostname":x.hostname,"hostname_source":x.hostname_source,"hostname_verified":x.hostname_verified,"hostname_note":x.hostname_note,"smb_445":x.port_445,"rdp_3389":x.port_3389,"winrm_5985":x.port_5985,"winrm_5986":x.port_5986,"status":x.status})
 
@@ -2972,7 +2979,7 @@ class MainWindow(QMainWindow):
         vl=QVBoxLayout(d); title=QLabel("扫描完成，发现主机库变化"); title.setStyleSheet("font-size:18px;font-weight:700;"); vl.addWidget(title)
         desc=QLabel(f"新发现 Windows 主机 {len(new_rows)} 台；疑似已不是 Windows 的已保存 IP {len(non_windows)} 个；暂时不可达 {len(offline)} 个。\n新增项默认勾选；移除属于删除操作，默认不勾选，由你确认。离线主机只提醒并保留。")
         desc.setWordWrap(True); desc.setObjectName("Muted"); vl.addWidget(desc)
-        table=QTableWidget(0,6); table.setHorizontalHeaderLabels(["处理","变化类型","名称","IP","检测结果","建议"]); table.verticalHeader().setVisible(False); table.setAlternatingRowColors(True); table.horizontalHeader().setStretchLastSection(True); table.setSelectionMode(QAbstractItemView.NoSelection)
+        table=QTableWidget(0,6); table.setHorizontalHeaderLabels(["处理","变化类型","名称","IP","检测结果","建议"]); table.verticalHeader().setVisible(False); table.setAlternatingRowColors(True); configure_full_content_table(table); table.setSelectionMode(QAbstractItemView.NoSelection)
         actions=[]
         def add_row(kind,hname,ip,result,suggestion,checked,action,payload):
             r=table.rowCount(); table.insertRow(r); holder=QWidget(); lay=QHBoxLayout(holder); lay.setContentsMargins(0,0,0,0); lay.setAlignment(Qt.AlignCenter); chk=QCheckBox(); chk.setChecked(checked); chk.setEnabled(action in ("ADD","REMOVE")); lay.addWidget(chk); table.setCellWidget(r,0,holder)
@@ -2981,7 +2988,7 @@ class MainWindow(QMainWindow):
         for x in new_rows:add_row("新发现 Windows",x["hostname"] or x["ip"],x["ip"],x["status"],"添加到主机管理",True,"ADD",x)
         for h,msg in non_windows:add_row("Windows 特征消失",(h.name if h else ""),(h.host if h else ""),msg,"确认环境变化后可移除",False,"REMOVE",h)
         for h,msg in offline:add_row("暂时不可达",(h.name if h else ""),(h.host if h else ""),msg,"保留；稍后重新扫描",False,"KEEP",h)
-        table.resizeColumnsToContents(); vl.addWidget(table,1)
+        fit_full_content_table(table); vl.addWidget(table,1)
         buttons=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); buttons.button(QDialogButtonBox.Ok).setText("应用所选变更"); buttons.button(QDialogButtonBox.Cancel).setText("暂不处理"); buttons.accepted.connect(d.accept); buttons.rejected.connect(d.reject); vl.addWidget(buttons)
         if not d.exec():
             self.discovery_status.setText(f"扫描完成：发现 {self.discovery_table.rowCount()} 台 Windows 主机；主机库变化暂未处理。")
@@ -3056,7 +3063,7 @@ class MainWindow(QMainWindow):
         canvas,root=self._page_canvas(); c,l=card("分发历史","双击任务可查看主机、文件分发、远程操作、备份、校验和完整审计详情。")
         self.history_cols=["task_id","created_at","operator","workstation","source_type","source_path","target_path","backup_root","verification_mode","host_count","file_count","total_bytes","status","success_hosts","failed_hosts","finished_at"]
         self.history_headers=["任务 ID","创建时间","操作用户","操作计算机","来源类型","来源路径","目标目录","备份根目录","校验策略","主机数","文件数","总大小","状态","成功主机","失败主机","结束时间"]
-        self.history_table=QTableWidget(0,len(self.history_cols)); self.history_table.setHorizontalHeaderLabels(self.history_headers); self.history_table.setAlternatingRowColors(True); self.history_table.verticalHeader().setVisible(False); self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.history_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.history_table.doubleClicked.connect(self._open_history_detail); l.addWidget(self.history_table)
+        self.history_table=QTableWidget(0,len(self.history_cols)); self.history_table.setHorizontalHeaderLabels(self.history_headers); self.history_table.setAlternatingRowColors(True); self.history_table.verticalHeader().setVisible(False); configure_full_content_table(self.history_table); self.history_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.history_table.doubleClicked.connect(self._open_history_detail); l.addWidget(self.history_table)
         row=QHBoxLayout()
         for text,fn,icon in [("刷新",self.refresh_history,"refresh"),("查看详情",self._open_history_detail,"history"),("导出 CSV",self._export_history,"export")]:b=QPushButton(text);b.setIcon(app_icon(icon));b.clicked.connect(fn);row.addWidget(b)
         row.addStretch(1);l.addLayout(row);root.addWidget(c);return canvas
@@ -3066,6 +3073,7 @@ class MainWindow(QMainWindow):
         for r,row in enumerate(rows):
             for c,key in enumerate(self.history_cols):
                 value=row[key]; value=human_bytes(int(value)) if key=="total_bytes" else value; value=source_text(value) if key=="source_type" else value; value=status_text(value) if key=="status" else value; self.history_table.setItem(r,c,QTableWidgetItem(str(value)))
+        fit_full_content_table(self.history_table)
     def _selected_task_id(self):
         rows=self.history_table.selectionModel().selectedRows();return self.history_table.item(rows[0].row(),0).text() if rows else None
     def _open_history_detail(self,*_):
@@ -3090,7 +3098,7 @@ class MainWindow(QMainWindow):
         btn=QPushButton("查询"); btn.setIcon(app_icon("refresh")); btn.clicked.connect(self.refresh_audit); flt.addWidget(QLabel("分类")); flt.addWidget(self.audit_category); flt.addWidget(QLabel("状态")); flt.addWidget(self.audit_status); flt.addWidget(self.audit_keyword,1); flt.addWidget(btn); l.addLayout(flt)
         self.audit_cols=["created_at","operator","workstation","category","action","status","task_id","host","subject","message","details_json"]
         self.audit_headers=["时间","操作人","操作终端","分类","操作","状态","任务 ID","主机 / IP","对象","说明","详细数据"]
-        self.audit_table=QTableWidget(0,len(self.audit_cols)); self.audit_table.setHorizontalHeaderLabels(self.audit_headers); self.audit_table.setAlternatingRowColors(True); self.audit_table.verticalHeader().setVisible(False); self.audit_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.audit_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); l.addWidget(self.audit_table,1)
+        self.audit_table=QTableWidget(0,len(self.audit_cols)); self.audit_table.setHorizontalHeaderLabels(self.audit_headers); self.audit_table.setAlternatingRowColors(True); self.audit_table.verticalHeader().setVisible(False); configure_full_content_table(self.audit_table); self.audit_table.setSelectionBehavior(QAbstractItemView.SelectRows); l.addWidget(self.audit_table,1)
         row=QHBoxLayout(); b_refresh=QPushButton("刷新"); b_export=QPushButton("导出 CSV"); b_open=QPushButton("打开本地审计目录"); b_refresh.setIcon(app_icon("refresh")); b_export.setIcon(app_icon("export")); b_open.setIcon(app_icon("folder")); b_refresh.clicked.connect(self.refresh_audit); b_export.clicked.connect(self._export_audit); b_open.clicked.connect(self._open_audit_dir); row.addWidget(b_refresh); row.addWidget(b_export); row.addWidget(b_open); row.addStretch(1); l.addLayout(row); root.addWidget(c); return canvas
 
     def refresh_audit(self):
@@ -3100,6 +3108,7 @@ class MainWindow(QMainWindow):
         for r,row in enumerate(rows):
             for c,key in enumerate(self.audit_cols):
                 value=row[key]; value=status_text(value) if key=="status" else (audit_category_text(value) if key=="category" else (action_text(value) if key=="action" else value)); self.audit_table.setItem(r,c,QTableWidgetItem(str(value if value is not None else "")))
+        fit_full_content_table(self.audit_table)
 
     def _export_audit(self):
         p,_=QFileDialog.getSaveFileName(self,"导出审计日志","审计日志.csv","CSV (*.csv)")

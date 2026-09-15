@@ -243,6 +243,7 @@ def distribute_plan_to_host_winrm(
     cancel_cb,
     log_cb,
     file_progress_cb=None,
+    byte_progress_cb=None,
     remote_plan: RemoteActionPlan | None = None,
     backup_root_path: str = "",
     audit_root: str = "",
@@ -266,6 +267,8 @@ def distribute_plan_to_host_winrm(
     pre_actions_started = False
     total_files = sum(len(pm.manifest) for pm in prepared_mappings)
     done_files = 0
+    total_bytes = sum(pm.total_bytes for pm in prepared_mappings)
+    completed_bytes = 0
     temp_roots: list[str] = []
     executor = None
 
@@ -383,7 +386,16 @@ def distribute_plan_to_host_winrm(
                         except Exception:
                             pass
                         log_cb(host, f"WinRM 上传：{entry.absolute_path.name} → {dest}")
-                        executor.upload_file(entry.absolute_path, temp)
+                        base_bytes = completed_bytes
+                        executor.upload_file(
+                            entry.absolute_path,
+                            temp,
+                            progress_cb=(
+                                (lambda sent, _file_total: byte_progress_cb(
+                                    host, base_bytes + int(sent), total_bytes, dest
+                                )) if byte_progress_cb else None
+                            ),
+                        )
                         temp_info = executor.file_info(temp, include_sha256=verify_sha256)
                         _record_check(task_id, host, dest, "TEMP_SIZE", "SIZE",
                                       str(entry.size), str(temp_info["size"]),
@@ -416,6 +428,9 @@ def distribute_plan_to_host_winrm(
                                 raise IOError("正式文件替换后 SHA256 校验不一致")
 
                         transferred += entry.size
+                        completed_bytes = base_bytes + int(entry.size)
+                        if byte_progress_cb:
+                            byte_progress_cb(host, completed_bytes, total_bytes, dest)
                         if action == "NEW":
                             new_files += 1
                         else:

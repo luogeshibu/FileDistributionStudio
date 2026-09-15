@@ -1,5 +1,5 @@
 from pathlib import Path
-from .widgets import PasswordLineEdit
+from .widgets import PasswordLineEdit, configure_full_content_table
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
@@ -437,8 +437,9 @@ class RemoteDirectoryBrowserDialog(QDialog):
         self.coverage_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.coverage_table.setSelectionMode(QAbstractItemView.NoSelection)
         self.coverage_table.setAlternatingRowColors(True)
+        configure_full_content_table(self.coverage_table)
         ch = self.coverage_table.horizontalHeader()
-        ch.setSectionResizeMode(0, QHeaderView.Stretch)
+        ch.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         ch.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         ch.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.coverage_table.setMaximumHeight(min(190, 58 + max(1, len(self.contexts)) * 30))
@@ -907,13 +908,14 @@ class RemoteBackupBrowserDialog(QDialog):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
+        configure_full_content_table(self.table)
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(1, QHeaderView.Stretch)
+        h.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(5, QHeaderView.Stretch)
+        h.setSectionResizeMode(5, QHeaderView.ResizeToContents)
 
         self.status = QLabel("选择一个盘符后会读取该目录下一层的文件和文件夹；双击文件夹可进入。")
         self.status.setWordWrap(True)
@@ -1178,6 +1180,7 @@ class RemoteProcessBrowserDialog(QDialog):
         self.table.setHorizontalHeaderLabels(["选择", "显示名称", "镜像名（实际参数）", "实例数", "PID", "可执行路径"])
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
+        configure_full_content_table(self.table)
         self.table.setSortingEnabled(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(self.COL_CHECK, QHeaderView.ResizeToContents)
@@ -1185,7 +1188,7 @@ class RemoteProcessBrowserDialog(QDialog):
         header.setSectionResizeMode(self.COL_IMAGE, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self.COL_COUNT, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self.COL_PIDS, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(self.COL_PATH, QHeaderView.Stretch)
+        header.setSectionResizeMode(self.COL_PATH, QHeaderView.ResizeToContents)
 
         self.status = QLabel("进程读取只通过 WinRM 查询，不会在打开窗口时结束任何进程。")
         self.status.setWordWrap(True)
@@ -1682,6 +1685,7 @@ def _table(rows, cols, headers, transformers=None):
                 value = transformers[key](value)
             t.setItem(r, c, QTableWidgetItem(str(value if value is not None else "")))
     t.setAlternatingRowColors(True)
+    configure_full_content_table(t)
     t.verticalHeader().setVisible(False)
     t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
     return t

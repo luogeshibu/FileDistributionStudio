@@ -55,6 +55,7 @@ class WinRMExecutor:
         kwargs = {
             "auth": (plan.username, plan.password),
             "transport": "ntlm",
+            "proxy": None,
             "read_timeout_sec": max(10, plan.command_timeout + 10),
             "operation_timeout_sec": max(5, plan.command_timeout),
         }
@@ -840,7 +841,8 @@ if (-not (Get-Variable -Name sha -ErrorAction SilentlyContinue)) {{ $sha='' }}
         except Exception as e:
             raise RuntimeError(f"解析远程文件信息失败：{path}；返回：{r['stdout']}") from e
 
-    def download_file(self, remote_path: str, local_path: str | Path, chunk_size: int = 48 * 1024) -> Path:
+    def download_file(self, remote_path: str, local_path: str | Path,
+                      chunk_size: int = 48 * 1024, progress_cb=None) -> Path:
         """通过 WinRM 分块读取远程文件到本机，不依赖 SMB。"""
         info = self.file_info(remote_path, include_sha256=False)
         if not info.get("exists"):
@@ -855,6 +857,8 @@ if (-not (Get-Variable -Name sha -ErrorAction SilentlyContinue)) {{ $sha='' }}
                 script = f"$p={rq};$fs=[IO.File]::OpenRead($p);try{{$fs.Seek({offset},0)|Out-Null;$b=New-Object byte[] {count};$n=$fs.Read($b,0,{count});if($n -lt $b.Length){{$x=New-Object byte[] $n;[Array]::Copy($b,$x,$n);$b=$x}};[Console]::Write([Convert]::ToBase64String($b))}}finally{{$fs.Dispose()}}"
                 r=self.run_ps(script); self._require_success(r, f"读取远程结果文件 {remote_path}")
                 data=base64.b64decode((r.get("stdout") or "").strip()); f.write(data); offset += len(data)
+                if progress_cb:
+                    progress_cb(offset, size)
         return dest
 
     def run_version_checker_export(self, exe_path: str, workdir: str, output_dir: str,
@@ -1259,24 +1263,16 @@ try {{
 
 
 def qualify_windows_username(username: str, computer_name: str = "") -> str:
-    """Return the WinRM username exactly as the operator entered it.
-
-    v0.6.4 continues to avoid auto-prefixing simple local accounts with a discovered
-    Computer Name.  In real Windows estates the display hostname, DNS hostname and
-    NetBIOS/local-account authority can differ (and NetBIOS authorities can be truncated).
-    Auto-rewriting ``ADMS`` to ``SOME-LONG-COMPUTER-NAME\\ADMS`` can therefore turn a
-    known-good credential into an NTLM authentication failure.
-
-    The field now follows PowerShell/Get-Credential semantics:
-      * ``ADMS`` is sent as ``ADMS``;
-      * ``DOMAIN\\user`` / ``COMPUTER\\user`` is sent unchanged;
-      * ``user@example.com`` is sent unchanged.
-
-    ``computer_name`` remains in the signature for call-site compatibility and host
-    discovery is still free to use other protocols, but discovered identity is never
-    allowed to rewrite credentials.
-    """
-    return (username or "").strip()
+    """Qualify a simple local account with the target Computer Name for NTLM."""
+    value = (username or "").strip()
+    if not value or "\\" in value or "/" in value or "@" in value:
+        return value
+    authority = (computer_name or "").strip().strip(".")
+    if not authority or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", authority):
+        return value
+    if len(authority) > 63 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", authority):
+        return value
+    return f"{authority}\\{value}"
 
 
 def describe_winrm_failure(host: str, plan: RemoteActionPlan, error) -> str:
@@ -1306,7 +1302,7 @@ def describe_winrm_failure(host: str, plan: RemoteActionPlan, error) -> str:
         return (
             f"WinRM 服务已可达，但服务器拒绝了认证账号 {plan.username!r}。"
             "这不一定代表密码错误：如果使用的是 ADMS 这类目标机本地管理员，Windows 的 WinRM/UAC 远程令牌限制也可能拒绝该账号。"
-            "v0.6.5 对简单用户名会按输入原样发送，不再自动拼接发现到的 Computer Name。"
+            "简单本地用户名会在已识别主机名时按 COMPUTER\\user 形式发送；域账号或已限定账号保持原样。"
             "可在软件的“WinRM 配置向导”中导出目标机准备脚本；涉及本地管理员完整令牌的脚本会明确提示并提供恢复脚本。"
             f"原始信息：{detail}"
         )

@@ -14,7 +14,7 @@ a = Analysis(
         (str(RES / "scripts"), "resources/scripts"),
     ],
     hiddenimports=["PySide6.QtCore","PySide6.QtGui","PySide6.QtWidgets","paramiko","psutil","winrm"] + IMPACKET_HIDDEN,
-    hookspath=[], hooksconfig={}, runtime_hooks=[], excludes=[], noarchive=False, optimize=1,
+    hookspath=[], hooksconfig={}, runtime_hooks=[], excludes=["_context_attributes"], noarchive=False, optimize=1,
 )
 pyz = PYZ(a.pure)
 exe = EXE(
