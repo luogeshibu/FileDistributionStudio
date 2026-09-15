@@ -1,9 +1,28 @@
 ﻿[CmdletBinding()]
-param()
+param(
+    [string]$SigningThumbprint = '',
+    [string]$TimestampUrl = 'http://timestamp.digicert.com',
+    [switch]$RequireSigning
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $Root=$PSScriptRoot
 Set-Location $Root
+
+# A certificate thumbprint can be supplied on the command line or through
+# FDS_SIGNING_THUMBPRINT. Signing is optional by default so existing local
+# builds keep working; use -RequireSigning for a release that must be signed.
+if ([string]::IsNullOrWhiteSpace($SigningThumbprint) -and
+    -not [string]::IsNullOrWhiteSpace([string]$env:FDS_SIGNING_THUMBPRINT)) {
+    $SigningThumbprint = [string]$env:FDS_SIGNING_THUMBPRINT
+}
+$SigningThumbprint = ($SigningThumbprint -replace '\s', '').Trim()
+if ($TimestampUrl -eq 'http://timestamp.digicert.com' -and
+    -not [string]::IsNullOrWhiteSpace([string]$env:FDS_SIGNING_TIMESTAMP_URL)) {
+    $TimestampUrl = [string]$env:FDS_SIGNING_TIMESTAMP_URL
+}
+if ([string]$env:FDS_REQUIRE_SIGNING -eq '1') { $RequireSigning = $true }
+
 $Python=Join-Path $Root '.venv\Scripts\python.exe'
 $Spec=Join-Path $Root 'packaging\windows\FileDistributionStudio.spec'
 if (-not (Test-Path $Python)) { throw '未找到 .venv，请先运行 setup.bat。' }
@@ -47,9 +66,43 @@ if ($LoosePython.Count -gt 0) {
     throw "发布目录包含外部 Python 源文件，已阻止发布：`n$Names"
 }
 
+# Smart App Control can still block an unsigned executable even after loose
+# Python files have been removed. When a trusted certificate is configured,
+# sign every PE payload before the self-test and verify every signature.
+$Product="FileDistributionStudio-v$Version-Windows-x64"
+$SigningRequested = $RequireSigning -or -not [string]::IsNullOrWhiteSpace($SigningThumbprint)
+if ($SigningRequested) {
+    if ([string]::IsNullOrWhiteSpace($SigningThumbprint)) {
+        throw '已要求代码签名，但未提供证书指纹。请使用 -SigningThumbprint 或设置 FDS_SIGNING_THUMBPRINT。'
+    }
+
+    $SignTool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if (-not $SignTool) {
+        throw '未找到 signtool.exe。请安装 Windows SDK，并将 signtool.exe 加入 PATH 后重试。'
+    }
+
+    $SignToolPath = $SignTool.Source
+    $PeFiles = @(Get-ChildItem -Path $App -Recurse -File -ErrorAction Stop |
+        Where-Object { $_.Extension.ToLowerInvariant() -in @('.exe', '.dll', '.pyd') })
+    if ($PeFiles.Count -eq 0) { throw '发布目录中没有可签名的 EXE/DLL/PYD 文件。' }
+
+    foreach ($PeFile in $PeFiles) {
+        Write-Host "正在签名：$($PeFile.FullName)"
+        & $SignToolPath sign /s My /sha1 $SigningThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 /d 'File Distribution Studio' $PeFile.FullName
+        if ($LASTEXITCODE -ne 0) { throw "代码签名失败：$($PeFile.FullName)" }
+
+        $Signature = Get-AuthenticodeSignature -LiteralPath $PeFile.FullName
+        if ($Signature.Status -ne 'Valid') {
+            throw "签名校验失败：$($PeFile.FullName)；状态：$($Signature.Status)"
+        }
+    }
+    Write-Host "已完成代码签名：$($PeFiles.Count) 个文件" -ForegroundColor Green
+} else {
+    Write-Warning '未配置代码签名证书；发布包仍可能被 Windows Smart App Control 拦截。正式分发请使用 -SigningThumbprint，并配合受信任的代码签名证书。'
+}
+
 & $Exe --self-test
 if ($LASTEXITCODE -ne 0) { throw '打包后的 EXE 自检失败。' }
-$Product="FileDistributionStudio-v$Version-Windows-x64"
 $Target=Join-Path $Release $Product
 Remove-Item $Target -Recurse -Force -ErrorAction SilentlyContinue
 Copy-Item $App $Target -Recurse
