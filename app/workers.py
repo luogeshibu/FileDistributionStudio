@@ -492,6 +492,8 @@ class DistributionThread(QThread):
             if actual_kind == "FILE":
                 mapping.folder_mode = "CONTENTS"
         self._log(f"正在生成映射清单：{mapping.display_source()} → {mapping.target_path}")
+        if mapping.source_kind == "DIR":
+            self._log("目录策略：合并覆盖（安全）——源目录同名文件强制覆盖、缺少文件新增；目标目录额外文件保留，不执行删除。")
         manifest = build_manifest(source, verify_sha256=self.settings.verify_sha256, progress=self._log)
         if mapping.source_kind == "DIR" and mapping.folder_mode == "SELF":
             prefix = source.name
@@ -1191,7 +1193,13 @@ class RemoteFileOperationThread(QThread):
                     payload = {"ok": True, "kind": "entries", "path": self.remote_path, "data": data}
                 else:
                     data = executor.list_drives()
-                    payload = {"ok": True, "kind": "drives", "path": "", "data": data}
+                    try:
+                        known_folders = executor.list_known_folders()
+                    except Exception:
+                        # Known Folders are optional shortcuts. Drive browsing
+                        # must remain available even on incompatible targets.
+                        known_folders = []
+                    payload = {"ok": True, "kind": "drives", "path": "", "data": data, "known_folders": known_folders}
                 self.completed.emit(payload); return
 
             if self.operation == "UPLOAD":

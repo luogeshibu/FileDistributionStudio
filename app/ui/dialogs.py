@@ -317,6 +317,12 @@ class RemoteDirectoryQueryThread(QThread):
                 kind = "directories"
             else:
                 data = executor.list_drives()
+                try:
+                    known_folders = executor.list_known_folders()
+                except Exception:
+                    # Optional convenience data only. Never let Known Folders
+                    # break normal remote drive browsing.
+                    known_folders = []
                 kind = "drives"
             self.completed.emit({
                 "ok": True,
@@ -324,6 +330,7 @@ class RemoteDirectoryQueryThread(QThread):
                 "kind": kind,
                 "path": self.path,
                 "data": data,
+                "known_folders": known_folders if not self.path else [],
                 "error": "",
             })
         except Exception as exc:
@@ -564,10 +571,23 @@ class RemoteDirectoryBrowserDialog(QDialog):
         dummy.setDisabled(True)
         item.addChild(dummy)
 
-    def _populate_drives(self, drives):
+    def _populate_drives(self, drives, known_folders=None):
         self.tree.clear()
         current_drive = self.initial_path[:3].upper() if len(self.initial_path) >= 3 and self.initial_path[1:3] == ":\\" else ""
         target_item = None
+        for folder in known_folders or []:
+            path = str(folder.get("path", "") or "").strip().replace("/", "\\")
+            name = str(folder.get("name", "") or "").strip()
+            if not path or not name:
+                continue
+            item = QTreeWidgetItem([name, path])
+            item.setData(0, self.ROLE_PATH, path)
+            item.setData(0, self.ROLE_KIND, "directory")
+            item.setData(0, self.ROLE_LOADED, False)
+            self._add_dummy_child(item)
+            self.tree.addTopLevelItem(item)
+            if self.initial_path and path.lower() == self.initial_path.rstrip("\\").lower():
+                target_item = item
         for d in drives or []:
             path = str(d.get("name", "") or "").replace("/", "\\")
             if not path:
@@ -631,8 +651,8 @@ class RemoteDirectoryBrowserDialog(QDialog):
             self.status.setText(error)
             return
         if payload.get("kind") == "drives":
-            self._populate_drives(payload.get("data") or [])
-            self.status.setText("参考主机盘符读取完成。展开盘符或目录时，只读取下一层。")
+            self._populate_drives(payload.get("data") or [], payload.get("known_folders") or [])
+            self.status.setText("参考主机常用目录和盘符读取完成。展开目录时，只读取下一层。")
         else:
             self._populate_directories(item, payload.get("data") or [])
             self.status.setText(f"参考主机已读取：{payload.get('path') or ''}")
@@ -1379,8 +1399,8 @@ class MappingTargetDialog(QDialog):
         self.target = QLineEdit(target_path)
         self.target.setPlaceholderText(r"例如：D:\ADMS\dll、E:\NariTech\bin")
         self.mode = QComboBox()
-        self.mode.addItem("仅复制目录内容到目标目录", "CONTENTS")
-        self.mode.addItem("复制目录本身到目标目录", "SELF")
+        self.mode.addItem("合并覆盖（安全）·仅复制目录内容到目标目录", "CONTENTS")
+        self.mode.addItem("合并覆盖（安全）·复制目录本身到目标目录", "SELF")
         idx = self.mode.findData(folder_mode)
         self.mode.setCurrentIndex(max(0, idx))
         self.mode.setEnabled(is_directory)
@@ -1406,6 +1426,10 @@ class MappingTargetDialog(QDialog):
         form.addRow("目标目录", target_row)
         if is_directory:
             form.addRow("目录方式", self.mode)
+            safe_note = QLabel("安全说明：目录采用“合并覆盖”。源目录中的同名文件会强制覆盖、缺少文件会新增；目标目录中源目录没有的额外文件会保留，不会删除。若启用备份，则先备份旧文件再覆盖。")
+            safe_note.setWordWrap(True)
+            safe_note.setStyleSheet("color:#287A4B; font-weight:600;")
+            form.addRow("", safe_note)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("确定")
         buttons.button(QDialogButtonBox.Cancel).setText("取消")
@@ -1459,7 +1483,7 @@ class SftpMappingDialog(QDialog):
         self.source_kind = QComboBox(); self.source_kind.addItem("远程文件", "FILE"); self.source_kind.addItem("远程目录", "DIR")
         idx = self.source_kind.findData(initial.get("source_kind", "FILE")); self.source_kind.setCurrentIndex(max(0,idx))
         self.target = QLineEdit(initial.get("target_path", "")); self.target.setPlaceholderText(r"例如：D:\ADMS\dll")
-        self.folder_mode = QComboBox(); self.folder_mode.addItem("仅复制目录内容到目标目录", "CONTENTS"); self.folder_mode.addItem("复制目录本身到目标目录", "SELF")
+        self.folder_mode = QComboBox(); self.folder_mode.addItem("合并覆盖（安全）·仅复制目录内容到目标目录", "CONTENTS"); self.folder_mode.addItem("合并覆盖（安全）·复制目录本身到目标目录", "SELF")
         idx = self.folder_mode.findData(initial.get("folder_mode", "CONTENTS")); self.folder_mode.setCurrentIndex(max(0,idx))
         self.source_kind.currentIndexChanged.connect(lambda *_: self.folder_mode.setEnabled(self.source_kind.currentData()=="DIR"))
         self.folder_mode.setEnabled(self.source_kind.currentData()=="DIR")
@@ -1473,6 +1497,9 @@ class SftpMappingDialog(QDialog):
         self.browse_remote_btn.clicked.connect(self._browse_remote_directory)
         target_row = QHBoxLayout(); target_row.setContentsMargins(0,0,0,0); target_row.addWidget(self.target,1); target_row.addWidget(self.browse_remote_btn)
         form=QFormLayout(); form.addRow("SFTP 主机",self.host); form.addRow("端口",self.port); form.addRow("用户名",self.username); form.addRow("密码",self.password); form.addRow("远程路径",self.remote_path); form.addRow("远程源类型",self.source_kind); form.addRow("目标目录",target_row); form.addRow("目录方式",self.folder_mode)
+        safe_note = QLabel("安全说明：目录采用“合并覆盖”。同名文件强制覆盖、缺少文件新增；目标目录中源目录没有的额外文件保留，不会删除。启用备份时先备份旧文件再覆盖。")
+        safe_note.setWordWrap(True); safe_note.setStyleSheet("color:#287A4B; font-weight:600;")
+        form.addRow("", safe_note)
         buttons=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); buttons.button(QDialogButtonBox.Ok).setText("添加映射"); buttons.button(QDialogButtonBox.Cancel).setText("取消"); buttons.accepted.connect(self._accept_checked); buttons.rejected.connect(self.reject)
         lay=QVBoxLayout(self); lay.addWidget(note); lay.addLayout(form); lay.addWidget(buttons)
 
@@ -1689,7 +1716,7 @@ class TaskDetailDialog(QDialog):
                 ["mapping_id","source_type","source_path","target_path","source_kind","folder_mode","file_count","total_bytes","manifest_sha256"],
                 ["映射 ID","来源类型","源文件 / 目录","目标目录","源类型","目录方式","文件数","总字节数","映射清单 SHA256"],
                 {"source_type": source_text, "source_kind": lambda v: "目录" if v == "DIR" else "文件",
-                 "folder_mode": lambda v: "复制目录本身" if v == "SELF" else "复制目录内容"},
+                 "folder_mode": lambda v: "合并覆盖（安全）·复制目录本身" if v == "SELF" else "合并覆盖（安全）·复制目录内容"},
             ), "分发映射")
 
         host_rows = db.list_task_hosts(task_id)

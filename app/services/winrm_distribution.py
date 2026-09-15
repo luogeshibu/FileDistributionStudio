@@ -330,22 +330,9 @@ def distribute_plan_to_host_winrm(
                              "transport": "WINRM"},
                 )
 
-                if existing["exists"] and verify_sha256 and existing["size"] == entry.size:
-                    st = "SUCCESS" if existing["sha256"] == source_hash else "FAILED"
-                    _record_check(task_id, host, dest, "EXISTING_SHA256", "SHA256",
-                                  source_hash, existing["sha256"], st,
-                                  "比较现有目标文件与源文件。", audit_root)
-                    if existing["sha256"] == source_hash:
-                        skipped_files += 1
-                        db.record_file(
-                            task_id, host, rel, "SAME", entry.size, source_hash,
-                            existing["sha256"], "SKIPPED", mapping_id=mapping.mapping_id,
-                            source_path=str(entry.absolute_path), target_path=dest,
-                        )
-                        if file_progress_cb:
-                            file_progress_cb(host, done_files, total_files, dest, "SKIPPED")
-                        continue
-
+                # 正式分发采用“用户选择即发布”的强制覆盖语义：
+                # 目标文件存在时，即使大小/SHA256 与源文件完全一致，也不再跳过。
+                # 如启用覆盖前备份，则必须先完成旧文件备份与校验；备份失败时禁止覆盖。
                 if existing["exists"] and backup_existing:
                     backup = _backup_file_path(mapping.target_path, backup_root_path, task_id, rel, host)
                     try:

@@ -448,6 +448,70 @@ $drives | ConvertTo-Json -Compress
             })
         return sorted(out, key=lambda x: x["name"])
 
+    def list_known_folders(self) -> list[dict]:
+        """读取当前 WinRM 登录用户的 Windows 常用目录（只读）。
+
+        使用目标机实际用户配置，不假定 C:\\Users\\ADMS；目录重定向/OneDrive 等场景
+        由 Windows 返回真实路径。仅返回当前存在的目录。
+        """
+        script = r"""
+$ErrorActionPreference = 'Stop'
+# Keep this as a normal PowerShell array. Some Windows PowerShell 5.1 builds
+# throw "Argument types do not match" when a generic List[object] is wrapped
+# with @($items) before ConvertTo-Json.
+$items = @()
+function Add-KnownFolder([string]$name, [string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return }
+    $expanded = [Environment]::ExpandEnvironmentVariables($path)
+    if ([IO.Directory]::Exists($expanded)) {
+        $script:items += [pscustomobject]@{ Name=$name; FullName=$expanded }
+    }
+}
+Add-KnownFolder 'Desktop' ([Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory))
+try {
+    $shell = Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders' -ErrorAction Stop
+    Add-KnownFolder 'Downloads' ([string]$shell.'{374DE290-123F-4565-9164-39C4925E467B}')
+} catch { }
+Add-KnownFolder 'Documents' ([Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments))
+Add-KnownFolder 'Pictures' ([Environment]::GetFolderPath([Environment+SpecialFolder]::MyPictures))
+Add-KnownFolder 'Music' ([Environment]::GetFolderPath([Environment+SpecialFolder]::MyMusic))
+Add-KnownFolder 'Videos' ([Environment]::GetFolderPath([Environment+SpecialFolder]::MyVideos))
+$items | ConvertTo-Json -Compress
+"""
+        r = self.run_ps(script)
+        self._require_success(r, "读取远程常用目录")
+        text = (r.get("stdout") or "").strip()
+        if not text:
+            return []
+        try:
+            data = json.loads(text.splitlines()[-1])
+        except Exception as e:
+            raise RuntimeError(f"解析远程常用目录失败；返回：{text}") from e
+        if isinstance(data, dict):
+            data = [data]
+        out = []
+        seen = set()
+        for item in data or []:
+            folder_id = str(item.get("Name", "") or "").strip()
+            full = str(item.get("FullName", "") or "").strip().replace("/", "\\")
+            key = full.lower()
+            # The remote PowerShell process returns language-neutral ASCII IDs only.
+            # Localize in Python so Windows PowerShell 5.1 / WinRM code pages can never
+            # turn Chinese labels into "??". Unknown IDs remain readable instead of blank.
+            labels = {
+                "Desktop": "桌面",
+                "Downloads": "下载",
+                "Documents": "文档",
+                "Pictures": "图片",
+                "Music": "音乐",
+                "Videos": "视频",
+            }
+            name = labels.get(folder_id, folder_id)
+            if name and full and key not in seen:
+                seen.add(key)
+                out.append({"name": name, "path": full, "id": folder_id})
+        return out
+
     def list_directories(self, path: str) -> list[dict]:
         """只读列出目标 Windows 某个目录下的直接子目录。
 

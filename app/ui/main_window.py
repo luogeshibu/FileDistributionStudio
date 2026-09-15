@@ -7,7 +7,7 @@ import logging
 import ipaddress
 import subprocess
 
-from PySide6.QtCore import Qt, QSize, QTimer, QItemSelectionModel
+from PySide6.QtCore import Qt, QSize, QTimer, QItemSelectionModel, QStandardPaths
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel, QLineEdit,
@@ -291,6 +291,10 @@ class MainWindow(QMainWindow):
         mh.setSectionResizeMode(3, QHeaderView.Stretch)
         mh.setSectionResizeMode(4, QHeaderView.Stretch)
         mh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        # 默认完整显示 10 条分发映射；更多映射继续使用表格内部滚动。
+        self.mapping_table.verticalHeader().setDefaultSectionSize(32)
+        self.mapping_table.setMinimumHeight(32 * 10 + 36)
+        self.mapping_table.setMaximumHeight(32 * 10 + 52)
         src_l.addWidget(self.mapping_table)
 
         mr = QHBoxLayout()
@@ -307,7 +311,7 @@ class MainWindow(QMainWindow):
         src_l.addLayout(mr)
         map_hint = QLabel(
             "示例：core.dll → D:\\ADMS\\dll；config.xml → D:\\ADMS\\conf；整个 translations 目录 → E:\\ADMS\\translations。"
-            "目录可选择“仅复制目录内容”或“复制目录本身”。每条映射都会应用到当前全部已勾选目标主机；开始分发前会逐台预检查。"
+            "目录统一采用“合并覆盖（安全）”：同名文件强制覆盖、缺少文件新增，目标目录中源目录没有的额外文件保留且绝不删除；可选择“仅复制目录内容”或“复制目录本身”。启用备份时先备份旧文件再覆盖。每条映射都会应用到当前全部已勾选目标主机；开始分发前会逐台预检查。"
         )
         map_hint.setObjectName("Muted"); map_hint.setWordWrap(True); src_l.addWidget(map_hint)
 
@@ -355,10 +359,10 @@ class MainWindow(QMainWindow):
         self.target_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.target_table.verticalHeader().setVisible(False)
         hdr = self.target_table.horizontalHeader(); hdr.setSectionResizeMode(QHeaderView.Stretch); hdr.setSectionResizeMode(0,QHeaderView.Fixed); self.target_table.setColumnWidth(0,44)
-        # 默认至少完整显示 8 台目标主机；主机更多时由表格自身滚动，不把整页无限撑高。
+        # 默认至少完整显示 10 台目标主机；主机更多时由表格自身滚动，不把整页无限撑高。
         self.target_table.verticalHeader().setDefaultSectionSize(32)
-        self.target_table.setMinimumHeight(32 * 8 + 36)
-        self.target_table.setMaximumHeight(32 * 8 + 52)
+        self.target_table.setMinimumHeight(32 * 10 + 36)
+        self.target_table.setMaximumHeight(32 * 10 + 52)
         target_l.addWidget(self.target_table)
         # 目标主机操作区：常用动作尽量铺满整行。远程桌面属于独立人工操作，不参与任何分发任务流程。
         tr = QGridLayout(); tr.setHorizontalSpacing(8); tr.setVerticalSpacing(8)
@@ -722,7 +726,7 @@ class MainWindow(QMainWindow):
         chk=QCheckBox(); chk.setChecked(True); chk.setStyleSheet("QCheckBox { margin-left: 12px; margin-right: 12px; }"); chk.stateChanged.connect(self._on_mapping_enabled_changed); self.mapping_table.setCellWidget(r,0,chk)
         scope_text, scope_tip = self._target_scope_display()
         vals=["SFTP" if mapping.source_type=="SFTP" else "本地", "目录" if mapping.source_kind=="DIR" else "文件", mapping.display_source(), mapping.target_path,
-              scope_text, ("复制目录本身" if mapping.folder_mode=="SELF" else "复制目录内容") if mapping.source_kind=="DIR" else "文件", "待分发"]
+              scope_text, ("合并覆盖（安全）·复制目录本身" if mapping.folder_mode=="SELF" else "合并覆盖（安全）·复制目录内容") if mapping.source_kind=="DIR" else "文件", "待分发"]
         for c,v in enumerate(vals,1): self.mapping_table.setItem(r,c,QTableWidgetItem(v))
         self.mapping_table.item(r,3).setData(ROLE_HOST_OBJECT,mapping)
         self.mapping_table.item(r,5).setToolTip(scope_tip)
@@ -801,7 +805,7 @@ class MainWindow(QMainWindow):
             d=MappingTargetDialog(self,target_path=m.target_path,is_directory=m.source_kind=="DIR",folder_mode=m.folder_mode, **self._mapping_dialog_kwargs())
             if not d.exec():return
             v=d.value();m.target_path=v["target_path"];m.folder_mode=v["folder_mode"]
-        scope_text,scope_tip=self._target_scope_display(); self.mapping_table.setItem(r,1,QTableWidgetItem("SFTP" if m.source_type=="SFTP" else "本地"));self.mapping_table.setItem(r,2,QTableWidgetItem("目录" if m.source_kind=="DIR" else "文件"));src=QTableWidgetItem(m.display_source());src.setData(ROLE_HOST_OBJECT,m);self.mapping_table.setItem(r,3,src);self.mapping_table.setItem(r,4,QTableWidgetItem(m.target_path));scope_item=QTableWidgetItem(scope_text);scope_item.setToolTip(scope_tip);self.mapping_table.setItem(r,5,scope_item);self.mapping_table.setItem(r,6,QTableWidgetItem(("复制目录本身" if m.folder_mode=="SELF" else "复制目录内容") if m.source_kind=="DIR" else "文件"));self.mapping_table.setItem(r,7,QTableWidgetItem("待分发"))
+        scope_text,scope_tip=self._target_scope_display(); self.mapping_table.setItem(r,1,QTableWidgetItem("SFTP" if m.source_type=="SFTP" else "本地"));self.mapping_table.setItem(r,2,QTableWidgetItem("目录" if m.source_kind=="DIR" else "文件"));src=QTableWidgetItem(m.display_source());src.setData(ROLE_HOST_OBJECT,m);self.mapping_table.setItem(r,3,src);self.mapping_table.setItem(r,4,QTableWidgetItem(m.target_path));scope_item=QTableWidgetItem(scope_text);scope_item.setToolTip(scope_tip);self.mapping_table.setItem(r,5,scope_item);self.mapping_table.setItem(r,6,QTableWidgetItem(("合并覆盖（安全）·复制目录本身" if m.folder_mode=="SELF" else "合并覆盖（安全）·复制目录内容") if m.source_kind=="DIR" else "文件"));self.mapping_table.setItem(r,7,QTableWidgetItem("待分发"))
         self._refresh_mapping_scope(); audit.operation(self.settings.audit_path,"MAPPING","EDIT","SUCCESS","已修改分发映射。",subject=m.mapping_id,details=m.safe_dict());self.refresh_audit()
 
     def _delete_mapping(self):
@@ -2054,12 +2058,15 @@ class MainWindow(QMainWindow):
         # Remote pane
         remote_box, remote_l = card("远程主机", "双击文件夹进入；支持上传、下载、新建目录、重命名和删除。")
         remote_nav = QHBoxLayout(); remote_nav.setSpacing(6)
+        self.remote_file_pc_btn = QPushButton("远程电脑")
+        self.remote_file_pc_btn.setToolTip("返回远程电脑首页，显示常用位置和所有可用磁盘。")
+        self.remote_file_pc_btn.clicked.connect(self._remote_file_connect)
         self.remote_file_up_btn = QPushButton("上一级"); self.remote_file_up_btn.clicked.connect(self._remote_file_up)
         self.remote_file_path = QLineEdit()
         self.remote_file_path.setPlaceholderText(r"连接后显示远程路径，例如 D:\ADMS\bin")
         self.remote_file_path.returnPressed.connect(self._remote_file_go)
         self.remote_file_refresh_btn = QPushButton("刷新"); self.remote_file_refresh_btn.clicked.connect(self._remote_file_refresh)
-        remote_nav.addWidget(self.remote_file_up_btn); remote_nav.addWidget(self.remote_file_path, 1); remote_nav.addWidget(self.remote_file_refresh_btn)
+        remote_nav.addWidget(self.remote_file_pc_btn); remote_nav.addWidget(self.remote_file_up_btn); remote_nav.addWidget(self.remote_file_path, 1); remote_nav.addWidget(self.remote_file_refresh_btn)
         remote_l.addLayout(remote_nav)
         self.remote_file_table = RemoteFileDropTable(0, 4)
         self.remote_file_table.setHorizontalHeaderLabels(["名称", "类型", "大小 / 可用", "修改时间"])
@@ -2150,7 +2157,7 @@ class MainWindow(QMainWindow):
             self.remote_file_status.setText(f"{host.host} · 未连接")
 
     def _remote_file_set_busy(self, busy: bool, text=""):
-        widgets = [self.remote_file_host_combo, self.remote_file_connect_btn, self.remote_file_up_btn,
+        widgets = [self.remote_file_host_combo, self.remote_file_connect_btn, self.remote_file_pc_btn, self.remote_file_up_btn,
                    self.remote_file_path, self.remote_file_refresh_btn, self.remote_upload_btn,
                    self.remote_download_btn, self.remote_mkdir_btn, self.remote_rename_btn, self.remote_delete_btn]
         for w in widgets:
@@ -2216,6 +2223,15 @@ class MainWindow(QMainWindow):
         kind=payload.get("kind")
         if kind=="drives":
             self.remote_file_path.clear()
+            for folder in payload.get("known_folders") or []:
+                r=self.remote_file_table.rowCount(); self.remote_file_table.insertRow(r)
+                name=str(folder.get("name", "") or "")
+                path=str(folder.get("path", "") or "")
+                item=QTableWidgetItem(name)
+                item.setData(Qt.UserRole+401,path); item.setData(Qt.UserRole+402,True); self.remote_file_table.setItem(r,0,item)
+                self.remote_file_table.setItem(r,1,QTableWidgetItem("常用位置"))
+                self.remote_file_table.setItem(r,2,QTableWidgetItem("—"))
+                self.remote_file_table.setItem(r,3,QTableWidgetItem(path))
             for d in payload.get("data") or []:
                 r=self.remote_file_table.rowCount(); self.remote_file_table.insertRow(r)
                 name=d.get("name","")
@@ -2275,6 +2291,35 @@ class MainWindow(QMainWindow):
     def _remote_local_show_drives(self):
         self.remote_local_path.setText("此电脑")
         self.remote_local_table.setRowCount(0)
+
+        # Windows 常用目录使用 Qt/系统解析后的真实路径，不硬编码 C:\Users\<name>。
+        # 因此桌面/下载等被 OneDrive 或组策略重定向后仍可正确进入。
+        common_locations = [
+            ("桌面", QStandardPaths.DesktopLocation),
+            ("下载", QStandardPaths.DownloadLocation),
+            ("文档", QStandardPaths.DocumentsLocation),
+            ("图片", QStandardPaths.PicturesLocation),
+            ("音乐", QStandardPaths.MusicLocation),
+            ("视频", QStandardPaths.MoviesLocation),
+        ]
+        seen=set()
+        for label, location in common_locations:
+            path=QStandardPaths.writableLocation(location)
+            if not path or not os.path.isdir(path):
+                continue
+            norm=os.path.normcase(os.path.normpath(path))
+            if norm in seen:
+                continue
+            seen.add(norm)
+            r=self.remote_local_table.rowCount(); self.remote_local_table.insertRow(r)
+            item=QTableWidgetItem(label)
+            item.setData(LocalFileTable.ROLE_PATH, path); item.setData(Qt.UserRole+302, True); item.setData(Qt.UserRole+303, False)
+            item.setToolTip(path)
+            self.remote_local_table.setItem(r,0,item)
+            self.remote_local_table.setItem(r,1,QTableWidgetItem("常用位置"))
+            self.remote_local_table.setItem(r,2,QTableWidgetItem("—"))
+            self.remote_local_table.setItem(r,3,QTableWidgetItem(path))
+
         drives=[]
         if os.name == "nt":
             for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
