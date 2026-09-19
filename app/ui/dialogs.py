@@ -502,7 +502,6 @@ class RemoteDirectoryBrowserDialog(QDialog):
         self.host_combo.currentIndexChanged.connect(self._reference_host_changed)
         self.refresh_btn.clicked.connect(self.refresh_root)
         self.check_path_btn.clicked.connect(self._start_coverage_check)
-        self.path_edit.editingFinished.connect(self._start_coverage_check)
         self.path_edit.textChanged.connect(self._coverage_path_edited)
         self.tree.itemExpanded.connect(self._item_expanded)
         self.tree.itemClicked.connect(self._item_clicked)
@@ -536,8 +535,25 @@ class RemoteDirectoryBrowserDialog(QDialog):
     def _set_busy(self, busy: bool, text=""):
         self.refresh_btn.setEnabled(not busy and bool(self.contexts))
         self.host_combo.setEnabled(not busy)
+        self._update_remote_action_state()
         if text:
             self.status.setText(text)
+
+    def _remote_thread_running(self):
+        return any(
+            thread is not None and thread.isRunning()
+            for thread in (self._thread, self._coverage_thread)
+        )
+
+    def _update_remote_action_state(self):
+        """只允许在所有远程读取线程结束后关闭并确认目录。"""
+        busy = self._remote_thread_running()
+        self.select_btn.setEnabled(bool(self.contexts) and not busy)
+        self.cancel_btn.setEnabled(bool(self.contexts) and not busy)
+
+    def _remote_thread_finished(self):
+        # finished 信号到达时让 Qt 先完成线程状态切换，再刷新按钮状态。
+        QTimer.singleShot(0, self._update_remote_action_state)
 
     def _start_query(self, path="", item=None):
         if self._thread and self._thread.isRunning():
@@ -555,7 +571,9 @@ class RemoteDirectoryBrowserDialog(QDialog):
             ctx, path=path, use_https=self.use_https, port=self.port,
         )
         self._thread.completed.connect(self._query_completed)
+        self._thread.finished.connect(self._remote_thread_finished)
         self._thread.start()
+        self._update_remote_action_state()
 
     def refresh_root(self):
         if not self.contexts:
@@ -612,8 +630,6 @@ class RemoteDirectoryBrowserDialog(QDialog):
             item = self.tree.topLevelItem(0)
             self.tree.setCurrentItem(item)
             self.path_edit.setText(item.data(0, self.ROLE_PATH) or "")
-        if self.path_edit.text().strip():
-            QTimer.singleShot(80, self._start_coverage_check)
 
     def _populate_directories(self, parent_item, directories):
         if parent_item is None:
@@ -674,7 +690,6 @@ class RemoteDirectoryBrowserDialog(QDialog):
         path = item.data(0, self.ROLE_PATH)
         if path:
             self.path_edit.setText(str(path))
-            QTimer.singleShot(60, self._start_coverage_check)
 
     def _item_double_clicked(self, item, _column):
         path = item.data(0, self.ROLE_PATH)
@@ -717,10 +732,12 @@ class RemoteDirectoryBrowserDialog(QDialog):
         self.check_path_btn.setText("正在检查…")
         self._coverage_thread = RemotePathCoverageThread(
             self.contexts, path=path, use_https=self.use_https, port=self.port,
-            max_workers=min(4, len(self.contexts)),
+            max_workers=min(8, len(self.contexts)),
         )
         self._coverage_thread.completed.connect(self._coverage_completed)
+        self._coverage_thread.finished.connect(self._remote_thread_finished)
         self._coverage_thread.start()
+        self._update_remote_action_state()
 
     def _coverage_completed(self, payload):
         self.check_path_btn.setEnabled(bool(self.contexts))
@@ -784,6 +801,13 @@ class RemoteDirectoryBrowserDialog(QDialog):
             QTimer.singleShot(60, self._start_coverage_check)
 
     def _accept_checked(self):
+        if self._remote_thread_running():
+            QMessageBox.information(
+                self,
+                "远程目录",
+                "正在读取远程信息，请等待当前读取完成后再选择目录。",
+            )
+            return
         path = self.path_edit.text().strip()
         if not path:
             QMessageBox.warning(self, "远程目录", "请选择或输入一个远程目标目录。")
@@ -821,13 +845,13 @@ class RemoteDirectoryBrowserDialog(QDialog):
         return self.path_edit.text().strip().replace("/", "\\")
 
     def reject(self):
-        if (self._thread and self._thread.isRunning()) or (self._coverage_thread and self._coverage_thread.isRunning()):
+        if self._remote_thread_running():
             QMessageBox.information(self, "远程目录", "正在读取远程信息，请等待当前读取完成后再关闭窗口。")
             return
         super().reject()
 
     def closeEvent(self, event):
-        if (self._thread and self._thread.isRunning()) or (self._coverage_thread and self._coverage_thread.isRunning()):
+        if self._remote_thread_running():
             event.ignore()
             return
         super().closeEvent(event)
@@ -1793,7 +1817,7 @@ class WinRMSetupDialog(QDialog):
         title = QLabel("目标 Windows 只需完成一次 WinRM 准备")
         title.setStyleSheet("font-size:14pt;font-weight:700;")
         intro = QLabel(
-            "目标机首次使用时，可导出简化 WinRM 设置脚本并以管理员身份运行。脚本只启用 WinRM 并设置约定的 LocalAccountTokenFilterPolicy；不会读取或修改任何账号、用户组或 RDP 权限。"
+            "此向导只生成目标机初始化脚本。目标机首次准备时以管理员身份运行；运行 File Distribution Studio 的客户机不需要启用或配置 WinRM。"
         )
         intro.setWordWrap(True)
 
@@ -1822,8 +1846,8 @@ class WinRMSetupDialog(QDialog):
         row.addWidget(save_btn); row.addWidget(copy_btn); row.addWidget(self.restore_btn); row.addStretch(1)
 
         help_text = QLabel(
-            "使用方式：保存脚本 → 复制到目标 Windows → 右键“以管理员身份运行” → 回到本软件点击“测试 WinRM”。\n"
-            "设置脚本只启用 WinRM 并写入 LocalAccountTokenFilterPolicy=1；还原脚本只删除该注册表值并停止 WinRM。账号权限检查/加入命令请到“使用帮助”中手工执行。"
+            "使用方式：在目标 Windows 上确认 ADMS 已存在、已启用且属于 Administrators → 保存脚本并以管理员身份运行 → 回到本软件点击“测试 WinRM”。\n"
+            "目标机脚本会准备 WinRM、HTTP 5985、认证和 Remote UAC 策略；客户机只需要能访问目标机 5985，不需要运行任何初始化脚本。还原脚本会恢复执行前保存的原始状态。"
         )
         help_text.setWordWrap(True)
 
@@ -1856,7 +1880,7 @@ class WinRMSetupDialog(QDialog):
         name = self._selected_script()
         if name == self.ADMS_ONECLICK:
             self.desc.setText(
-                "最简模式：只启用 WinRM，并设置 LocalAccountTokenFilterPolicy=1，使已属于本地 Administrators 的账号可获得完整远程管理员令牌。脚本不会检查或修改 ADMS、Administrators、Remote Desktop Users 或其他账号设置。"
+                "ADMS 目标机准备：脚本会检查本地 ADMS 已存在、已启用且属于 Administrators；然后配置 WinRM 服务、HTTP 5985、入站防火墙放行、Negotiate 认证，并设置 LocalAccountTokenFilterPolicy=1。不会创建账号、修改密码或加入用户组。"
             )
         elif name == self.LOCAL_ADMIN:
             self.desc.setText(

@@ -5,7 +5,7 @@
 
 主界面默认使用 **WinRM HTTP 5985**，普通用户无需理解 HTTPS/5986；只有现场已配置 WinRM HTTPS Listener 时才需要进入“高级连接…”修改。
 
-在“Windows 目标主机”区域可直接点击 **下载 ADMS 设置脚本** / **下载 ADMS 还原脚本**。v0.6.23 起，这两个脚本不读取也不修改任何 ADMS 账号、用户组或 RDP 设置：设置脚本只启用/启动 WinRM 并设置 `LocalAccountTokenFilterPolicy=1`；还原脚本只删除该注册表值并停止 WinRM。
+在“Windows 目标主机”区域可直接点击 **下载 ADMS 设置脚本** / **下载 ADMS 还原脚本**。设置脚本会在目标机管理员权限下检查 ADMS 已存在、已启用且属于本机 Administrators，然后准备 WinRM、HTTP 5985、防火墙放行、Negotiate 认证和 `LocalAccountTokenFilterPolicy=1`；不会创建账号或修改用户组。还原脚本会恢复设置前保存的原始策略、服务启动方式和运行状态。运行软件的客户机不需要启用 WinRM。
 
 ## Windows 目标主机选择记忆（v0.6.20）
 
@@ -16,11 +16,11 @@
 
 ## ADMS 目标机一键 WinRM 准备
 
-v0.6.23 起，主界面下载的 `TARGET_PREP_ADMS_WINRM.cmd` **只启用/启动 WinRM，并设置 `LocalAccountTokenFilterPolicy=1`**；不检查、不创建、不启用/禁用、不加组、不移组，也不修改任何 ADMS/RDP 账号设置。
+当前主界面下载的 `TARGET_PREP_ADMS_WINRM.cmd` 会检查 ADMS 已存在、已启用且属于本机 Administrators，再配置 WinRM、HTTP 5985、防火墙放行、Negotiate 认证和 `LocalAccountTokenFilterPolicy=1`；不创建账号、不修改密码、不加入用户组，也不修改 RDP 设置。
 
-`TARGET_RESTORE_ADMS_WINRM.cmd` **只删除 `LocalAccountTokenFilterPolicy` 并停止 WinRM**；不修改 ADMS 账号、任何组成员关系或 RDP 策略。
+`TARGET_RESTORE_ADMS_WINRM.cmd` **恢复设置脚本执行前保存的 `LocalAccountTokenFilterPolicy`、WinRM 启动方式和服务运行状态**；不修改 ADMS 账号、任何组成员关系或 RDP 策略。
 
-> 当前 ADMS 设置脚本使用 `LocalAccountTokenFilterPolicy=1`，用于已属于本地 Administrators 的账号获得完整远程管理员令牌；脚本本身不会修改任何账号或用户组。
+> 当前 ADMS 设置脚本使用 `LocalAccountTokenFilterPolicy=1`，用于已属于本地 Administrators 的账号获得完整远程管理员令牌；脚本本身不会创建账号或修改任何用户组。
 
 ## 分发进度语义
 
@@ -503,7 +503,7 @@ git status
 
 ## v0.6.24：WinRM 脚本与账号权限边界
 
-应用提供的 `TARGET_PREP_ADMS_WINRM.cmd` 只启用/启动 WinRM 并设置 `LocalAccountTokenFilterPolicy=1`；`TARGET_RESTORE_ADMS_WINRM.cmd` 只删除该注册表值并停止 WinRM。两个脚本都不会读取、创建、启用、禁用或修改 ADMS，也不会修改 Administrators、Remote Desktop Users 或 RDP 登录权限。
+应用提供的 `TARGET_PREP_ADMS_WINRM.cmd` 会检查 ADMS 已存在、已启用且属于 Administrators，然后启用/启动 WinRM、验证 HTTP 5985/防火墙/Negotiate，并设置 `LocalAccountTokenFilterPolicy=1`；不会创建、启用、禁用 ADMS 或修改用户组。`TARGET_RESTORE_ADMS_WINRM.cmd` 会恢复准备前保存的原始状态，也不会修改 ADMS、Administrators、Remote Desktop Users 或 RDP 权限。
 
 如需现场手工检查 ADMS，请在“使用帮助 → ADMS 账号检查与管理员组（手工操作）”查看 `net user ADMS`、Administrators 成员查询以及手工加入命令。
 

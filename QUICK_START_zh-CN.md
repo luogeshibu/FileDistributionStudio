@@ -327,17 +327,17 @@ v0.6.4 已将文件正文改为 WinRM/WinRS stdin 二进制流，不再把文件
 2. 在“Windows 目标主机”区域直接点击“下载 ADMS 设置脚本”（也可以从 WinRM 配置向导导出）。
 3. 将 `TARGET_PREP_ADMS_WINRM.cmd` 复制到目标 Windows，以管理员身份运行并确认。
 4. 回到管理机，在 File Distribution Studio 中填写 `ADMS` + 原密码，点击“测试 WinRM”。
-5. 如需撤销准备，点击“下载 ADMS 还原脚本”并在目标机以管理员身份运行；脚本只删除 `LocalAccountTokenFilterPolicy` 并停止 WinRM，不修改任何 ADMS 账号、用户组或 RDP 设置。
+5. 如需撤销准备，点击“下载 ADMS 还原脚本”并在目标机以管理员身份运行；脚本会恢复设置前保存的 `LocalAccountTokenFilterPolicy`、WinRM 启动方式和服务运行状态，不修改任何 ADMS 账号、用户组或 RDP 设置。
 
 注意：一键脚本不会创建账号，也不会修改密码；它会改变目标机远程管理权限，仅限授权的受控网络使用。
 
 
-> v0.6.23：ADMS 设置脚本只启用/启动 WinRM 并设置 `LocalAccountTokenFilterPolicy=0`；还原脚本只删除该值并停止 WinRM。两个脚本都不读取或修改 ADMS 账号、用户组和 RDP 设置。
+> 历史说明：旧版 ADMS 脚本曾只设置 WinRM 和 `LocalAccountTokenFilterPolicy`，且还原时无条件删除该值。当前脚本会先检查 ADMS 权限并保存原始状态，再执行配置；还原时恢复原始状态。
 
 
 ## v0.6.24：WinRM 脚本与账号权限边界
 
-应用提供的 `TARGET_PREP_ADMS_WINRM.cmd` 只启用/启动 WinRM 并设置 `LocalAccountTokenFilterPolicy=0`；`TARGET_RESTORE_ADMS_WINRM.cmd` 只删除该注册表值并停止 WinRM。两个脚本都不会读取、创建、启用、禁用或修改 ADMS，也不会修改 Administrators、Remote Desktop Users 或 RDP 登录权限。
+应用提供的 `TARGET_PREP_ADMS_WINRM.cmd` 会检查 ADMS 已存在、已启用且属于 Administrators，然后启用/启动 WinRM、验证 HTTP 5985/防火墙/Negotiate，并设置 `LocalAccountTokenFilterPolicy=1`；不会创建、启用、禁用 ADMS 或修改用户组。`TARGET_RESTORE_ADMS_WINRM.cmd` 会恢复准备前保存的原始状态，也不会修改 ADMS、Administrators、Remote Desktop Users 或 RDP 权限。
 
 如需现场手工检查 ADMS，请在“使用帮助 → ADMS 账号检查与管理员组（手工操作）”查看 `net user ADMS`、Administrators 成员查询以及手工加入命令。
 

@@ -30,6 +30,8 @@ class RemoteActionPlan:
     upload_chunk_kb: int = 64
     command_workdir: str = ""
     command_execution_mode: str = "INTERACTIVE"
+    # 仅供需要严格连接截止时间的诊断测试使用；正式操作默认按 command_timeout 推导。
+    read_timeout_sec: int | None = None
 
     def __post_init__(self):
         self.pre_commands = list(self.pre_commands or [])
@@ -56,7 +58,12 @@ class WinRMExecutor:
             "auth": (plan.username, plan.password),
             "transport": "ntlm",
             "proxy": None,
-            "read_timeout_sec": max(10, plan.command_timeout + 10),
+            "read_timeout_sec": max(
+                10,
+                int(plan.read_timeout_sec)
+                if plan.read_timeout_sec is not None
+                else plan.command_timeout + 10,
+            ),
             "operation_timeout_sec": max(5, plan.command_timeout),
         }
         if plan.use_https:

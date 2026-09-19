@@ -341,6 +341,13 @@ class MainWindow(QMainWindow):
         self.target_filter_edit.setPlaceholderText("输入 IP、主机名、分组、凭据或状态，例如：172.16.21 / Dispatcher / AUTH_OK")
         self.target_filter_edit.textChanged.connect(self._apply_target_filter)
         target_filter_row.addWidget(self.target_filter_edit, 1)
+        self.btn_test_all_winrm_select = QPushButton("全量测试并选中 WinRM")
+        self.btn_test_all_winrm_select.setIcon(app_icon("radar"))
+        self.btn_test_all_winrm_select.setToolTip(
+            "测试全部已保存主机的 WinRM 连接和身份验证；测试通过的主机会自动勾选，失败主机会自动取消。"
+            "这里只测试 WinRM，不执行写入、不创建目录。适合测试后直接分发。"
+        )
+        self.btn_test_all_winrm_select.clicked.connect(self._test_all_winrm_and_select)
         self.target_filter_count = QLabel("显示 0 / 0 台 · 已选 0 台")
         self.target_filter_count.setObjectName("Muted")
         target_filter_row.addWidget(self.target_filter_count)
@@ -365,20 +372,22 @@ class MainWindow(QMainWindow):
             ("全选", lambda:self._set_all_targets(True), "check"),
             ("取消全选", lambda:self._set_all_targets(False), "clear"),
             ("刷新主机", self.refresh_hosts, "refresh"),
-            ("测试在线状态", self._test_distribution_hosts_online, "radar"),
+            ("测试网络状态（Ping/端口）", self._test_distribution_hosts_online, "radar"),
         ]:
             b = QPushButton(text); b.setIcon(app_icon(icon)); b.clicked.connect(fn); target_action_buttons.append(b)
-        self.btn_winrm_test = QPushButton("测试 WinRM")
+        self.btn_winrm_test = QPushButton("测试已选主机 WinRM")
         self.btn_winrm_test.setIcon(app_icon("terminal"))
-        self.btn_winrm_test.setToolTip("对所有已勾选主机执行各自主机凭据的 WinRM 身份验证，并逐一测试当前目标目录的创建、写入、读取和删除。")
+        self.btn_winrm_test.setToolTip(
+            "只测试当前已勾选的主机。没有分发映射时只验证 WinRM；有启用的分发映射时，还会测试目标目录的创建、写入、读取和删除。"
+        )
         self.btn_winrm_test.clicked.connect(self._test_winrm_targets)
         target_action_buttons.append(self.btn_winrm_test)
         self.btn_target_env_check = QPushButton("ADMS 部署前检查")
         self.btn_target_env_check.setIcon(app_icon("search"))
         self.btn_target_env_check.setToolTip(
             "只读检查当前勾选目标机是否满足 ADMS 客户端部署前置条件：WinRM 可连接、"
-            "与本机时间偏差不超过 2 分钟、Private/Public 防火墙均关闭；"
-            "同时显示 Domain 防火墙、时区和 Windows Time 状态供诊断，不修改目标机。"
+            "与本机时间偏差不超过 2 分钟；"
+            "同时显示 Domain/Private/Public 防火墙、时区和 Windows Time 状态供诊断，不要求关闭整台防火墙。"
         )
         self.btn_target_env_check.clicked.connect(
             lambda: self._check_host_environment(self._selected_hosts(), "Windows 目标主机")
@@ -396,7 +405,8 @@ class MainWindow(QMainWindow):
         self.btn_download_adms_setup.setIcon(app_icon("file"))
         self.btn_download_adms_setup.setToolTip(
             "下载后请将该脚本放到目标主机，并在目标主机上以管理员身份运行。\n"
-            "用于首次准备 ADMS WinRM；脚本不修改任何账号、用户组或 RDP 权限。"
+            "脚本会检查 ADMS 已存在、已启用且属于 Administrators，然后准备 WinRM、5985 和 Remote UAC 策略；"
+            "不会创建账号或修改用户组。客户机不需要运行该脚本。"
         )
         self.btn_download_adms_setup.clicked.connect(lambda: self._save_bundled_cmd("TARGET_PREP_ADMS_WINRM.cmd", "保存 ADMS WinRM 设置脚本"))
         target_action_buttons.append(self.btn_download_adms_setup)
@@ -404,7 +414,7 @@ class MainWindow(QMainWindow):
         self.btn_download_adms_restore.setIcon(app_icon("refresh"))
         self.btn_download_adms_restore.setToolTip(
             "下载后请将该脚本放到目标主机，并在目标主机上以管理员身份运行。\n"
-            "用于还原 ADMS WinRM 准备项；仅删除 LocalAccountTokenFilterPolicy 并停止 WinRM，"
+            "用于恢复设置脚本执行前保存的 WinRM 服务、启动方式和 LocalAccountTokenFilterPolicy 原值，"
             "不修改任何账号、用户组或 RDP 权限。"
         )
         self.btn_download_adms_restore.clicked.connect(lambda: self._save_bundled_cmd("TARGET_RESTORE_ADMS_WINRM.cmd", "保存 ADMS 还原脚本"))
@@ -420,15 +430,22 @@ class MainWindow(QMainWindow):
             button.setMinimumWidth(0)
             button.setMinimumHeight(34)
 
-        # 固定呈现顺序：第二行放诊断/连接类动作，第三行放两个脚本下载。
-        target_action_buttons = target_action_buttons[:7] + [self.btn_winrm_setup, self.btn_download_adms_setup, self.btn_download_adms_restore]
+        # 固定呈现顺序：第一行放主机选择与状态动作，第二行放 WinRM/诊断动作，
+        # 后两行放配置向导和脚本下载，避免全量 WinRM 按钮藏在筛选栏里。
+        target_action_buttons = [
+            self.btn_test_all_winrm_select, *target_action_buttons[:4],
+            self.btn_winrm_test,
+            self.btn_target_env_check, self.btn_open_rdp,
+            self.btn_winrm_setup, self.btn_download_adms_setup, self.btn_download_adms_restore,
+        ]
         for b in target_action_buttons:
             _compact_action_button(b)
-        # 4 + 4 + 2（最后两个脚本按钮各跨两列），避免最后一行只剩一个按钮。
+        # 4 + 4 + 1/3 + 4，确保“全量测试并选中 WinRM”位于操作区第一排。
         positions = [
             (0, 0, 1, 1), (0, 1, 1, 1), (0, 2, 1, 1), (0, 3, 1, 1),
             (1, 0, 1, 1), (1, 1, 1, 1), (1, 2, 1, 1), (1, 3, 1, 1),
-            (2, 0, 1, 2), (2, 2, 1, 2),
+            (2, 0, 1, 1), (2, 1, 1, 3),
+            (3, 0, 1, 4),
         ]
         for b, pos in zip(target_action_buttons, positions):
             tr.addWidget(b, *pos)
@@ -436,8 +453,9 @@ class MainWindow(QMainWindow):
             tr.setColumnStretch(col, 1)
         target_l.addLayout(tr)
         adms_precheck_hint = QLabel(
-            "ADMS 部署前检查：只读检查 WinRM、与本机时间偏差（≤2 分钟）、Private/Public 防火墙（必须关闭）；"
-            "Domain 防火墙、时区和 Windows Time 仅作为诊断信息显示。"
+            "ADMS 部署前检查：只读检查 WinRM 和时间偏差（≤2 分钟）；"
+            "Domain/Private/Public 防火墙、时区和 Windows Time 仅作为诊断信息显示。防火墙不需要整体关闭，"
+            "只需允许目标机 TCP 5985，真实可达性以 WinRM 测试结果为准。"
         )
         adms_precheck_hint.setObjectName("Muted")
         adms_precheck_hint.setWordWrap(True)
@@ -1130,6 +1148,84 @@ class MainWindow(QMainWindow):
         if not hosts:QMessageBox.warning(self,"在线测试","请先至少勾选一台目标主机。");return
         self._start_host_status_test([h.host for h in hosts],"distribution")
 
+    def _test_all_winrm_and_select(self):
+        """测试全部主机的 WinRM 身份验证，并将通过者设为本次分发目标。"""
+        hosts = db.list_hosts()
+        if not hosts:
+            QMessageBox.information(self, "全量测试并选中 WinRM", "当前没有已保存的目标主机。")
+            return
+        running = getattr(self, "winrm_test_thread", None)
+        if running and running.isRunning():
+            QMessageBox.information(self, "WinRM 测试", "已有 WinRM 测试正在执行，请等待完成。")
+            return
+        running = getattr(self, "winrm_select_thread", None)
+        if running and running.isRunning():
+            QMessageBox.information(self, "WinRM 测试", "已有全量 WinRM 测试正在执行，请等待完成。")
+            return
+        self._save_default_winrm_credential(show_error=True)
+        try:
+            credentials = self._resolve_credentials(hosts)
+        except Exception as exc:
+            QMessageBox.warning(self, "WinRM 测试", str(exc))
+            return
+
+        # 这项操作的语义是“以本次测试结果重建分发范围”，因此先清除旧选择。
+        self._suppress_target_selection_persist = True
+        try:
+            for row in range(self.target_table.rowCount()):
+                checkbox = self.target_table.cellWidget(row, 0)
+                if checkbox:
+                    checkbox.setChecked(False)
+        finally:
+            self._suppress_target_selection_persist = False
+        self._refresh_mapping_scope()
+
+        self.btn_test_all_winrm_select.setEnabled(False)
+        self.btn_test_all_winrm_select.setText("正在测试全部 WinRM…")
+        for row in range(self.target_table.rowCount()):
+            self.target_table.setItem(row, 6, QTableWidgetItem("正在测试…"))
+        self.winrm_select_thread = WinRMTargetTestThread(
+            [host.host for host in hosts],
+            [],
+            credentials,
+            use_https=self.remote_https.isChecked(),
+            port=self.remote_port.value(),
+            max_workers=8,
+            host_names={host.host: host.name for host in hosts},
+        )
+        self.winrm_select_thread.result.connect(self._winrm_select_result)
+        self.winrm_select_thread.completed.connect(self._winrm_select_completed)
+        self.winrm_select_thread.start()
+
+    def _winrm_select_result(self, host, success, message):
+        self._suppress_target_selection_persist = True
+        try:
+            for row in range(self.target_table.rowCount()):
+                host_item = self.target_table.item(row, 2)
+                if host_item and host_item.text().strip() == host:
+                    checkbox = self.target_table.cellWidget(row, 0)
+                    if checkbox:
+                        checkbox.setChecked(bool(success))
+                    break
+        finally:
+            self._suppress_target_selection_persist = False
+        self._refresh_mapping_scope()
+        self._winrm_target_test_result(host, success, message)
+
+    def _winrm_select_completed(self, success, failed):
+        self.btn_test_all_winrm_select.setEnabled(True)
+        self.btn_test_all_winrm_select.setText("全量测试并选中 WinRM")
+        self._save_all_target_selection_preferences()
+        self.refresh_audit()
+        self.refresh_hosts()
+        self._refresh_mapping_scope()
+        QMessageBox.information(
+            self,
+            "全量测试并选中 WinRM",
+            f"全量 WinRM 测试完成。\n\nWinRM 认证通过并已选中：{success} 台\n"
+            f"测试失败并已取消：{failed} 台\n\n后续分发将只针对已选中的主机。",
+        )
+
     def _save_bundled_cmd(self, name: str, title: str):
         source = script_path(name)
         if not source.exists():
@@ -1191,7 +1287,7 @@ class MainWindow(QMainWindow):
         for target in targets:
             try:validate_windows_target_path(target, allow_unc=False)
             except Exception as e:QMessageBox.warning(self,"WinRM 测试",f"目标目录格式不正确：\n{target}\n\n{e}");return
-        self.btn_winrm_test.setEnabled(False);self.btn_winrm_test.setText("正在测试 WinRM…")
+        self.btn_winrm_test.setEnabled(False);self.btn_winrm_test.setText("正在测试已选主机…")
         host_set={h.host for h in hosts}
         for r in range(self.target_table.rowCount()):
             if self.target_table.item(r,2).text() in host_set:self.target_table.setItem(r,6,QTableWidgetItem("正在测试…"))
@@ -1216,7 +1312,7 @@ class MainWindow(QMainWindow):
         audit.operation(self.settings.audit_path,"WINRM","UI_TEST","SUCCESS" if success else "FAILED",message,host=host,details={"targets":[m.target_path for m in self._mapping_rows(True)],"port":self.remote_port.value(),"https":self.remote_https.isChecked()})
 
     def _winrm_target_test_completed(self,success,failed):
-        self.btn_winrm_test.setEnabled(True);self.btn_winrm_test.setText("测试 WinRM");self.refresh_audit();self.refresh_hosts()
+        self.btn_winrm_test.setEnabled(True);self.btn_winrm_test.setText("测试已选主机 WinRM");self.refresh_audit();self.refresh_hosts()
         message=f"WinRM 测试完成。\n通过：{success} 台\n失败：{failed} 台"
         if failed==0:
             QMessageBox.information(self,"WinRM 测试",message)
@@ -1900,11 +1996,16 @@ class MainWindow(QMainWindow):
 
     @classmethod
     def _environment_alarm_state(cls, data: dict) -> tuple[bool, bool, bool, dict[str, str]]:
-        """Alarm when either |clock drift| > 2 min OR Private/Public are not both disabled."""
+        """Alarm on clock drift; firewall profile state is informational only.
+
+        A correctly configured Windows host normally keeps its firewall enabled.
+        WinRM reachability is verified by the actual WinRM test, so an enabled
+        Private/Public profile must not be treated as a deployment failure.
+        """
         drift=abs(float(data.get("time_drift_seconds", 0.0) or 0.0))
         states=cls._environment_firewall_states(data)
         time_bad=drift > 120.0
-        firewall_bad=not (states.get("Private") == "关闭" and states.get("Public") == "关闭")
+        firewall_bad=False
         return bool(time_bad or firewall_bad), time_bad, firewall_bad, states
 
     def _host_environment_result(self, host: str, ok: bool, data):
@@ -1921,7 +2022,7 @@ class MainWindow(QMainWindow):
                 f"[{host}] ADMS 部署前检查：{level}；时间偏差={drift:+.1f}s "
                 f"({'超过2分钟' if time_bad else '未超过2分钟'})；时区={tz}；W32Time={svc}；"
                 f"防火墙 Domain={states['Domain']}，Private={states['Private']}，Public={states['Public']}；"
-                f"防火墙条件={'异常' if firewall_bad else '满足要求'}。"
+                f"防火墙状态={'仅供诊断' if not firewall_bad else '异常'}。"
             )
         else:
             self._append_log(f"[{host}] ADMS 部署前检查失败：{data.get('error','未知错误')}")
@@ -1948,10 +2049,10 @@ class MainWindow(QMainWindow):
                 f"  时区：{tz}\n"
                 f"  Windows Time：{svc}\n"
                 f"  防火墙：Domain={states['Domain']}，Private={states['Private']}，Public={states['Public']}\n"
-                f"  ADMS 前置结论：{'不满足（告警）' if alarm else '满足'}；要求：时间偏差≤2分钟，Private=关闭，Public=关闭"
+                f"  ADMS 前置结论：{'不满足（告警）' if alarm else '满足'}；要求：时间偏差≤2分钟；防火墙状态仅供诊断"
             )
         summary=f"ADMS 部署前检查完成：成功 {success} 台，失败 {failed} 台。"
-        summary += f"\n满足前置条件 {max(0, success-len(alarms))} 台，告警 {len(alarms)} 台。规则：时间偏差必须 ≤ 2 分钟，且 Private/Public 防火墙必须全部关闭；任一条件不满足即告警。"
+        summary += f"\n满足前置条件 {max(0, success-len(alarms))} 台，告警 {len(alarms)} 台。规则：时间偏差必须 ≤ 2 分钟；防火墙状态仅供诊断，TCP 5985 是否可达以实际 WinRM 测试为准。"
         # 使用固定的中等尺寸结果窗口，避免 QMessageBox 的 DetailedText
         # 因长行 sizeHint 把窗口横向撑到接近全屏。结果直接展示，无需再点“Show Details”。
         dlg=QDialog(self)
@@ -1985,6 +2086,50 @@ class MainWindow(QMainWindow):
 
 
     # ---------- Remote files (independent manual tool) ----------
+    @staticmethod
+    def _checkable_file_item(text):
+        item = QTableWidgetItem(str(text or ""))
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        item.setCheckState(Qt.Unchecked)
+        return item
+
+    def _filter_remote_file_table(self, table, query):
+        tokens = str(query or "").strip().casefold().split()
+        for row in range(table.rowCount()):
+            values = []
+            for column in range(table.columnCount()):
+                cell = table.item(row, column)
+                if cell:
+                    values.append(cell.text())
+            text = " ".join(values).casefold()
+            table.setRowHidden(row, bool(tokens) and not all(token in text for token in tokens))
+
+    @staticmethod
+    def _set_visible_file_rows_checked(table, checked):
+        state = Qt.Checked if checked else Qt.Unchecked
+        for row in range(table.rowCount()):
+            if table.isRowHidden(row):
+                continue
+            item = table.item(row, 0)
+            if item and item.flags() & Qt.ItemIsUserCheckable:
+                item.setCheckState(state)
+
+    @staticmethod
+    def _checked_or_selected_paths(table, path_role):
+        checked = []
+        selected = []
+        selected_rows = {index.row() for index in table.selectionModel().selectedRows()}
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            path = str(item.data(path_role) or "") if item else ""
+            if not path:
+                continue
+            if item.checkState() == Qt.Checked:
+                checked.append(path)
+            if row in selected_rows:
+                selected.append(path)
+        return checked or selected
+
     def _build_remote_files_page(self):
         canvas, root = self._page_canvas()
         c, l = card(
@@ -2037,6 +2182,26 @@ class MainWindow(QMainWindow):
         local_nav.addWidget(self.remote_local_pc_btn); local_nav.addWidget(self.remote_local_up_btn); local_nav.addWidget(self.remote_local_path, 1)
         local_nav.addWidget(self.remote_local_browse_btn); local_nav.addWidget(self.remote_local_refresh_btn)
         local_l.addLayout(local_nav)
+        local_filter = QHBoxLayout(); local_filter.setSpacing(6)
+        local_filter.addWidget(QLabel("搜索"))
+        self.remote_local_search = QLineEdit()
+        self.remote_local_search.setPlaceholderText("按名称、类型或路径搜索当前目录")
+        self.remote_local_search.setClearButtonEnabled(True)
+        self.remote_local_search.textChanged.connect(
+            lambda text: self._filter_remote_file_table(self.remote_local_table, text)
+        )
+        local_filter.addWidget(self.remote_local_search, 1)
+        self.remote_local_check_visible_btn = QPushButton("勾选当前结果")
+        self.remote_local_check_visible_btn.clicked.connect(
+            lambda: self._set_visible_file_rows_checked(self.remote_local_table, True)
+        )
+        self.remote_local_uncheck_btn = QPushButton("清除勾选")
+        self.remote_local_uncheck_btn.clicked.connect(
+            lambda: self._set_visible_file_rows_checked(self.remote_local_table, False)
+        )
+        local_filter.addWidget(self.remote_local_check_visible_btn)
+        local_filter.addWidget(self.remote_local_uncheck_btn)
+        local_l.addLayout(local_filter)
         self.remote_local_table = LocalFileTable(0, 4)
         self.remote_local_table.setHorizontalHeaderLabels(["名称", "类型", "大小", "修改时间"])
         self.remote_local_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2073,6 +2238,26 @@ class MainWindow(QMainWindow):
         self.remote_file_refresh_btn = QPushButton("刷新"); self.remote_file_refresh_btn.clicked.connect(self._remote_file_refresh)
         remote_nav.addWidget(self.remote_file_pc_btn); remote_nav.addWidget(self.remote_file_up_btn); remote_nav.addWidget(self.remote_file_path, 1); remote_nav.addWidget(self.remote_file_refresh_btn)
         remote_l.addLayout(remote_nav)
+        remote_filter = QHBoxLayout(); remote_filter.setSpacing(6)
+        remote_filter.addWidget(QLabel("搜索"))
+        self.remote_file_search = QLineEdit()
+        self.remote_file_search.setPlaceholderText("按名称、类型或路径搜索当前目录")
+        self.remote_file_search.setClearButtonEnabled(True)
+        self.remote_file_search.textChanged.connect(
+            lambda text: self._filter_remote_file_table(self.remote_file_table, text)
+        )
+        remote_filter.addWidget(self.remote_file_search, 1)
+        self.remote_file_check_visible_btn = QPushButton("勾选当前结果")
+        self.remote_file_check_visible_btn.clicked.connect(
+            lambda: self._set_visible_file_rows_checked(self.remote_file_table, True)
+        )
+        self.remote_file_uncheck_btn = QPushButton("清除勾选")
+        self.remote_file_uncheck_btn.clicked.connect(
+            lambda: self._set_visible_file_rows_checked(self.remote_file_table, False)
+        )
+        remote_filter.addWidget(self.remote_file_check_visible_btn)
+        remote_filter.addWidget(self.remote_file_uncheck_btn)
+        remote_l.addLayout(remote_filter)
         self.remote_file_table = RemoteFileDropTable(0, 4)
         self.remote_file_table.setHorizontalHeaderLabels(["名称", "类型", "大小 / 可用", "修改时间"])
         self.remote_file_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2163,7 +2348,8 @@ class MainWindow(QMainWindow):
     def _remote_file_set_busy(self, busy: bool, text=""):
         widgets = [self.remote_file_host_combo, self.remote_file_connect_btn, self.remote_file_pc_btn, self.remote_file_up_btn,
                    self.remote_file_path, self.remote_file_refresh_btn, self.remote_upload_btn,
-                   self.remote_download_btn, self.remote_mkdir_btn, self.remote_rename_btn, self.remote_delete_btn]
+                   self.remote_download_btn, self.remote_mkdir_btn, self.remote_rename_btn, self.remote_delete_btn,
+                   self.remote_file_search, self.remote_file_check_visible_btn, self.remote_file_uncheck_btn]
         for w in widgets:
             w.setEnabled(not busy)
         if text: self.remote_file_status.setText(text)
@@ -2236,7 +2422,7 @@ class MainWindow(QMainWindow):
                 r=self.remote_file_table.rowCount(); self.remote_file_table.insertRow(r)
                 name=str(folder.get("name", "") or "")
                 path=str(folder.get("path", "") or "")
-                item=QTableWidgetItem(name)
+                item=self._checkable_file_item(name)
                 item.setData(Qt.UserRole+401,path); item.setData(Qt.UserRole+402,True); self.remote_file_table.setItem(r,0,item)
                 self.remote_file_table.setItem(r,1,QTableWidgetItem("常用位置"))
                 self.remote_file_table.setItem(r,2,QTableWidgetItem("—"))
@@ -2244,7 +2430,7 @@ class MainWindow(QMainWindow):
             for d in payload.get("data") or []:
                 r=self.remote_file_table.rowCount(); self.remote_file_table.insertRow(r)
                 name=d.get("name","")
-                item=QTableWidgetItem(f"{name}  {d.get('volume_label','')}".strip())
+                item=self._checkable_file_item(f"{name}  {d.get('volume_label','')}".strip())
                 item.setData(Qt.UserRole+401,name); item.setData(Qt.UserRole+402,True); self.remote_file_table.setItem(r,0,item)
                 self.remote_file_table.setItem(r,1,QTableWidgetItem("磁盘"))
                 self.remote_file_table.setItem(r,2,QTableWidgetItem(f"可用 {human_bytes(int(d.get('free_size',0) or 0))} / {human_bytes(int(d.get('total_size',0) or 0))}"))
@@ -2255,12 +2441,13 @@ class MainWindow(QMainWindow):
             self.settings.remote_file_remote_path=path; self.settings.save()
             for e in payload.get("data") or []:
                 r=self.remote_file_table.rowCount(); self.remote_file_table.insertRow(r)
-                item=QTableWidgetItem(str(e.get("name", "")))
+                item=self._checkable_file_item(str(e.get("name", "")))
                 item.setData(Qt.UserRole+401,e.get("path", "")); item.setData(Qt.UserRole+402,bool(e.get("is_dir"))); self.remote_file_table.setItem(r,0,item)
                 self.remote_file_table.setItem(r,1,QTableWidgetItem("文件夹" if e.get("is_dir") else "文件"))
                 self.remote_file_table.setItem(r,2,QTableWidgetItem("—" if e.get("is_dir") else human_bytes(int(e.get("size",0) or 0))))
                 self.remote_file_table.setItem(r,3,QTableWidgetItem(str(e.get("modified", ""))))
         fit_full_content_table(self.remote_file_table)
+        self._filter_remote_file_table(self.remote_file_table, self.remote_file_search.text())
 
     def _remote_file_op_done(self, payload):
         payload=dict(payload or {})
@@ -2322,7 +2509,7 @@ class MainWindow(QMainWindow):
                 continue
             seen.add(norm)
             r=self.remote_local_table.rowCount(); self.remote_local_table.insertRow(r)
-            item=QTableWidgetItem(label)
+            item=self._checkable_file_item(label)
             item.setData(LocalFileTable.ROLE_PATH, path); item.setData(Qt.UserRole+302, True); item.setData(Qt.UserRole+303, False)
             item.setToolTip(path)
             self.remote_local_table.setItem(r,0,item)
@@ -2349,13 +2536,14 @@ class MainWindow(QMainWindow):
             except Exception:
                 size_text="—"
             r=self.remote_local_table.rowCount(); self.remote_local_table.insertRow(r)
-            item=QTableWidgetItem(drive)
+            item=self._checkable_file_item(drive)
             item.setData(LocalFileTable.ROLE_PATH, drive); item.setData(Qt.UserRole+302, True); item.setData(Qt.UserRole+303, True)
             self.remote_local_table.setItem(r,0,item)
             self.remote_local_table.setItem(r,1,QTableWidgetItem("磁盘"))
             self.remote_local_table.setItem(r,2,QTableWidgetItem(size_text))
             self.remote_local_table.setItem(r,3,QTableWidgetItem(""))
         fit_full_content_table(self.remote_local_table)
+        self._filter_remote_file_table(self.remote_local_table, self.remote_local_search.text())
 
     def _remote_local_choose_files(self):
         start=self.remote_local_path.text().strip()
@@ -2426,13 +2614,14 @@ class MainWindow(QMainWindow):
             try:
                 stat=entry.stat(); is_dir=entry.is_dir()
                 r=self.remote_local_table.rowCount(); self.remote_local_table.insertRow(r)
-                item=QTableWidgetItem(entry.name); item.setData(LocalFileTable.ROLE_PATH,str(entry)); item.setData(Qt.UserRole+302,is_dir); item.setData(Qt.UserRole+303,False); self.remote_local_table.setItem(r,0,item)
+                item=self._checkable_file_item(entry.name); item.setData(LocalFileTable.ROLE_PATH,str(entry)); item.setData(Qt.UserRole+302,is_dir); item.setData(Qt.UserRole+303,False); self.remote_local_table.setItem(r,0,item)
                 self.remote_local_table.setItem(r,1,QTableWidgetItem("文件夹" if is_dir else "文件"))
                 self.remote_local_table.setItem(r,2,QTableWidgetItem("—" if is_dir else human_bytes(stat.st_size)))
                 self.remote_local_table.setItem(r,3,QTableWidgetItem(datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")))
             except Exception:
                 continue
         fit_full_content_table(self.remote_local_table)
+        self._filter_remote_file_table(self.remote_local_table, self.remote_local_search.text())
 
     def _remote_local_double_clicked(self, row: int, _column: int):
         item=self.remote_local_table.item(row,0)
@@ -2442,20 +2631,10 @@ class MainWindow(QMainWindow):
                 self.remote_local_path.setText(path); self._refresh_remote_local_table()
 
     def _selected_local_paths(self):
-        rows=sorted({idx.row() for idx in self.remote_local_table.selectionModel().selectedRows()})
-        out=[]
-        for r in rows:
-            item=self.remote_local_table.item(r,0); path=str(item.data(LocalFileTable.ROLE_PATH) or "") if item else ""
-            if path: out.append(path)
-        return out
+        return self._checked_or_selected_paths(self.remote_local_table, LocalFileTable.ROLE_PATH)
 
     def _selected_remote_paths(self):
-        rows=sorted({idx.row() for idx in self.remote_file_table.selectionModel().selectedRows()})
-        out=[]
-        for r in rows:
-            item=self.remote_file_table.item(r,0); path=str(item.data(Qt.UserRole+401) or "") if item else ""
-            if path: out.append(path)
-        return out
+        return self._checked_or_selected_paths(self.remote_file_table, Qt.UserRole+401)
 
     def _remote_upload_selected(self):
         paths=self._selected_local_paths()
@@ -2548,7 +2727,7 @@ class MainWindow(QMainWindow):
         for text,fn,icon in [
             ("添加",self._add_host,"add"),("编辑",self._edit_host,"edit"),("删除",self._delete_host,"delete"),
             ("全选",lambda:self._set_inventory_checks(True),"check"),("取消全选",lambda:self._set_inventory_checks(False),"clear"),
-            ("测试在线状态",self._test_inventory_online,"radar"),
+            ("测试网络状态（Ping/端口）",self._test_inventory_online,"radar"),
             ("ADMS 部署前检查",lambda:self._check_host_environment(self._selected_inventory_hosts(), "主机管理"),"search"),
             ("验证主机名",self._verify_inventory_names,"terminal"),("导出 Excel",self._export_inventory_excel,"file"),("刷新",self.refresh_hosts,"refresh")
         ]:
@@ -2743,18 +2922,37 @@ class MainWindow(QMainWindow):
 
     def _start_host_status_test(self,hosts,context):
         if self.host_status_thread and self.host_status_thread.isRunning():QMessageBox.information(self,"在线测试","已有在线测试正在执行，请稍候。");return
-        self.host_status_context=context;self._set_busy(True,"正在测试主机")
+        self.host_status_context=context
+        self._host_status_results={}
+        self._set_busy(True,"正在测试主机")
         audit.operation(self.settings.audit_path,"HOST","CONNECTIVITY_TEST_START","SUCCESS","开始批量主机在线状态测试。",details={"hosts":hosts,"context":context})
         self.host_status_thread=HostStatusTestThread(hosts,self.settings.socket_timeout,max_workers=min(max(8,self.settings.discovery_workers),32));self.host_status_thread.result.connect(self._host_status_test_result);self.host_status_thread.completed.connect(self._host_status_test_completed);self.host_status_thread.start()
 
     def _host_status_test_result(self,host,result):
+        self._host_status_results[host]=result
         now=datetime.now().isoformat(timespec="seconds")
         db.update_host_connectivity(host,online_status=result.online_status,ping_ok=result.ping_ok,smb_port_ok=result.smb_port_ok,rdp_port_ok=result.rdp_port_ok,winrm_port_ok=result.winrm_port_ok,last_test_at=now)
         audit.operation(self.settings.audit_path,"HOST","CONNECTIVITY_TEST","SUCCESS" if result.online_status!="OFFLINE" else "FAILED",result.message,host=host,details={"ping":result.ping_ok,"smb_445":result.smb_port_ok,"rdp_3389":result.rdp_port_ok,"winrm_5985":result.winrm_5985_ok,"winrm_5986":result.winrm_5986_ok,"online_status":result.online_status})
         if hasattr(self,"dist_log"):self._append_log(f"[{host}] 在线测试：{result.message.replace(chr(10),'；')}")
 
     def _host_status_test_completed(self,online,offline):
-        self._set_busy(False);self.refresh_hosts();self.refresh_audit();QMessageBox.information(self,"在线测试",f"测试完成。\n在线 / 可达：{online} 台\n离线 / 不可达：{offline} 台\n\n注意：Ping/445/3389 仅用于发现和识别；正式分发要求 WinRM 5985/5986 可达并且账号认证通过。")
+        records={h.host:h for h in db.list_hosts()}
+        ping_failed=[]
+        for host,result in getattr(self,"_host_status_results",{}).items():
+            if not bool(getattr(result,"ping_ok",False)):
+                record=records.get(host)
+                name=(record.name or "").strip() if record else ""
+                ping_failed.append(f"{name}（{host}）" if name and name != host else host)
+        ping_failed.sort()
+        self._set_busy(False);self.refresh_hosts();self.refresh_audit()
+        message=f"测试完成。\n在线 / 可达：{online} 台\n离线 / 不可达：{offline} 台\nPing 不可达：{len(ping_failed)} 台"
+        if ping_failed:
+            message += "\n\nPing 不可达主机：\n" + "\n".join(f"• {host}" for host in ping_failed)
+            self._append_log("Ping 不可达主机：" + "、".join(ping_failed))
+        else:
+            message += "\n\nPing 全部通过。"
+        message += "\n\n注意：Ping/445/3389 仅用于发现和识别；正式分发要求 WinRM 5985/5986 可达并且账号认证通过。"
+        QMessageBox.information(self,"网络状态测试结果",message)
 
     def _verify_inventory_names(self):
         hosts=self._selected_inventory_hosts()

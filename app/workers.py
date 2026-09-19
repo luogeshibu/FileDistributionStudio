@@ -6,6 +6,7 @@ import platform
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from time import monotonic
 
 from PySide6.QtCore import QThread, Signal
 
@@ -218,6 +219,7 @@ class HostStatusTestThread(QThread):
 class WinRMTargetTestThread(QThread):
     result = Signal(str, bool, str)  # host, success, message
     completed = Signal(int, int)
+    TEST_TIMEOUT_SEC = 10
 
     def __init__(self, hosts: list[str], target_paths: list[str] | str,
                  credentials: dict[str, tuple[str, str, str]], use_https: bool = False,
@@ -238,15 +240,25 @@ class WinRMTargetTestThread(QThread):
         username, password, source = self.credentials.get(host, ("", "", "未设置"))
         if not username or not password:
             return host, False, f"{source}缺少用户名或密码。"
+        started = monotonic()
         try:
             resolved_username = qualify_windows_username(username, self.host_names.get(host, ""))
             plan = RemoteActionPlan(
                 enabled=False, use_https=self.use_https, port=self.port,
-                username=resolved_username, password=password, command_timeout=30,
+                username=resolved_username, password=password,
+                command_timeout=self.TEST_TIMEOUT_SEC,
+                # pywinrm 要求 read_timeout_sec 严格大于 operation_timeout_sec；
+                # 多出的 1 秒只是协议余量，超过 10 秒仍由本线程判定为失败。
+                read_timeout_sec=self.TEST_TIMEOUT_SEC + 1,
             )
             r = test_winrm_targets(host, self.target_paths, plan)
             return host, True, f"{r['message']} 凭据来源：{source}；账号：{resolved_username}。"
         except Exception as e:
+            if monotonic() - started >= self.TEST_TIMEOUT_SEC - 0.25:
+                return host, False, (
+                    f"WinRM 测试超过 {self.TEST_TIMEOUT_SEC} 秒，已判定失败。"
+                    f"凭据来源：{source}；账号：{username}。"
+                )
             return host, False, f"凭据来源：{source}；账号：{username}。{e}"
 
     def run(self):
