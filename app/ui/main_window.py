@@ -7,7 +7,7 @@ import logging
 import ipaddress
 import subprocess
 
-from PySide6.QtCore import Qt, QSize, QTimer, QItemSelectionModel, QStandardPaths
+from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel, QLineEdit,
@@ -32,7 +32,7 @@ from .dialogs import (HostEditDialog, TaskDetailDialog, HostnameCredentialDialog
                       SftpMappingDialog, WinRMSetupDialog, WinRMHostCredentialDialog, RemoteProcessBrowserDialog,
                       RemoteBackupBrowserDialog)
 from .theme import app_icon
-from .widgets import PasswordLineEdit, LocalFileTable, RemoteFileDropTable, configure_full_content_table, fit_full_content_table
+from .widgets import PasswordLineEdit, RemoteFileDropTable, configure_full_content_table, fit_full_content_table
 from .locale_zh import (status_text, source_text, mode_text, group_text, audit_category_text, action_text,
                          hostname_source_text)
 from ..services.host_status import status_label as online_status_text, smb_status_label, winrm_status_label
@@ -530,7 +530,7 @@ class MainWindow(QMainWindow):
 
         remote, remote_l = card(
             "WinRM 连接与远程操作",
-            "执行顺序：结束目标进程 → 分发前命令 → 文件分发 → 分发后命令。",
+            "执行顺序：结束目标进程 → 分发前命令 → 文件分发 → 分发后命令；模块开关只决定是否加入本次任务，不影响配置编辑。",
         )
         rt=QHBoxLayout(); self.remote_enabled=task_toggle("程序 / 服务前后操作", bool(self.settings.winrm_remote_actions_enabled)); self.remote_https=QCheckBox("HTTPS"); self.remote_port=QSpinBox(); self.remote_port.setRange(1,65535); self.remote_port.setValue(int(self.settings.winrm_port or 5985)); self.remote_https.toggled.connect(lambda c:self.remote_port.setValue(5986 if c else 5985)); self.remote_https.setChecked(bool(self.settings.winrm_use_https)); self.remote_port.setValue(int(self.settings.winrm_port or (5986 if self.remote_https.isChecked() else 5985)))
         self.remote_https.setVisible(False); self.remote_port.setVisible(False)
@@ -636,8 +636,9 @@ class MainWindow(QMainWindow):
         root.addWidget(src); root.addWidget(target); root.addWidget(opts); root.addWidget(backup_card); root.addWidget(remote); root.addWidget(version_card); root.addWidget(run_card); root.addStretch(1)
         for w in (self.chk_distribution,self.chk_backup,self.remote_enabled,self.version_after_distribution):
             w.toggled.connect(self._refresh_task_plan)
-        self.remote_enabled.toggled.connect(lambda enabled:self.remote_pipeline.setEnabled(bool(enabled)))
-        self.remote_pipeline.setEnabled(bool(self.remote_enabled.isChecked()))
+        # 与备份、版本检查模块保持一致：开关只控制本次任务是否执行，
+        # 不禁用配置区，避免用户关闭模块后无法提前编辑和保存参数。
+        self.remote_pipeline.setEnabled(True)
         self._refresh_task_plan()
         return wrap_scroll(canvas)
 
@@ -2155,78 +2156,40 @@ class MainWindow(QMainWindow):
 
         help_label = QLabel(
             "一次只连接 1 台主机，使用“文件分发 → Windows 目标主机”中相同的有效 WinRM 凭据。"
-            "左侧是本机，右侧是远程主机；可把 Windows 资源管理器中的文件/文件夹直接拖到右侧上传。"
+            "本机文件可直接从 Windows 资源管理器拖入远程列表上传；下载时先选择本地目录，再选择远程文件。"
         )
         help_label.setWordWrap(True); help_label.setObjectName("Muted"); l.addWidget(help_label)
 
-        panes = QHBoxLayout(); panes.setSpacing(12)
+        transfer = QHBoxLayout(); transfer.setSpacing(8)
+        transfer.addWidget(QLabel("下载到本地目录"))
+        initial_download_dir = (getattr(self.settings, "remote_file_local_path", "") or "").strip()
+        if not initial_download_dir or not Path(initial_download_dir).is_dir():
+            initial_download_dir = str(Path.home())
+        self.remote_download_path = QLineEdit(initial_download_dir)
+        self.remote_download_path.setClearButtonEnabled(False)
+        self.remote_download_path.setToolTip("远程文件下载到此目录。")
+        self.remote_download_browse_btn = QPushButton("选择目录")
+        self.remote_download_browse_btn.clicked.connect(self._remote_choose_download_directory)
+        transfer.addWidget(self.remote_download_path, 1)
+        transfer.addWidget(self.remote_download_browse_btn)
 
-        # Local pane
-        local_box, local_l = card("本机", "文件和文件夹都可以选择；Ctrl/Shift 可多选，双击文件夹进入，也可以直接拖到右侧上传。")
-        local_nav = QHBoxLayout(); local_nav.setSpacing(6)
-        self.remote_local_pc_btn = QPushButton("此电脑"); self.remote_local_pc_btn.setToolTip("显示本机所有可用磁盘。")
-        self.remote_local_pc_btn.clicked.connect(self._remote_local_show_drives)
-        self.remote_local_up_btn = QPushButton("上一级"); self.remote_local_up_btn.clicked.connect(self._remote_local_up)
-        self.remote_local_path = QLineEdit()
-        self.remote_local_path.setClearButtonEnabled(False)
-        self.remote_local_path.returnPressed.connect(self._remote_local_go)
-        self.remote_local_browse_btn = QPushButton("选择…")
-        self.remote_local_browse_btn.setToolTip("选择本机文件或文件夹。文件可多选；选中后会在左侧列表中定位并选中。")
-        choose_menu = QMenu(self.remote_local_browse_btn)
-        choose_files_action = choose_menu.addAction("选择文件…")
-        choose_files_action.triggered.connect(self._remote_local_choose_files)
-        choose_dir_action = choose_menu.addAction("选择文件夹…")
-        choose_dir_action.triggered.connect(self._remote_local_choose_directory)
-        self.remote_local_browse_btn.setMenu(choose_menu)
-        self.remote_local_refresh_btn = QPushButton("刷新"); self.remote_local_refresh_btn.clicked.connect(self._refresh_remote_local_table)
-        local_nav.addWidget(self.remote_local_pc_btn); local_nav.addWidget(self.remote_local_up_btn); local_nav.addWidget(self.remote_local_path, 1)
-        local_nav.addWidget(self.remote_local_browse_btn); local_nav.addWidget(self.remote_local_refresh_btn)
-        local_l.addLayout(local_nav)
-        local_filter = QHBoxLayout(); local_filter.setSpacing(6)
-        local_filter.addWidget(QLabel("搜索"))
-        self.remote_local_search = QLineEdit()
-        self.remote_local_search.setPlaceholderText("按名称、类型或路径搜索当前目录")
-        self.remote_local_search.setClearButtonEnabled(True)
-        self.remote_local_search.textChanged.connect(
-            lambda text: self._filter_remote_file_table(self.remote_local_table, text)
-        )
-        local_filter.addWidget(self.remote_local_search, 1)
-        self.remote_local_check_visible_btn = QPushButton("勾选当前结果")
-        self.remote_local_check_visible_btn.clicked.connect(
-            lambda: self._set_visible_file_rows_checked(self.remote_local_table, True)
-        )
-        self.remote_local_uncheck_btn = QPushButton("清除勾选")
-        self.remote_local_uncheck_btn.clicked.connect(
-            lambda: self._set_visible_file_rows_checked(self.remote_local_table, False)
-        )
-        local_filter.addWidget(self.remote_local_check_visible_btn)
-        local_filter.addWidget(self.remote_local_uncheck_btn)
-        local_l.addLayout(local_filter)
-        self.remote_local_table = LocalFileTable(0, 4)
-        self.remote_local_table.setHorizontalHeaderLabels(["名称", "类型", "大小", "修改时间"])
-        self.remote_local_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.remote_local_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.remote_local_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.remote_local_table.setDragEnabled(True)
-        self.remote_local_table.verticalHeader().setVisible(False)
-        configure_full_content_table(self.remote_local_table)
-        self.remote_local_table.cellDoubleClicked.connect(self._remote_local_double_clicked)
-        local_l.addWidget(self.remote_local_table, 1)
-        panes.addWidget(local_box, 1)
-
-        # Transfer controls
-        controls = QVBoxLayout(); controls.setSpacing(8); controls.addStretch(1)
-        self.remote_upload_btn = QPushButton("上传  →")
-        self.remote_upload_btn.setToolTip("把左侧选中的本地文件/目录上传到右侧当前远程目录。也可以直接把资源管理器文件拖到右侧。")
-        self.remote_upload_btn.clicked.connect(self._remote_upload_selected)
-        self.remote_download_btn = QPushButton("←  下载")
-        self.remote_download_btn.setToolTip("把右侧选中的远程文件/目录下载到左侧当前本机目录。")
+        self.remote_upload_btn = QPushButton("选择文件上传")
+        self.remote_upload_btn.setToolTip("从本机选择文件或文件夹上传；也可以直接从 Windows 资源管理器拖入右侧远程列表。")
+        upload_menu = QMenu(self.remote_upload_btn)
+        upload_files_action = upload_menu.addAction("选择文件…")
+        upload_files_action.triggered.connect(self._remote_choose_upload_files)
+        upload_dir_action = upload_menu.addAction("选择文件夹…")
+        upload_dir_action.triggered.connect(self._remote_choose_upload_directory)
+        self.remote_upload_btn.setMenu(upload_menu)
+        self.remote_download_btn = QPushButton("下载选中")
+        self.remote_download_btn.setToolTip("把右侧选中的远程文件/目录下载到上方指定的本地目录。")
         self.remote_download_btn.clicked.connect(self._remote_download_selected)
-        controls.addWidget(self.remote_upload_btn); controls.addWidget(self.remote_download_btn); controls.addStretch(1)
-        panes.addLayout(controls)
+        transfer.addWidget(self.remote_upload_btn)
+        transfer.addWidget(self.remote_download_btn)
+        l.addLayout(transfer)
 
         # Remote pane
-        remote_box, remote_l = card("远程主机", "双击文件夹进入；支持上传、下载、新建目录、重命名和删除。")
+        remote_box, remote_l = card("远程主机", "双击文件夹进入；可从 Windows 资源管理器拖入文件/文件夹上传，也可选择远程项目后下载。")
         remote_nav = QHBoxLayout(); remote_nav.setSpacing(6)
         self.remote_file_pc_btn = QPushButton("远程电脑")
         self.remote_file_pc_btn.setToolTip("返回远程电脑首页，显示常用位置和所有可用磁盘。")
@@ -2274,15 +2237,14 @@ class MainWindow(QMainWindow):
         self.remote_delete_btn = QPushButton("删除"); self.remote_delete_btn.clicked.connect(self._remote_file_delete)
         remote_actions.addWidget(self.remote_mkdir_btn); remote_actions.addWidget(self.remote_rename_btn); remote_actions.addWidget(self.remote_delete_btn); remote_actions.addStretch(1)
         remote_l.addLayout(remote_actions)
-        panes.addWidget(remote_box, 1)
-        l.addLayout(panes, 1)
+        l.addWidget(remote_box, 1)
 
-        transfer = QHBoxLayout(); transfer.setSpacing(8)
+        progress_row = QHBoxLayout(); progress_row.setSpacing(8)
         self.remote_file_progress = QProgressBar(); self.remote_file_progress.setRange(0,100); self.remote_file_progress.setValue(0)
         self.remote_file_progress.setFormat("就绪")
         self.remote_file_clear_log_btn = QPushButton("清空日志"); self.remote_file_clear_log_btn.clicked.connect(lambda: self.remote_file_log.clear())
-        transfer.addWidget(self.remote_file_progress, 1); transfer.addWidget(self.remote_file_clear_log_btn)
-        l.addLayout(transfer)
+        progress_row.addWidget(self.remote_file_progress, 1); progress_row.addWidget(self.remote_file_clear_log_btn)
+        l.addLayout(progress_row)
         self.remote_file_log = QPlainTextEdit(); self.remote_file_log.setReadOnly(True); self.remote_file_log.setMaximumHeight(130)
         l.addWidget(self.remote_file_log)
 
@@ -2290,12 +2252,6 @@ class MainWindow(QMainWindow):
         self._remote_file_thread = None
         self._remote_file_connected_host = ""
         self._refresh_remote_file_hosts()
-        initial_local = (getattr(self.settings, "remote_file_local_path", "") or "").strip()
-        if initial_local and Path(initial_local).is_dir():
-            self.remote_local_path.setText(initial_local)
-            self._refresh_remote_local_table()
-        else:
-            self._remote_local_show_drives()
         return canvas
 
     def _remote_file_append_log(self, text: str):
@@ -2348,7 +2304,8 @@ class MainWindow(QMainWindow):
     def _remote_file_set_busy(self, busy: bool, text=""):
         widgets = [self.remote_file_host_combo, self.remote_file_connect_btn, self.remote_file_pc_btn, self.remote_file_up_btn,
                    self.remote_file_path, self.remote_file_refresh_btn, self.remote_upload_btn,
-                   self.remote_download_btn, self.remote_mkdir_btn, self.remote_rename_btn, self.remote_delete_btn,
+                   self.remote_download_path, self.remote_download_browse_btn, self.remote_download_btn,
+                   self.remote_mkdir_btn, self.remote_rename_btn, self.remote_delete_btn,
                    self.remote_file_search, self.remote_file_check_visible_btn, self.remote_file_uncheck_btn]
         for w in widgets:
             w.setEnabled(not busy)
@@ -2473,174 +2430,30 @@ class MainWindow(QMainWindow):
         self._remote_file_append_log(f"{kind} 完成。")
         if kind in ("upload","mkdir","delete","rename"):
             QTimer.singleShot(80, self._remote_file_refresh)
-        if kind=="download":
-            self._refresh_remote_local_table()
-
-    def _remote_local_go(self):
-        raw=self.remote_local_path.text().strip()
-        if raw in ("", "此电脑"):
-            self._remote_local_show_drives(); return
-        path=Path(raw).expanduser()
-        if not path.is_dir():
-            QMessageBox.warning(self, "本机目录", f"目录不存在：\n{path}"); return
-        self.remote_local_path.setText(str(path)); self._refresh_remote_local_table()
-
-    def _remote_local_show_drives(self):
-        self.remote_local_path.setText("此电脑")
-        self.remote_local_table.setRowCount(0)
-
-        # Windows 常用目录使用 Qt/系统解析后的真实路径，不硬编码 C:\Users\<name>。
-        # 因此桌面/下载等被 OneDrive 或组策略重定向后仍可正确进入。
-        common_locations = [
-            ("桌面", QStandardPaths.DesktopLocation),
-            ("下载", QStandardPaths.DownloadLocation),
-            ("文档", QStandardPaths.DocumentsLocation),
-            ("图片", QStandardPaths.PicturesLocation),
-            ("音乐", QStandardPaths.MusicLocation),
-            ("视频", QStandardPaths.MoviesLocation),
-        ]
-        seen=set()
-        for label, location in common_locations:
-            path=QStandardPaths.writableLocation(location)
-            if not path or not os.path.isdir(path):
-                continue
-            norm=os.path.normcase(os.path.normpath(path))
-            if norm in seen:
-                continue
-            seen.add(norm)
-            r=self.remote_local_table.rowCount(); self.remote_local_table.insertRow(r)
-            item=self._checkable_file_item(label)
-            item.setData(LocalFileTable.ROLE_PATH, path); item.setData(Qt.UserRole+302, True); item.setData(Qt.UserRole+303, False)
-            item.setToolTip(path)
-            self.remote_local_table.setItem(r,0,item)
-            self.remote_local_table.setItem(r,1,QTableWidgetItem("常用位置"))
-            self.remote_local_table.setItem(r,2,QTableWidgetItem("—"))
-            self.remote_local_table.setItem(r,3,QTableWidgetItem(path))
-
-        drives=[]
-        if os.name == "nt":
-            for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-                root=f"{letter}:\\"
-                try:
-                    if os.path.exists(root):
-                        drives.append(root)
-                except Exception:
-                    pass
-        else:
-            drives=[os.path.abspath(os.sep)]
-        for drive in drives:
-            try:
-                import shutil
-                usage=shutil.disk_usage(drive)
-                size_text=f"可用 {human_bytes(usage.free)} / {human_bytes(usage.total)}"
-            except Exception:
-                size_text="—"
-            r=self.remote_local_table.rowCount(); self.remote_local_table.insertRow(r)
-            item=self._checkable_file_item(drive)
-            item.setData(LocalFileTable.ROLE_PATH, drive); item.setData(Qt.UserRole+302, True); item.setData(Qt.UserRole+303, True)
-            self.remote_local_table.setItem(r,0,item)
-            self.remote_local_table.setItem(r,1,QTableWidgetItem("磁盘"))
-            self.remote_local_table.setItem(r,2,QTableWidgetItem(size_text))
-            self.remote_local_table.setItem(r,3,QTableWidgetItem(""))
-        fit_full_content_table(self.remote_local_table)
-        self._filter_remote_file_table(self.remote_local_table, self.remote_local_search.text())
-
-    def _remote_local_choose_files(self):
-        start=self.remote_local_path.text().strip()
-        if start == "此电脑" or not Path(start).is_dir(): start=str(Path.home())
-        paths, _ = QFileDialog.getOpenFileNames(self, "选择要上传的本机文件（可多选）", start, "所有文件 (*.*)")
-        if paths:
-            self._remote_local_reveal_and_select(paths)
-
-    def _remote_local_choose_directory(self):
-        start=self.remote_local_path.text().strip()
-        if start == "此电脑" or not Path(start).is_dir(): start=str(Path.home())
-        path=QFileDialog.getExistingDirectory(self, "选择要上传的本机文件夹", start)
+    def _remote_choose_download_directory(self):
+        start = self.remote_download_path.text().strip()
+        if not Path(start).is_dir():
+            start = str(Path.home())
+        path = QFileDialog.getExistingDirectory(self, "选择远程文件下载目录", start)
         if path:
-            self._remote_local_reveal_and_select([path])
+            self.remote_download_path.setText(str(Path(path)))
+            self.settings.remote_file_local_path = str(Path(path))
+            self.settings.save()
 
-    def _remote_local_reveal_and_select(self, paths):
-        paths=[str(Path(p)) for p in paths if p]
-        if not paths: return
-        parents={str(Path(p).parent) for p in paths}
-        parent=next(iter(parents)) if len(parents)==1 else str(Path(paths[0]).parent)
-        self.remote_local_path.setText(parent)
-        self._refresh_remote_local_table()
-        wanted={os.path.normcase(os.path.normpath(p)) for p in paths}
-        self.remote_local_table.clearSelection()
-        first_row=None
-        for r in range(self.remote_local_table.rowCount()):
-            item=self.remote_local_table.item(r,0)
-            item_path=str(item.data(LocalFileTable.ROLE_PATH) or "") if item else ""
-            if item_path and os.path.normcase(os.path.normpath(item_path)) in wanted:
-                idx=self.remote_local_table.model().index(r, 0)
-                self.remote_local_table.selectionModel().select(idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
-                if first_row is None: first_row=r
-        if first_row is not None:
-            self.remote_local_table.scrollToItem(self.remote_local_table.item(first_row,0), QAbstractItemView.PositionAtCenter)
+    def _remote_choose_upload_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择要上传的本机文件（可多选）", str(Path.home()), "所有文件 (*.*)"
+        )
+        if paths:
+            self._remote_file_drop_upload(paths)
 
-    def _remote_local_browse(self):
-        # 兼容旧调用：默认进入“选择文件夹”。
-        self._remote_local_choose_directory()
-
-    def _remote_local_up(self):
-        raw=self.remote_local_path.text().strip()
-        if raw in ("", "此电脑"):
-            self._remote_local_show_drives(); return
-        p=Path(raw)
-        if os.name == "nt" and p.parent == p:
-            self._remote_local_show_drives(); return
-        # Windows 盘符根目录（C:\）的上一级是“此电脑”。
-        if os.name == "nt" and len(str(p)) <= 3 and str(p)[1:2] == ":":
-            self._remote_local_show_drives(); return
-        parent=p.parent
-        if parent==p:
-            self._remote_local_show_drives(); return
-        self.remote_local_path.setText(str(parent)); self._refresh_remote_local_table()
-
-    def _refresh_remote_local_table(self):
-        raw=self.remote_local_path.text().strip()
-        if raw == "此电脑":
-            self._remote_local_show_drives(); return
-        p=Path(raw or Path.home()).expanduser()
-        if not p.is_dir(): return
-        self.settings.remote_file_local_path=str(p); self.settings.save()
-        self.remote_local_table.setRowCount(0)
-        try:
-            entries=sorted(p.iterdir(), key=lambda x:(not x.is_dir(), x.name.lower()))
-        except Exception as exc:
-            self._remote_file_append_log(f"读取本机目录失败：{exc}"); return
-        for entry in entries:
-            try:
-                stat=entry.stat(); is_dir=entry.is_dir()
-                r=self.remote_local_table.rowCount(); self.remote_local_table.insertRow(r)
-                item=self._checkable_file_item(entry.name); item.setData(LocalFileTable.ROLE_PATH,str(entry)); item.setData(Qt.UserRole+302,is_dir); item.setData(Qt.UserRole+303,False); self.remote_local_table.setItem(r,0,item)
-                self.remote_local_table.setItem(r,1,QTableWidgetItem("文件夹" if is_dir else "文件"))
-                self.remote_local_table.setItem(r,2,QTableWidgetItem("—" if is_dir else human_bytes(stat.st_size)))
-                self.remote_local_table.setItem(r,3,QTableWidgetItem(datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")))
-            except Exception:
-                continue
-        fit_full_content_table(self.remote_local_table)
-        self._filter_remote_file_table(self.remote_local_table, self.remote_local_search.text())
-
-    def _remote_local_double_clicked(self, row: int, _column: int):
-        item=self.remote_local_table.item(row,0)
-        if item and bool(item.data(Qt.UserRole+302)):
-            path=str(item.data(LocalFileTable.ROLE_PATH) or "")
-            if path:
-                self.remote_local_path.setText(path); self._refresh_remote_local_table()
-
-    def _selected_local_paths(self):
-        return self._checked_or_selected_paths(self.remote_local_table, LocalFileTable.ROLE_PATH)
+    def _remote_choose_upload_directory(self):
+        path = QFileDialog.getExistingDirectory(self, "选择要上传的本机文件夹", str(Path.home()))
+        if path:
+            self._remote_file_drop_upload([path])
 
     def _selected_remote_paths(self):
         return self._checked_or_selected_paths(self.remote_file_table, Qt.UserRole+401)
-
-    def _remote_upload_selected(self):
-        paths=self._selected_local_paths()
-        if not paths:
-            QMessageBox.information(self,"远程文件","请先在左侧选择要上传的文件或文件夹。") ; return
-        self._remote_file_drop_upload(paths)
 
     def _remote_file_drop_upload(self, paths):
         remote_dir=self.remote_file_path.text().strip().replace("/", "\\")
@@ -2656,7 +2469,10 @@ class MainWindow(QMainWindow):
         paths=self._selected_remote_paths()
         if not paths:
             QMessageBox.information(self,"远程文件","请先在右侧选择要下载的文件或文件夹。") ; return
-        local_dir=self.remote_local_path.text().strip()
+        local_dir=self.remote_download_path.text().strip()
+        if not Path(local_dir).is_dir():
+            QMessageBox.warning(self,"本机目录",f"下载目标目录不存在：\n{local_dir}")
+            return
         if QMessageBox.question(self,"确认下载",f"下载 {len(paths)} 项到本机：\n{local_dir}\n\n确定继续？", QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes:
             return
         self._start_remote_file_op("DOWNLOAD", local_path=local_dir, paths=paths)
@@ -3372,7 +3188,7 @@ class MainWindow(QMainWindow):
             "远程进程选择器",
             "在“文件分发 → WinRM 连接与远程操作 → ① 结束目标进程”点击“选择远程进程”，程序会通过 WinRM 只读读取参考主机当前进程，并同时显示任务管理器友好名称、实际 exe 镜像名、实例数、PID 和可执行路径。窗口不会结束任何进程，只有正式分发进入第①步时才执行。",
         )
-        process_help=QLabel("选择结果按 exe 镜像名保存，例如 graphic.exe。正式执行使用 taskkill /F /T /IM，因此同名 exe 的多个实例会一起结束；多主机任务会在所有勾选目标主机上执行同一组镜像名。建议先通过搜索定位 ADMS/厂商应用，不要随意选择 Windows 核心系统进程。")
+        process_help=QLabel("选择结果按 exe 镜像名保存，例如 graphic.exe。正式执行会按镜像名递归收集并结束全部实例及其子进程，子进程优先处理；多主机任务会在所有勾选目标主机上执行同一组镜像名。建议先通过搜索定位 ADMS/厂商应用，不要随意选择 Windows 核心系统进程。")
         process_help.setWordWrap(True); process_help.setObjectName("Muted"); lp.addWidget(process_help); root.addWidget(p)
 
         w,lw=card(

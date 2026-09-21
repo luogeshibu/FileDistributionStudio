@@ -1218,7 +1218,7 @@ class RemoteProcessBrowserDialog(QDialog):
         self.status.setWordWrap(True)
         self.status.setStyleSheet("color:#667A8A;")
         self.note = QLabel(
-            "注意：正式执行按“镜像名”调用 taskkill /F /T /IM。若同一 exe 有多个实例，选择一次会结束该 exe 的全部实例；"
+            "注意：正式执行按“镜像名”递归收集并结束全部实例及其子进程，子进程会优先处理；"
             "多主机任务会在所有勾选目标主机上执行同一组镜像名。"
         )
         self.note.setWordWrap(True)
@@ -1307,7 +1307,7 @@ class RemoteProcessBrowserDialog(QDialog):
             return
 
         processes = list(payload.get("data") or [])
-        # 与正式 taskkill /IM 语义一致：按镜像名聚合，而不是让用户误以为只结束一个 PID。
+        # 与正式递归进程树清理语义一致：按镜像名聚合，而不是让用户误以为只结束一个 PID。
         grouped = {}
         for proc in processes:
             image = str(proc.get("image_name", "") or "").strip()

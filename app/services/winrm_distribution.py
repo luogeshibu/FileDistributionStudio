@@ -264,7 +264,10 @@ def distribute_plan_to_host_winrm(
     transferred = new_files = updated_files = skipped_files = failed_files = 0
     last_error = ""
     distribution_success = False
-    pre_actions_started = False
+    # 失败恢复只适用于“分发前准备已经完整成功，但文件分发阶段失败”。
+    # 如果结束进程或分发前 CMD 本身失败，不能直接执行 sys_ctl start，否则会
+    # 把原始故障扩大成“启动失败”，甚至让目标程序处于不一致状态。
+    pre_actions_completed = False
     total_files = sum(len(pm.manifest) for pm in prepared_mappings)
     done_files = 0
     total_bytes = sum(pm.total_bytes for pm in prepared_mappings)
@@ -302,8 +305,8 @@ def distribute_plan_to_host_winrm(
         if cancel_cb():
             raise RuntimeError("用户已取消任务")
 
-        pre_actions_started = bool(plan.enabled)
         _run_pre_actions(executor, task_id, host, plan, log_cb, audit_root)
+        pre_actions_completed = bool(plan.enabled)
 
         for pm, temp_root in zip(prepared_mappings, temp_roots):
             mapping = pm.mapping
@@ -511,10 +514,16 @@ def distribute_plan_to_host_winrm(
                         last_error, task_id=task_id, host=host,
                         details={"transport": "WINRM"})
         try:
-            if plan.enabled and pre_actions_started and plan.post_on_failure:
+            if plan.enabled and pre_actions_completed and plan.post_on_failure:
                 post_errors = _run_post_actions(executor, task_id, host, plan, log_cb, audit_root)
                 if post_errors:
                     last_error += " | 分发后恢复：" + " ; ".join(post_errors)
+            elif plan.enabled and plan.post_on_failure and not pre_actions_completed:
+                audit.operation(
+                    audit_root, "WINRM", "POST_SKIP", "SKIPPED",
+                    "分发前准备未完整成功，已跳过分发后恢复命令，避免在 sys_ctl stop/进程清理失败后盲目启动程序。",
+                    task_id=task_id, host=host,
+                )
         except Exception as recovery_error:
             last_error += f" | 分发后恢复失败：{recovery_error}"
         db.finish_host(task_id, host, "FAILED", transferred, new_files, updated_files,

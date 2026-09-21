@@ -397,8 +397,25 @@ $payload | ConvertTo-Json -Compress -Depth 4
         status = self._audit(task_id, phase, action, audit_command, result)
         if status == "FAILED" and not allow_nonzero:
             detail = result["stderr"] or result["stdout"] or f"退出码={result['exit_code']}"
+            detail = self._command_failure_detail(command, detail)
             raise RuntimeError(f"交互式桌面命令执行失败 [{self.host}] {command}: {detail}")
         return result
+
+    @staticmethod
+    def _command_failure_detail(command: str, detail: str) -> str:
+        """补充厂商控制命令常见的状态顺序提示，但保留原始输出。"""
+        command_text = str(command or "").lower()
+        output_text = str(detail or "").lower()
+        notes = []
+        if "sys_ctl" in command_text and "start" in command_text and "sys_ctl stop" in output_text:
+            notes.append(
+                "目标程序要求先成功执行 sys_ctl stop，再执行当前启动命令；请检查分发前命令是否执行、命令工作目录是否正确，以及上一次任务是否中断"
+            )
+        if "was unexpected at this time" in output_text or "unexpected at this time" in output_text:
+            notes.append(
+                "目标机 CMD/厂商启动脚本报告了“& was unexpected at this time”，通常是批处理脚本条件块或环境变量中的 & 未正确转义；请在目标机相同工作目录中直接执行该命令检查脚本语法"
+            )
+        return f"{detail}；" + "；".join(notes) if notes else detail
 
     @staticmethod
     def _require_success(result: dict, action: str):
@@ -1199,6 +1216,7 @@ try {{
         status = self._audit(task_id, phase, action, audit_command, result)
         if status == "FAILED" and not allow_nonzero:
             detail = result["stderr"] or result["stdout"] or f"退出码={result['exit_code']}"
+            detail = self._command_failure_detail(command, detail)
             raise RuntimeError(f"远程命令执行失败 [{self.host}] {command}: {detail}")
         return result
 
@@ -1258,14 +1276,122 @@ try {{
         raise RuntimeError(f"服务在 {wait_seconds} 秒内未启动：{service_name}")
 
     def kill_process(self, task_id: str, image_name: str):
-        probe = self.run_cmd(f'tasklist /FI "IMAGENAME eq {image_name}" /NH')
-        probe_text = (probe["stdout"] + " " + probe["stderr"]).lower()
-        if image_name.lower() not in probe_text:
-            db.record_action(task_id, self.host, "PRE", "KILL_PROCESS",
-                             f'taskkill /F /IM "{image_name}"', "SKIPPED", 0,
-                             "进程当前未运行。", "", probe["duration_ms"])
+        image_name = (image_name or "").strip()
+        if not image_name:
             return
-        self.run_audited(task_id, "PRE", "KILL_PROCESS", f'taskkill /F /T /IM "{image_name}"')
+
+        # 不直接把 taskkill 的瞬时返回码当成最终结果。/T 在父进程或子进程
+        # 正好退出的竞态下可能返回“子进程无法终止”，即使整棵进程树已经没有
+        # 了；同时，单独按镜像名 taskkill 也不方便确认所有子进程是否真的清理。
+        # 这里一次读取进程快照，递归收集目标进程及其所有后代，按子进程优先
+        # 逐个强制结束，最后再次按镜像名确认是否仍有残留。
+        image_q = self.ps_quote(image_name)
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+$image = {image_q}
+$snapshot = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+$roots = @($snapshot | Where-Object {{ [string]$_.Name -ieq $image }})
+if ($roots.Count -eq 0) {{
+    [pscustomobject]@{{
+        Found = 0; Attempted = 0; Remaining = 0; RemainingPids = @(); Failures = @();
+        Message = '进程当前未运行。'
+    }} | ConvertTo-Json -Compress -Depth 4
+    exit 0
+}}
+
+$known = @{{}}
+$depth = @{{}}
+$queue = New-Object System.Collections.Queue
+foreach ($root in $roots) {{
+    $rootId = [int]$root.ProcessId
+    if (-not $known.ContainsKey($rootId)) {{
+        $known[$rootId] = $true
+        $depth[$rootId] = 0
+        $queue.Enqueue($rootId)
+    }}
+}}
+
+while ($queue.Count -gt 0) {{
+    $parentId = [int]$queue.Dequeue()
+    $parentDepth = [int]$depth[$parentId]
+    foreach ($child in @($snapshot | Where-Object {{ [int]$_.ParentProcessId -eq $parentId }})) {{
+        $childId = [int]$child.ProcessId
+        if (-not $known.ContainsKey($childId)) {{
+            $known[$childId] = $true
+            $depth[$childId] = $parentDepth + 1
+            $queue.Enqueue($childId)
+        }}
+    }}
+}}
+
+$ordered = @($known.Keys | Sort-Object {{ [int]$depth[[int]$_] }} -Descending)
+$failures = @()
+foreach ($procIdValue in $ordered) {{
+    $procId = [int]$procIdValue
+    try {{
+        Stop-Process -Id $procId -Force -ErrorAction Stop
+    }} catch {{
+        # 进程可能在遍历和终止之间已经退出；只有确认它仍然存在时才记录失败。
+        $alive = $false
+        try {{ Get-Process -Id $procId -ErrorAction Stop | Out-Null; $alive = $true }} catch {{}}
+        if ($alive) {{
+            try {{ & taskkill.exe /F /T /PID $procId 2>&1 | Out-Null }} catch {{}}
+            try {{ Get-Process -Id $procId -ErrorAction Stop | Out-Null }}
+            catch {{ $alive = $false }}
+        }}
+        if ($alive) {{ $failures += ('PID ' + $procId + ': ' + [string]$_.Exception.Message) }}
+    }}
+}}
+
+Start-Sleep -Milliseconds 250
+$remaining = @($snapshot | Where-Object {{ [string]$_.Name -ieq $image }})
+$liveSnapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+$remaining = @($liveSnapshot | Where-Object {{ [string]$_.Name -ieq $image }})
+$message = if ($remaining.Count -eq 0) {{ '目标进程及其子进程已清理。' }} else {{ '仍有目标进程残留。' }}
+[pscustomobject]@{{
+    Found = $roots.Count
+    Attempted = $ordered.Count
+    Remaining = $remaining.Count
+    RemainingPids = @($remaining | ForEach-Object {{ [int]$_.ProcessId }})
+    Failures = @($failures)
+    Message = $message
+}} | ConvertTo-Json -Compress -Depth 4
+"""
+        command = f'taskkill /F /T /IM "{image_name}" [递归进程树清理]'
+        result = self.run_ps(script)
+        if int(result.get("exit_code", 1)) != 0:
+            detail = result.get("stderr") or result.get("stdout") or f"退出码={result.get('exit_code')}"
+            db.record_action(task_id, self.host, "PRE", "KILL_PROCESS", command,
+                             "FAILED", int(result.get("exit_code", 1)), result.get("stdout", ""), detail,
+                             result.get("duration_ms", 0))
+            raise RuntimeError(f"递归结束进程失败 [{self.host}] {image_name}: {detail}")
+
+        try:
+            data = json.loads((result.get("stdout") or "").splitlines()[-1])
+        except Exception as exc:
+            detail = f"无法解析进程清理结果：{result.get('stdout', '') or result.get('stderr', '')}"
+            db.record_action(task_id, self.host, "PRE", "KILL_PROCESS", command,
+                             "FAILED", 1, result.get("stdout", ""), detail, result.get("duration_ms", 0))
+            raise RuntimeError(detail) from exc
+
+        remaining = int(data.get("Remaining", 0) or 0)
+        remaining_pids = ", ".join(str(x) for x in (data.get("RemainingPids") or []))
+        failures = "; ".join(str(x) for x in (data.get("Failures") or []))
+        if remaining:
+            detail = f"仍有 {remaining} 个 {image_name} 进程未结束"
+            if remaining_pids:
+                detail += f"（PID: {remaining_pids}）"
+            if failures:
+                detail += f"；原因：{failures}"
+            db.record_action(task_id, self.host, "PRE", "KILL_PROCESS", command,
+                             "FAILED", 1, result.get("stdout", ""), detail, result.get("duration_ms", 0))
+            raise RuntimeError(f"{detail}。请检查 ADMS 是否具有结束目标进程的权限。")
+
+        found = int(data.get("Found", 0) or 0)
+        status = "SUCCESS" if found else "SKIPPED"
+        message = str(data.get("Message") or ("进程当前未运行。" if not found else "目标进程及其子进程已清理。"))
+        db.record_action(task_id, self.host, "PRE", "KILL_PROCESS", command,
+                         status, 0, message, failures, result.get("duration_ms", 0))
 
 
 
