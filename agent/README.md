@@ -2,7 +2,7 @@
 
 这是目标 Windows 主机上的后台 Agent，计划替代 WinRM、RDP 和管理共享作为文件分发与远程操作通道。
 
-当前分支先提供基础服务接口：
+当前分支先提供基础服务接口和目标机安装脚本：
 
 - Windows Service 宿主；
 - 仅 HTTPS 监听，不默认启动明文 HTTP；
@@ -11,6 +11,24 @@
 - 流式文件上传、临时文件写入和原子替换；
 - 按 EXE 名称结束整个进程树；
 - 明确确认后强制重启目标主机。
+
+## 目标机安装
+
+将编译后的 `FileDistributionStudio.Agent.exe` 和 `Install-FdsAgent.ps1` 一起复制到目标机，
+在目标机的“管理员 PowerShell”中执行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\Install-FdsAgent.ps1 -AgentExePath .\FileDistributionStudio.Agent.exe -AllowedRoot 'D:\ADMS'
+```
+
+脚本会自动生成每台机器独立的自签名 HTTPS 证书、随机配对令牌、受保护的配置文件、
+Windows 防火墙入站规则和自动启动服务。脚本最后会显示配对令牌和证书指纹；把它们录入桌面端后，
+桌面端即可测试 Agent、执行进程树结束/强制重启操作；当前桌面端的正式多文件分发仍保留 WinRM 业务流程，
+待 Agent 的远程目录浏览、备份和完整校验接口完成后再切换，避免出现“界面显示 Agent、实际又偷偷走 WinRM”的混用。
+
+默认只允许写入 `C:\FDS-Data`。生产环境应通过 `-AllowedRoot` 明确限制到实际业务目录，
+不要把系统盘根目录、`Windows` 或整个用户目录加入允许范围。
 
 ## 配置原则
 
@@ -33,6 +51,10 @@ appsettings.example.json 仅用于说明字段，不包含可用凭据或证书�
     GET  /api/v1/health
     GET  /api/v1/status
     PUT  /api/v1/files?path=D%3A%5CADMS%5Cbin%5Cexample.zip
+    POST /api/v1/files/inspect
+         { "path": "D:\\ADMS\\bin\\example.zip", "includeSha256": true }
+    POST /api/v1/files/backup
+         { "sourcePath": "D:\\ADMS\\bin\\example.zip", "backupPath": "D:\\ADMS\\.fds_backup\\..." }
     POST /api/v1/operations/process/kill
          { "imageName": "GridExplorer.exe" }
     POST /api/v1/operations/restart

@@ -116,6 +116,38 @@ app.MapPut("/api/v1/files", async (HttpRequest request, string path, AgentOption
     }
 });
 
+app.MapPost("/api/v1/files/inspect", (FileInspectRequest request, AgentOptions config) =>
+{
+    if (!TryResolveAllowedPath(config, request.Path, out var path, out var error))
+        return Results.BadRequest(new { error });
+    if (!File.Exists(path))
+        return Results.Ok(new { exists = false, size = 0L, sha256 = "" });
+    var info = new FileInfo(path);
+    var hash = request.IncludeSha256 ? ComputeSha256(path) : "";
+    return Results.Ok(new { exists = true, size = info.Length, sha256 = hash });
+});
+
+app.MapPost("/api/v1/files/backup", (FileBackupRequest request, AgentOptions config) =>
+{
+    if (!TryResolveAllowedPath(config, request.SourcePath, out var source, out var sourceError))
+        return Results.BadRequest(new { error = sourceError });
+    if (!TryResolveAllowedPath(config, request.BackupPath, out var backup, out var backupError))
+        return Results.BadRequest(new { error = backupError });
+    if (!File.Exists(source))
+        return Results.NotFound(new { error = "待备份文件不存在。" });
+    try
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+        if (!File.Exists(backup))
+            File.Copy(source, backup, overwrite: false);
+        return Results.Ok(new { path = backup, bytes = new FileInfo(backup).Length, sha256 = ComputeSha256(backup) });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"文件备份失败：{ex.Message}", statusCode: StatusCodes.Status500InternalServerError);
+    }
+});
+
 app.MapPost("/api/v1/operations/process/kill", (KillProcessRequest request, ProcessOperations processes) =>
 {
     var result = processes.KillByImageName(request.ImageName);
@@ -217,5 +249,13 @@ static void TryDelete(string path)
     try { if (File.Exists(path)) File.Delete(path); } catch { /* cleanup is best effort */ }
 }
 
+static string ComputeSha256(string path)
+{
+    using var stream = File.OpenRead(path);
+    return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+}
+
 public sealed record KillProcessRequest(string ImageName);
 public sealed record RestartRequest(bool Force);
+public sealed record FileInspectRequest(string Path, bool IncludeSha256 = true);
+public sealed record FileBackupRequest(string SourcePath, string BackupPath);

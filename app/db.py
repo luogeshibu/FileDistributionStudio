@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS hosts (
     winrm_port_ok INTEGER NOT NULL DEFAULT 0,
     smb_status TEXT NOT NULL DEFAULT 'UNTESTED',
     winrm_status TEXT NOT NULL DEFAULT 'UNTESTED',
+    agent_port INTEGER NOT NULL DEFAULT 8743,
+    agent_status TEXT NOT NULL DEFAULT 'UNTESTED',
+    agent_certificate_sha256 TEXT NOT NULL DEFAULT '',
+    agent_last_test_at TEXT NOT NULL DEFAULT '',
     last_test_at TEXT NOT NULL DEFAULT ''
 );
 
@@ -207,6 +211,10 @@ def init_db():
         _ensure_column(c, "hosts", "winrm_port_ok", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(c, "hosts", "smb_status", "TEXT NOT NULL DEFAULT 'UNTESTED'")
         _ensure_column(c, "hosts", "winrm_status", "TEXT NOT NULL DEFAULT 'UNTESTED'")
+        _ensure_column(c, "hosts", "agent_port", "INTEGER NOT NULL DEFAULT 8743")
+        _ensure_column(c, "hosts", "agent_status", "TEXT NOT NULL DEFAULT 'UNTESTED'")
+        _ensure_column(c, "hosts", "agent_certificate_sha256", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(c, "hosts", "agent_last_test_at", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(c, "hosts", "last_test_at", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(c, "task_files", "mapping_id", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(c, "task_files", "source_path", "TEXT NOT NULL DEFAULT ''")
@@ -225,8 +233,9 @@ def upsert_host(host: HostRecord):
             '''
             INSERT INTO hosts(name,host,group_name,target_mode,default_target,os_hint,last_seen,notes,
                               hostname_source,hostname_verified,hostname_note,online_status,ping_ok,
-                              smb_port_ok,rdp_port_ok,winrm_port_ok,smb_status,winrm_status,last_test_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                              smb_port_ok,rdp_port_ok,winrm_port_ok,smb_status,winrm_status,
+                              agent_port,agent_status,agent_certificate_sha256,agent_last_test_at,last_test_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(host) DO UPDATE SET
               name=excluded.name,
               group_name=excluded.group_name,
@@ -245,13 +254,19 @@ def upsert_host(host: HostRecord):
               winrm_port_ok=excluded.winrm_port_ok,
               smb_status=excluded.smb_status,
               winrm_status=excluded.winrm_status,
+              agent_port=excluded.agent_port,
+              agent_status=excluded.agent_status,
+              agent_certificate_sha256=excluded.agent_certificate_sha256,
+              agent_last_test_at=excluded.agent_last_test_at,
               last_test_at=excluded.last_test_at
             ''',
             (host.name, host.host, host.group_name, host.target_mode, host.default_target,
              host.os_hint, host.last_seen, host.notes, host.hostname_source,
              int(bool(host.hostname_verified)), host.hostname_note, host.online_status,
              int(bool(host.ping_ok)), int(bool(host.smb_port_ok)), int(bool(host.rdp_port_ok)),
-             int(bool(host.winrm_port_ok)), host.smb_status, host.winrm_status, host.last_test_at),
+             int(bool(host.winrm_port_ok)), host.smb_status, host.winrm_status,
+             int(host.agent_port or 8743), host.agent_status, host.agent_certificate_sha256,
+             host.agent_last_test_at, host.last_test_at),
         )
 
 
@@ -270,6 +285,15 @@ def mark_host_hostname_verification_failed(host: str, note: str = ""):
         c.execute(
             """UPDATE hosts SET hostname_verified=0, hostname_note=?, last_seen=? WHERE host=?""",
             (note or "WinRM 主机名验证失败。", datetime.now().isoformat(timespec="seconds"), host),
+        )
+
+
+def update_host_agent_status(host: str, status: str, tested_at: str = ""):
+    with _conn() as c:
+        c.execute(
+            "UPDATE hosts SET agent_status=?, agent_last_test_at=?, last_test_at=? WHERE host=?",
+            (status or "UNTESTED", tested_at or datetime.now().isoformat(timespec="seconds"),
+             tested_at or datetime.now().isoformat(timespec="seconds"), host),
         )
 
 

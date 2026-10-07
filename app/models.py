@@ -26,6 +26,10 @@ class HostRecord:
     winrm_port_ok: int = 0
     smb_status: str = "UNTESTED"
     winrm_status: str = "UNTESTED"
+    agent_port: int = 8743
+    agent_status: str = "UNTESTED"
+    agent_certificate_sha256: str = ""
+    agent_last_test_at: str = ""
     last_test_at: str = ""
 
 

@@ -15,6 +15,7 @@ import re
 
 DEFAULT_TARGET = "FileDistributionStudio:WinRM:Default"
 HOST_TARGET_PREFIX = "FileDistributionStudio:WinRM:Host:"
+AGENT_HOST_TARGET_PREFIX = "FileDistributionStudio:Agent:Host:"
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,12 @@ def host_target(host: str) -> str:
     # avoid control characters so accidental malformed host text cannot create odd keys.
     safe = re.sub(r"[\x00-\x1f\x7f]+", "", (host or "").strip())
     return HOST_TARGET_PREFIX + safe
+
+
+def agent_target(host: str) -> str:
+    """Return the Credential Manager key used for one host's Agent token."""
+    safe = re.sub(r"[\x00-\x1f\x7f]+", "", (host or "").strip())
+    return AGENT_HOST_TARGET_PREFIX + safe
 
 
 def is_available() -> bool:
@@ -112,7 +119,7 @@ def write(target: str, username: str, password: str) -> None:
     cred.Flags = 0
     cred.Type = CRED_TYPE_GENERIC
     cred.TargetName = str(target)
-    cred.Comment = "File Distribution Studio WinRM credential"
+    cred.Comment = "File Distribution Studio protected credential"
     cred.CredentialBlobSize = len(blob)
     cred.CredentialBlob = ctypes.cast(blob_buf, ctypes.POINTER(ctypes.c_ubyte))
     cred.Persist = CRED_PERSIST_LOCAL_MACHINE

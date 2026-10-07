@@ -30,9 +30,17 @@ class HostEditDialog(QDialog):
         self.group = QLineEdit(group_text(host.group_name) if host else "默认")
         self.mode = QComboBox()
         self.mode.addItem("WinRM（固定业务通道）", "WINRM")
-        self.mode.setEnabled(False)
-        self.business_channel = QLineEdit("WinRM（固定业务通道）")
+        self.mode.addItem("FDS Agent（HTTPS）", "AGENT")
+        self.mode.setEnabled(True)
+        self.business_channel = QLineEdit("FDS Agent（HTTPS）" if host and host.target_mode == "AGENT" else "WinRM（固定业务通道）")
         self.business_channel.setReadOnly(True)
+        self.agent_port = QSpinBox()
+        self.agent_port.setRange(1, 65535)
+        self.agent_port.setValue(int(host.agent_port if host else 8743) or 8743)
+        self.agent_pin = QLineEdit(host.agent_certificate_sha256 if host else "")
+        self.agent_pin.setPlaceholderText("可选：SHA-256 证书指纹（64 位十六进制）")
+        self.mode.setCurrentIndex(1 if host and host.target_mode == "AGENT" else 0)
+        self.mode.currentIndexChanged.connect(self._channel_changed)
         self.notes = QTextEdit(host.notes if host else "")
 
         source_value = hostname_source_text(host.hostname_source) if host else "手工维护"
@@ -52,6 +60,8 @@ class HostEditDialog(QDialog):
         form.addRow("名称说明", self.hostname_note)
         form.addRow("分组", self.group)
         form.addRow("业务通道", self.business_channel)
+        form.addRow("Agent HTTPS 端口", self.agent_port)
+        form.addRow("Agent 证书指纹", self.agent_pin)
         note = QLabel("v0.5.0 起目标目录由每次分发任务的“分发映射”指定，不再固定保存到主机属性。")
         note.setWordWrap(True); note.setStyleSheet("color:#667A8A;")
         form.addRow("目标目录", note)
@@ -66,6 +76,13 @@ class HostEditDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addLayout(form)
         lay.addWidget(buttons)
+        self._channel_changed()
+
+    def _channel_changed(self, *_):
+        is_agent = self.mode.currentData() == "AGENT"
+        self.business_channel.setText("FDS Agent（HTTPS）" if is_agent else "WinRM（固定业务通道）")
+        self.agent_port.setEnabled(is_agent)
+        self.agent_pin.setEnabled(is_agent)
 
     def value(self):
         new_name = self.name.text().strip() or self.host.text().strip()
@@ -99,6 +116,10 @@ class HostEditDialog(QDialog):
             winrm_port_ok=self._original.winrm_port_ok if self._original else 0,
             smb_status=self._original.smb_status if self._original else "UNTESTED",
             winrm_status=self._original.winrm_status if self._original else "UNTESTED",
+            agent_port=self.agent_port.value(),
+            agent_status=self._original.agent_status if self._original else "UNTESTED",
+            agent_certificate_sha256=self.agent_pin.text().strip().replace(" ", "").upper(),
+            agent_last_test_at=self._original.agent_last_test_at if self._original else "",
             last_test_at=self._original.last_test_at if self._original else "",
         )
 
@@ -1623,6 +1644,45 @@ class WinRMHostCredentialDialog(QDialog):
             "password": self.password.text(),
             "remember": self.remember.isChecked(),
         }
+
+
+class AgentTokenDialog(QDialog):
+    """Configure a per-host Agent pairing token without writing it to app files."""
+    def __init__(self, parent=None, *, host_count: int = 1, token: str = "", remember: bool = True):
+        super().__init__(parent)
+        self.setWindowTitle("设置 FDS Agent 配对令牌")
+        self.resize(590, 260)
+        title = "当前主机" if host_count == 1 else f"选中的 {host_count} 台主机"
+        note = QLabel(
+            f"为{title}设置 FDS Agent 配对令牌。令牌只保存到当前 Windows 用户的 Windows 凭据管理器，"
+            "不会写入 settings.json、SQLite、JSONL、审计日志或命令行。"
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#667A8A;")
+        self.token = PasswordLineEdit(token)
+        self.token.setPlaceholderText("粘贴目标主机安装 Agent 时生成的配对令牌")
+        self.remember = QCheckBox("安全记住令牌（Windows 凭据管理器）")
+        self.remember.setChecked(bool(remember))
+        form = QFormLayout()
+        form.addRow("Agent 令牌", self.token)
+        form.addRow("", self.remember)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("保存 Agent 令牌")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self._accept_checked)
+        buttons.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addWidget(note); lay.addLayout(form); lay.addWidget(buttons)
+
+    def _accept_checked(self):
+        if not self.token.text().strip():
+            QMessageBox.warning(self, "Agent 令牌", "令牌不能为空。")
+            self.token.setFocus()
+            return
+        self.accept()
+
+    def value(self):
+        return {"token": self.token.text().strip(), "remember": self.remember.isChecked()}
 
 
 class HostnameCredentialDialog(QDialog):
