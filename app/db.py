@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS hosts (
     name TEXT NOT NULL,
     host TEXT NOT NULL UNIQUE,
     group_name TEXT NOT NULL DEFAULT 'Default',
-    target_mode TEXT NOT NULL DEFAULT 'WINRM',
+    target_mode TEXT NOT NULL DEFAULT 'AGENT',
     default_target TEXT NOT NULL DEFAULT 'D:\ADMS',
     os_hint TEXT NOT NULL DEFAULT '',
     last_seen TEXT NOT NULL DEFAULT '',
@@ -219,6 +219,10 @@ def init_db():
         _ensure_column(c, "task_files", "mapping_id", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(c, "task_files", "source_path", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(c, "task_files", "target_path", "TEXT NOT NULL DEFAULT ''")
+        # The Agent branch has one remote transport.  Existing host rows from
+        # pre-Agent releases must not silently keep selecting the retired
+        # WinRM path.
+        c.execute("UPDATE hosts SET target_mode='AGENT' WHERE target_mode <> 'AGENT'")
 
 
 def list_hosts():
@@ -381,14 +385,14 @@ def record_task_mapping(task_id, mapping_id, source_type, source_path, target_pa
 
 
 def update_host_connectivity(host: str, *, online_status: str, ping_ok: bool,
-                             smb_port_ok: bool, rdp_port_ok: bool, winrm_port_ok: bool,
+                             smb_port_ok: bool, rdp_port_ok: bool, agent_port_ok: bool,
                              last_test_at: str):
     with _conn() as c:
         c.execute(
             """UPDATE hosts SET online_status=?, ping_ok=?, smb_port_ok=?, rdp_port_ok=?,
-               winrm_port_ok=?, last_test_at=? WHERE host=?""",
+               agent_status=?, last_test_at=? WHERE host=?""",
             (online_status, int(bool(ping_ok)), int(bool(smb_port_ok)), int(bool(rdp_port_ok)),
-             int(bool(winrm_port_ok)), last_test_at, host),
+             "PORT_OPEN" if agent_port_ok else "UNTESTED", last_test_at, host),
         )
 
 

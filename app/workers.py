@@ -148,29 +148,23 @@ class HostnameVerificationThread(QThread):
         if self.method == "SMB":
             return self._verify_smb(host)
         if self.method == "WINRM":
-            return self._verify_winrm(host)
+            return host, "", "WINRM", False, "当前 Agent-only 分支已移除 WinRM 主机名验证。"
 
-        # AUTO 仅用于“主机名识别”。SMB/WKSSVC 在很多现场无需 WinRM 即可得到精确
-        # Computer Name，因此优先尝试；它不会参与正式文件分发、备份或远程控制。
+        # AUTO 仅用于“主机名识别”。Agent-only 分支不再回退到 WinRM，
+        # 因此识别失败只表示 SMB/WKSSVC 不可用，不会触发额外的旧协议连接。
         smb_result = self._verify_smb(host)
         if smb_result[3]:
             return smb_result
-        winrm_result = self._verify_winrm(host)
-        if winrm_result[3]:
-            return winrm_result
-        message = (
-            f"SMB/WKSSVC 验证失败：{smb_result[4]} | "
-            f"WinRM 验证失败：{winrm_result[4]}"
-        )
+        message = f"SMB/WKSSVC 验证失败：{smb_result[4]}"
         return host, "", "AUTO", False, message
 
     def run(self):
         success = failed = done = 0
         total = len(self.hosts)
         method_text = {
-            "AUTO": "自动识别（SMB/WKSSVC 优先，WinRM 备用；仅用于主机名）",
+            "AUTO": "自动识别（仅 SMB/WKSSVC；仅用于主机名）",
             "SMB": "SMB/WKSSVC（TCP 445）",
-            "WINRM": "WinRM hostname",
+            "WINRM": "已停用的旧 WinRM hostname",
         }.get(self.method, self.method)
         self.log.emit(f"开始主机名深度验证，共 {total} 台主机；方式：{method_text}。")
         with ThreadPoolExecutor(max_workers=min(self.max_workers, max(1, total))) as ex:
@@ -249,8 +243,8 @@ class WinRMTargetTestThread(QThread):
                 enabled=False, use_https=self.use_https, port=self.port,
                 username=resolved_username, password=password,
                 command_timeout=self.TEST_TIMEOUT_SEC,
-                # pywinrm 要求 read_timeout_sec 严格大于 operation_timeout_sec；
-                # 多出的 1 秒只是协议余量，超过 10 秒仍由本线程判定为失败。
+                # 旧 WinRM 测试线程只保留为兼容代码；Agent 测试线程使用
+                # 独立的 10 秒 HTTPS 超时并在上方完成认证。
                 read_timeout_sec=self.TEST_TIMEOUT_SEC + 1,
             )
             r = test_winrm_targets(host, self.target_paths, plan)
@@ -594,47 +588,26 @@ class DistributionThread(QThread):
         return username, password, source
 
     def _precheck_winrm_auth(self):
-        """在生成本地/SFTP 清单之前先验证所有目标主机的 WinRM 会话。
-
-        业务操作从 v0.6.0 起只走 WinRM。主机发现可以继续使用 Ping/445/3389/DNS/SMB
-        等辅助信号，但这些辅助通道绝不会参与文件写入、备份、服务或进程控制。
-        """
+        """在生成本地/SFTP 清单之前验证所有目标主机的 Agent 会话。"""
         if not self.hosts:
             raise RuntimeError("没有目标主机。")
 
         failures = []
 
         def one(hrec):
-            if hrec.target_mode == "AGENT":
-                token, source = self.agent_tokens.get(hrec.host, ("", "未设置"))
-                if not token:
-                    return hrec, False, "", source, "Agent 配对令牌未设置。"
-                try:
-                    AgentClient(AgentEndpoint(
-                        hrec.host, int(hrec.agent_port or 8743), token,
-                        certificate_sha256=hrec.agent_certificate_sha256, timeout=10,
-                    )).status()
-                    return hrec, True, "Agent", source, ""
-                except Exception as exc:
-                    return hrec, False, "Agent", source, str(exc)
-            resolved_username, password, source = self._credential_for(hrec)
-            plan = replace(
-                self.remote_plan,
-                enabled=False,
-                username=resolved_username,
-                password=password,
-            )
+            if hrec.target_mode != "AGENT":
+                return hrec, False, "", "已禁用", "当前分支只支持 FDS Agent HTTPS。"
+            token, source = self.agent_tokens.get(hrec.host, ("", "未设置"))
+            if not token:
+                return hrec, False, "", source, "Agent 配对令牌未设置。"
             try:
-                result = WinRMExecutor(hrec.host, plan).test()
-                if int(result.get("exit_code", 1)) != 0:
-                    detail = result.get("stderr") or result.get("stdout") or f"退出码={result.get('exit_code')}"
-                    raise RuntimeError(describe_winrm_failure(hrec.host, plan, detail))
-                return hrec, True, resolved_username, source, ""
+                AgentClient(AgentEndpoint(
+                    hrec.host, int(hrec.agent_port or 8743), token,
+                    certificate_sha256=hrec.agent_certificate_sha256, timeout=10,
+                )).status()
+                return hrec, True, "Agent", source, ""
             except Exception as exc:
-                msg = str(exc)
-                if not msg.startswith("WinRM"):
-                    msg = describe_winrm_failure(hrec.host, plan, exc)
-                return hrec, False, resolved_username, source, msg
+                return hrec, False, "Agent", source, str(exc)
 
         self._log("开始远程通道前置认证检查：只有全部目标主机认证通过后，才生成文件清单并进入分发。")
         with ThreadPoolExecutor(max_workers=min(max(1, self.settings.max_concurrency), max(1, len(self.hosts)))) as ex:
@@ -642,26 +615,25 @@ class DistributionThread(QThread):
             for fut in as_completed(futures):
                 hrec, ok, resolved_username, source, message = fut.result()
                 if ok:
-                    channel = "FDS Agent" if hrec.target_mode == "AGENT" else "WinRM"
+                    channel = "FDS Agent"
                     self.host_status.emit(hrec.host, "READY", f"{channel} 认证通过")
                     self._log(f"[{hrec.host}] {channel} 认证通过；凭据来源：{source}；实际认证账号：{resolved_username}")
                     audit.operation(
-                        self.settings.audit_path, "AGENT" if hrec.target_mode == "AGENT" else "WINRM", "AUTH_PREFLIGHT", "SUCCESS",
+                        self.settings.audit_path, "AGENT", "AUTH_PREFLIGHT", "SUCCESS",
                         f"正式分发前 {channel} 身份验证通过。", task_id=self.task_id, host=hrec.host,
                         details={"username": resolved_username, "auth_source": source,
-                                 "port": hrec.agent_port if hrec.target_mode == "AGENT" else self.remote_plan.port,
-                                 "https": True if hrec.target_mode == "AGENT" else self.remote_plan.use_https},
+                                 "port": hrec.agent_port, "https": True},
                     )
                 else:
-                    channel = "FDS Agent" if hrec.target_mode == "AGENT" else "WinRM"
+                    channel = "FDS Agent"
                     self.host_status.emit(hrec.host, "FAILED", f"{channel} 认证失败")
                     self._log(f"[{hrec.host}] {channel} 前置认证失败；凭据来源：{source}；实际认证账号：{resolved_username}；{message}")
                     failures.append((hrec.host, message))
                     audit.operation(
-                        self.settings.audit_path, "AGENT" if hrec.target_mode == "AGENT" else "WINRM", "AUTH_PREFLIGHT", "FAILED",
+                        self.settings.audit_path, "AGENT", "AUTH_PREFLIGHT", "FAILED",
                         message, task_id=self.task_id, host=hrec.host,
-                        details={"username": resolved_username, "auth_source": source, "port": self.remote_plan.port,
-                                 "https": self.remote_plan.use_https},
+                        details={"username": resolved_username, "auth_source": source, "port": hrec.agent_port,
+                                 "https": True},
                     )
 
         if failures:
@@ -774,15 +746,13 @@ class DistributionThread(QThread):
                     "max_concurrency": self.settings.max_concurrency,
                     "preflight_check": self.settings.preflight_check,
                     "remote_actions_enabled": self.remote_plan.enabled,
-                    "transport": "MIXED_WINRM_AGENT" if any(h.target_mode == "AGENT" for h in self.hosts) and any(h.target_mode != "AGENT" for h in self.hosts) else ("AGENT_HTTPS" if all(h.target_mode == "AGENT" for h in self.hosts) else "WINRM"),
-                    "winrm_port": self.remote_plan.port,
-                    "winrm_https": self.remote_plan.use_https,
+                    "transport": "AGENT_HTTPS",
                     "operator": getpass.getuser(), "workstation": platform.node(),
                     "app_version": APP_VERSION,
                 },
             )
 
-            # 先验证 WinRM 身份，不让用户在认证失败时还等待本地/SFTP 清单和 SHA256。
+            # 先验证 Agent 身份，不让用户在认证失败时还等待本地/SFTP 清单和 SHA256。
             self._precheck_winrm_auth()
 
             prepared = []
@@ -839,33 +809,18 @@ class DistributionThread(QThread):
                 futures = {}
                 for hrec in self.hosts:
                     self.host_status.emit(hrec.host, "WAITING", "")
-                    if hrec.target_mode == "AGENT":
-                        token, _source = self.agent_tokens.get(hrec.host, ("", "未设置"))
-                        fut = ex.submit(
-                            distribute_plan_to_host_agent,
-                            self.task_id, hrec, prepared, token,
-                            self.settings.verify_sha256, self.settings.backup_existing,
-                            self.settings.retry_count, self._cancel.is_set,
-                            lambda host, msg: self._log(f"[{host}] {msg}"),
-                            lambda host, i, total, rel, status: self.file_progress.emit(host, i, total, rel, status),
-                            lambda host, done_bytes, total_bytes, rel: self.byte_progress.emit(host, done_bytes, total_bytes, rel),
-                            self.remote_plan, self.backup_root_path, self.settings.audit_path,
-                            self.settings.preflight_check, self.settings.min_free_space_margin_mb,
-                        )
-                    else:
-                        username, password, source = self._credential_for(hrec)
-                        host_plan = replace(self.remote_plan, username=username, password=password)
-                        fut = ex.submit(
-                            distribute_plan_to_host_winrm,
-                            self.task_id, hrec, prepared, username, password,
-                            self.settings.verify_sha256, self.settings.backup_existing,
-                            self.settings.retry_count, self._cancel.is_set,
-                            lambda host, msg: self._log(f"[{host}] {msg}"),
-                            lambda host, i, total, rel, status: self.file_progress.emit(host, i, total, rel, status),
-                            lambda host, done_bytes, total_bytes, rel: self.byte_progress.emit(host, done_bytes, total_bytes, rel),
-                            host_plan, self.backup_root_path, self.settings.audit_path,
-                            self.settings.preflight_check, self.settings.min_free_space_margin_mb,
-                        )
+                    token, _source = self.agent_tokens.get(hrec.host, ("", "未设置"))
+                    fut = ex.submit(
+                        distribute_plan_to_host_agent,
+                        self.task_id, hrec, prepared, token,
+                        self.settings.verify_sha256, self.settings.backup_existing,
+                        self.settings.retry_count, self._cancel.is_set,
+                        lambda host, msg: self._log(f"[{host}] {msg}"),
+                        lambda host, i, total, rel, status: self.file_progress.emit(host, i, total, rel, status),
+                        lambda host, done_bytes, total_bytes, rel: self.byte_progress.emit(host, done_bytes, total_bytes, rel),
+                        self.remote_plan, self.backup_root_path, self.settings.audit_path,
+                        self.settings.preflight_check, self.settings.min_free_space_margin_mb,
+                    )
                     futures[fut] = hrec
 
                 for fut in as_completed(futures):
@@ -1341,15 +1296,16 @@ class RemoteFileOperationThread(QThread):
         )
 
     def _executor(self):
-        plan = RemoteActionPlan(
-            enabled=False,
-            use_https=self.use_https,
-            port=self.port,
-            username=self.context.get("username", ""),
-            password=self.context.get("password", ""),
-            command_timeout=120,
-        )
-        return WinRMExecutor(self.context.get("host", ""), plan)
+        token = self.context.get("token", "")
+        if not token:
+            raise RuntimeError("Agent 配对令牌未设置。")
+        return AgentClient(AgentEndpoint(
+            host=self.context.get("host", ""),
+            port=int(self.context.get("agent_port") or self.port or 8743),
+            token=token,
+            certificate_sha256=self.context.get("certificate_sha256", ""),
+            timeout=120,
+        ))
 
     def _upload_one(self, executor, source: Path, remote_dir: str, counters: dict):
         import ntpath
@@ -1361,7 +1317,7 @@ class RemoteFileOperationThread(QThread):
             executor.upload_file(
                 source,
                 dest,
-                progress_cb=lambda sent, _total: self._emit_byte_progress(
+                progress=lambda sent, _total: self._emit_byte_progress(
                     counters, base + int(sent), source.name
                 ),
             )
@@ -1383,7 +1339,7 @@ class RemoteFileOperationThread(QThread):
                 executor.upload_file(
                     item,
                     remote_item,
-                    progress_cb=lambda sent, _total, name=item.name: self._emit_byte_progress(
+                    progress=lambda sent, _total, name=item.name: self._emit_byte_progress(
                         counters, base + int(sent), name
                     ),
                 )
@@ -1426,7 +1382,7 @@ class RemoteFileOperationThread(QThread):
             executor.download_file(
                 remote_source,
                 dest,
-                progress_cb=lambda done, _total: self._emit_byte_progress(
+                progress=lambda done, _total: self._emit_byte_progress(
                     counters, base + int(done), ntpath.basename(remote_source)
                 ),
             )
@@ -1453,7 +1409,7 @@ class RemoteFileOperationThread(QThread):
                     executor.download_file(
                         entry.get("path", ""),
                         dest,
-                        progress_cb=lambda done, _total, name=entry.get("name", ""): self._emit_byte_progress(
+                        progress=lambda done, _total, name=entry.get("name", ""): self._emit_byte_progress(
                             counters, base + int(done), name
                         ),
                     )
@@ -1548,11 +1504,13 @@ class RemoteFileOperationThread(QThread):
 
             if self.operation == "DELETE":
                 for remote in self.paths:
-                    executor.remove_path(remote)
+                    executor.delete(remote)
                 self.completed.emit({"ok": True, "kind": "delete", "count": len(self.paths)}); return
 
             if self.operation == "RENAME":
-                executor.rename_path(self.remote_path, self.new_name)
+                import ntpath
+                parent = ntpath.dirname(self.remote_path.rstrip("\\"))
+                executor.rename(self.remote_path, ntpath.join(parent, self.new_name))
                 self.completed.emit({"ok": True, "kind": "rename"}); return
 
             raise ValueError(f"未知远程文件操作：{self.operation}")

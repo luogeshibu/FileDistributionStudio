@@ -120,11 +120,126 @@ app.MapPost("/api/v1/files/inspect", (FileInspectRequest request, AgentOptions c
 {
     if (!TryResolveAllowedPath(config, request.Path, out var path, out var error))
         return Results.BadRequest(new { error });
+    if (Directory.Exists(path))
+        return Results.Ok(new { exists = true, isDir = true, size = 0L, sha256 = "" });
     if (!File.Exists(path))
-        return Results.Ok(new { exists = false, size = 0L, sha256 = "" });
+        return Results.Ok(new { exists = false, isDir = false, size = 0L, sha256 = "" });
     var info = new FileInfo(path);
     var hash = request.IncludeSha256 ? ComputeSha256(path) : "";
-    return Results.Ok(new { exists = true, size = info.Length, sha256 = hash });
+    return Results.Ok(new { exists = true, isDir = false, size = info.Length, sha256 = hash });
+});
+
+app.MapGet("/api/v1/files/list", (string? path, AgentOptions config) =>
+{
+    var requested = path ?? "";
+    if (string.IsNullOrWhiteSpace(requested))
+    {
+        var roots = config.AllowedRoots
+            .Where(root => !string.IsNullOrWhiteSpace(root))
+            .Select(root => Path.GetFullPath(root))
+            .Where(Directory.Exists)
+            .Select(root => new
+            {
+                name = Path.GetFileName(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+                    ?? root,
+                path = root,
+                isDir = true,
+                size = 0L,
+                lastWriteUtc = Directory.GetLastWriteTimeUtc(root),
+            });
+        return Results.Ok(new { path = "", entries = roots });
+    }
+
+    if (!TryResolveAllowedPath(config, requested, out var directory, out var error))
+        return Results.BadRequest(new { error });
+    if (!Directory.Exists(directory))
+        return Results.NotFound(new { error = "远程目录不存在。" });
+
+    try
+    {
+        var entries = Directory.EnumerateFileSystemEntries(directory)
+            .Select(entry =>
+            {
+                var isDir = Directory.Exists(entry);
+                var info = isDir ? null : new FileInfo(entry);
+                return new
+                {
+                    name = Path.GetFileName(entry),
+                    path = Path.GetFullPath(entry),
+                    isDir,
+                    size = info?.Length ?? 0L,
+                    lastWriteUtc = File.GetLastWriteTimeUtc(entry),
+                };
+            })
+            .OrderByDescending(entry => entry.isDir)
+            .ThenBy(entry => entry.name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        return Results.Ok(new { path = directory, entries });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"读取远程目录失败：{ex.Message}", statusCode: StatusCodes.Status500InternalServerError);
+    }
+});
+
+app.MapGet("/api/v1/files/download", (string path, AgentOptions config) =>
+{
+    if (!TryResolveAllowedPath(config, path, out var file, out var error))
+        return Results.BadRequest(new { error });
+    if (!File.Exists(file))
+        return Results.NotFound(new { error = "远程文件不存在。" });
+    return Results.File(File.OpenRead(file), "application/octet-stream", Path.GetFileName(file), enableRangeProcessing: true);
+});
+
+app.MapPost("/api/v1/files/directory", (DirectoryRequest request, AgentOptions config) =>
+{
+    if (!TryResolveAllowedPath(config, request.Path, out var directory, out var error))
+        return Results.BadRequest(new { error });
+    try
+    {
+        Directory.CreateDirectory(directory);
+        return Results.Ok(new { path = directory });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"创建远程目录失败：{ex.Message}", statusCode: StatusCodes.Status500InternalServerError);
+    }
+});
+
+app.MapPost("/api/v1/files/rename", (RenameRequest request, AgentOptions config) =>
+{
+    if (!TryResolveAllowedPath(config, request.Path, out var source, out var sourceError))
+        return Results.BadRequest(new { error = sourceError });
+    if (!TryResolveAllowedPath(config, request.NewPath, out var destination, out var destinationError))
+        return Results.BadRequest(new { error = destinationError });
+    try
+    {
+        if (File.Exists(source)) File.Move(source, destination);
+        else if (Directory.Exists(source)) Directory.Move(source, destination);
+        else return Results.NotFound(new { error = "远程项目不存在。" });
+        return Results.Ok(new { path = destination });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"重命名远程项目失败：{ex.Message}", statusCode: StatusCodes.Status500InternalServerError);
+    }
+});
+
+app.MapDelete("/api/v1/files", (string path, AgentOptions config) =>
+{
+    if (!TryResolveAllowedPath(config, path, out var target, out var error))
+        return Results.BadRequest(new { error });
+    try
+    {
+        if (File.Exists(target)) File.Delete(target);
+        else if (Directory.Exists(target)) Directory.Delete(target, recursive: true);
+        else return Results.NotFound(new { error = "远程项目不存在。" });
+        return Results.Ok(new { path = target });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"删除远程项目失败：{ex.Message}", statusCode: StatusCodes.Status500InternalServerError);
+    }
 });
 
 app.MapPost("/api/v1/files/backup", (FileBackupRequest request, AgentOptions config) =>
@@ -259,3 +374,5 @@ public sealed record KillProcessRequest(string ImageName);
 public sealed record RestartRequest(bool Force);
 public sealed record FileInspectRequest(string Path, bool IncludeSha256 = true);
 public sealed record FileBackupRequest(string SourcePath, string BackupPath);
+public sealed record DirectoryRequest(string Path);
+public sealed record RenameRequest(string Path, string NewPath);

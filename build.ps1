@@ -26,7 +26,7 @@ if ([string]$env:FDS_REQUIRE_SIGNING -eq '1') { $RequireSigning = $true }
 $Python=Join-Path $Root '.venv\Scripts\python.exe'
 $Spec=Join-Path $Root 'packaging\windows\FileDistributionStudio.spec'
 if (-not (Test-Path $Python)) { throw '未找到 .venv，请先运行 setup.bat。' }
-& $Python -c "import PyInstaller,PySide6,paramiko,psutil,winrm,impacket; print('打包环境检查通过')"
+& $Python -c "import PyInstaller,PySide6,paramiko,psutil,impacket; print('打包环境检查通过')"
 if ($LASTEXITCODE -ne 0) { throw '打包环境无效，请重新运行 setup.bat。' }
 $Version=(& $Python -c "from app.version import APP_VERSION; print(APP_VERSION)").Trim()
 $Build=Join-Path $Root 'build'
@@ -108,8 +108,30 @@ Remove-Item $Target -Recurse -Force -ErrorAction SilentlyContinue
 Copy-Item $App $Target -Recurse
 $Zip=Join-Path $Release "$Product.zip"
 Remove-Item $Zip -Force -ErrorAction SilentlyContinue
-Compress-Archive -Path "$Target\*" -DestinationPath $Zip -CompressionLevel Optimal
-$Hash=(Get-FileHash $Zip -Algorithm SHA256).Hash
+$archiveError = $null
+$archiveReady = $false
+for ($attempt = 1; $attempt -le 6; $attempt++) {
+    try {
+        Remove-Item $Zip -Force -ErrorAction SilentlyContinue
+        Compress-Archive -Path "$Target\*" -DestinationPath $Zip -CompressionLevel Optimal -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath $Zip -PathType Leaf)) {
+            throw "压缩命令完成，但未找到 ZIP 文件。"
+        }
+        $null = Get-FileHash -LiteralPath $Zip -Algorithm SHA256 -ErrorAction Stop
+        $archiveReady = $true
+        break
+    } catch {
+        $archiveError = $_
+        if ($attempt -lt 6) {
+            Write-Warning "ZIP 文件暂时被占用，正在重试（$attempt/5）：$($_.Exception.Message)"
+            Start-Sleep -Seconds 2
+        }
+    }
+}
+if (-not $archiveReady) {
+    throw "发布 ZIP 失败：$($archiveError.Exception.Message)。请关闭正在运行的发布目录程序后重试。"
+}
+$Hash=(Get-FileHash -LiteralPath $Zip -Algorithm SHA256 -ErrorAction Stop).Hash
 "$Hash  $Product.zip" | Set-Content (Join-Path $Release 'SHA256SUMS.txt') -Encoding ascii
 Write-Host "发布包已生成：$Release" -ForegroundColor Green
 Write-Host "ZIP：$Zip"

@@ -10,7 +10,7 @@ class HostRecord:
     name: str
     host: str
     group_name: str = "默认"
-    target_mode: str = "WINRM"
+    target_mode: str = "AGENT"
     # 兼容旧数据库字段。v0.5.0 起目标目录属于“分发映射”，不再作为主机属性使用。
     default_target: str = ""
     os_hint: str = ""
@@ -99,8 +99,7 @@ class DiscoveryResult:
     hostname: str
     port_445: bool
     port_3389: bool
-    port_5985: bool
-    port_5986: bool
+    port_agent: bool
     network: str = ""
     hostname_source: str = ""
     hostname_verified: bool = False
@@ -108,10 +107,10 @@ class DiscoveryResult:
 
     @property
     def status(self) -> str:
-        if self.port_445 and (self.port_3389 or self.port_5985 or self.port_5986):
+        if self.port_445 and (self.port_3389 or self.port_agent):
             return "Likely Windows"
         if self.port_445:
             return "SMB"
-        if self.port_3389 or self.port_5985 or self.port_5986:
+        if self.port_3389 or self.port_agent:
             return "Likely Windows"
         return "Online / Unknown"

@@ -13,14 +13,13 @@ class HostConnectivity:
     ping_ok: bool
     smb_port_ok: bool
     rdp_port_ok: bool
-    winrm_5985_ok: bool
-    winrm_5986_ok: bool
+    agent_8743_ok: bool
     online_status: str
     message: str
 
     @property
-    def winrm_port_ok(self) -> bool:
-        return self.winrm_5985_ok or self.winrm_5986_ok
+    def agent_port_ok(self) -> bool:
+        return self.agent_8743_ok
 
 
 def _tcp_open(host: str, port: int, timeout: float) -> bool:
@@ -54,13 +53,12 @@ def test_host_connectivity(host: str, timeout: float = 0.55) -> HostConnectivity
     ping_ok = _ping(host, int(max(0.25, timeout) * 1000))
     smb = _tcp_open(host, 445, timeout)
     rdp = _tcp_open(host, 3389, timeout)
-    w5985 = _tcp_open(host, 5985, timeout)
-    w5986 = _tcp_open(host, 5986, timeout)
+    agent = _tcp_open(host, 8743, timeout)
 
-    any_tcp = smb or rdp or w5985 or w5986
-    if w5985 or w5986:
-        status = "ONLINE_WINRM"
-        label = "在线（WinRM 可达）"
+    any_tcp = smb or rdp or agent
+    if agent:
+        status = "ONLINE_AGENT"
+        label = "在线（Agent 可达）"
     elif smb:
         status = "ONLINE_SMB"
         label = "在线（SMB 可达）"
@@ -76,16 +74,16 @@ def test_host_connectivity(host: str, timeout: float = 0.55) -> HostConnectivity
         f"Ping：{'通过' if ping_ok else '无响应'}",
         f"SMB 445：{'开放' if smb else '未开放/不可达'}",
         f"RDP 3389：{'开放' if rdp else '未开放/不可达'}",
-        f"WinRM 5985：{'开放' if w5985 else '未开放/不可达'}",
-        f"WinRM 5986：{'开放' if w5986 else '未开放/不可达'}",
+        f"Agent HTTPS 8743：{'开放' if agent else '未开放/不可达'}",
     ]
-    return HostConnectivity(host, ping_ok, smb, rdp, w5985, w5986, status, "\n".join(details))
+    return HostConnectivity(host, ping_ok, smb, rdp, agent, status, "\n".join(details))
 
 
 def status_label(status: str) -> str:
     return {
         "UNTESTED": "未测试",
-        "ONLINE_WINRM": "在线（WinRM 可达）",
+        "ONLINE_WINRM": "在线（旧 WinRM 诊断）",
+        "ONLINE_AGENT": "在线（Agent 可达）",
         "ONLINE_SMB": "在线（SMB 可达）",
         "ONLINE": "在线",
         "OFFLINE": "离线 / 不可达",

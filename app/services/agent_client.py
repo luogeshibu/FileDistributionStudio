@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-"""Small, dependency-free HTTPS client for the FDS Windows Agent.
-
-The desktop application deliberately keeps the Agent transport separate from the
-legacy WinRM transport.  This makes the migration reversible and prevents a
-failed Agent connection from changing existing WinRM behavior.
-"""
+"""Small, dependency-free HTTPS client for the FDS Windows Agent."""
 
 from dataclasses import dataclass
 from hashlib import sha256
@@ -145,9 +140,81 @@ class AgentClient:
         body = json.dumps({"path": path, "includeSha256": bool(include_sha256)}, ensure_ascii=False).encode("utf-8")
         return self._request("POST", "/api/v1/files/inspect", body)
 
+    def list_directory_entries(self, path: str = "") -> list[dict]:
+        query = urlencode({"path": path or ""})
+        payload = self._request("GET", f"/api/v1/files/list?{query}")
+        entries = []
+        for raw in payload.get("entries") or []:
+            item = dict(raw or {})
+            item["is_dir"] = bool(item.get("isDir", item.get("is_dir", False)))
+            item["modified"] = item.get("lastWriteUtc", item.get("modified", ""))
+            entries.append(item)
+        return entries
+
+    def list_drives(self) -> list[dict]:
+        return self.list_directory_entries("")
+
+    def list_known_folders(self) -> list[dict]:
+        # The Agent intentionally exposes only its configured AllowedRoots.
+        return []
+
+    def path_info(self, path: str) -> dict:
+        item = self.inspect_file(path, include_sha256=False)
+        item["is_dir"] = bool(item.get("isDir", item.get("is_dir", False)))
+        return item
+
+    def ensure_directory(self, path: str) -> dict:
+        body = json.dumps({"path": path}, ensure_ascii=False).encode("utf-8")
+        return self._request("POST", "/api/v1/files/directory", body)
+
     def backup_file(self, source_path: str, backup_path: str) -> dict:
         body = json.dumps({"sourcePath": source_path, "backupPath": backup_path}, ensure_ascii=False).encode("utf-8")
         return self._request("POST", "/api/v1/files/backup", body)
+
+    def rename(self, path: str, new_path: str) -> dict:
+        body = json.dumps({"path": path, "newPath": new_path}, ensure_ascii=False).encode("utf-8")
+        return self._request("POST", "/api/v1/files/rename", body)
+
+    def delete(self, path: str) -> dict:
+        query = urlencode({"path": path})
+        return self._request("DELETE", f"/api/v1/files?{query}")
+
+    def download_file(self, remote_path: str, local_path: str | Path,
+                      progress: Callable[[int, int], None] | None = None) -> Path:
+        query = urlencode({"path": remote_path})
+        target = Path(local_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        connection = self._connect()
+        done = 0
+        temporary = target.with_name(target.name + ".fds-download.tmp")
+        try:
+            connection.request("GET", f"/api/v1/files/download?{query}", headers=self._headers())
+            response = connection.getresponse()
+            if response.status != 200:
+                raise AgentError(self._error_message(response.status, self._decode_response(response)))
+            total = int(response.getheader("Content-Length") or 0)
+            with temporary.open("wb") as stream:
+                while True:
+                    chunk = response.read(self.CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    stream.write(chunk)
+                    done += len(chunk)
+                    if progress:
+                        progress(done, total)
+            temporary.replace(target)
+            return target
+        except AgentError:
+            raise
+        except (OSError, ssl.SSLError, TimeoutError) as exc:
+            raise AgentError(f"Agent 下载中断（已接收 {done} 字节）：{exc}") from exc
+        finally:
+            connection.close()
+            try:
+                if temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                pass
 
     def upload_file(self, local_path: str | Path, target_path: str,
                     progress: Callable[[int, int], None] | None = None) -> dict:

@@ -65,8 +65,9 @@ def distribute_plan_to_host_agent(
 ):
     """Run the file-only workflow over Agent HTTPS.
 
-    Arbitrary CMDs are intentionally rejected here.  Agent hosts can end selected
-    process trees, but commands such as sys_ctl remain an explicit WinRM feature.
+    Arbitrary CMDs are intentionally rejected here.  The Agent branch exposes
+    only the controlled process-tree and file operations; it never falls back
+    to WinRM or executes an arbitrary command string.
     """
     host = host_record.host
     db.start_host(task_id, host, host_record.name)
@@ -82,7 +83,7 @@ def distribute_plan_to_host_agent(
             raise RuntimeError("Agent 配对令牌未设置。")
         if plan and getattr(plan, "enabled", False):
             if getattr(plan, "pre_commands", None) or getattr(plan, "post_commands", None):
-                raise RuntimeError("FDS Agent 不执行任意 CMD；请将需要 sys_ctl 等命令的主机保留为 WinRM 通道。")
+                raise RuntimeError("FDS Agent 不执行任意 CMD；当前分支已移除 WinRM，请使用 Agent 支持的进程操作或重启操作。")
         client = _client(host_record, token)
         client.status()
         audit.operation(audit_root, "AGENT", "HOST_START", "SUCCESS",

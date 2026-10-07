@@ -12,7 +12,7 @@ import psutil
 from ..models import DiscoveryResult
 from .smb_identity import smb_ntlm_identity, windows_netwksta_identity
 
-WINDOWS_PORTS = (445, 3389, 5985, 5986)
+WINDOWS_PORTS = (445, 3389, 8743)
 MAX_SCAN_ADDRESSES = 4096
 
 
@@ -211,7 +211,7 @@ def quick_hostname(ip: str, timeout: float, smb_open: bool = False) -> tuple[str
         note += " TCP 445 可达，但 SMB/NTLM 未返回可用名称；"
         if smb_note:
             note += f"快速 SMB 识别信息：{smb_note} "
-    note += "可使用‘深度验证主机名’，优先通过 SMB/WKSSVC（445）读取 Computer Name，必要时再回退 WinRM。"
+    note += "当前分支正式连接使用 FDS Agent HTTPS；主机名识别只依赖 SMB/WKSSVC 等只读信号。"
     return "", "", note
 
 
@@ -225,8 +225,7 @@ def scan_host(ip: str, timeout: float, network: str = "") -> DiscoveryResult | N
         hostname=hostname,
         port_445=ports[445],
         port_3389=ports[3389],
-        port_5985=ports[5985],
-        port_5986=ports[5986],
+        port_agent=ports[8743],
         network=network,
         hostname_source=source,
         hostname_verified=(source == "NETAPI_WKSTA"),

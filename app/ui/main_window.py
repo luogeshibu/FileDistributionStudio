@@ -119,12 +119,12 @@ reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v Loca
 
 PAGE_META = [
     ("文件分发", "选择本地或远程源，将文件安全分发到多台 Windows 主机。", "send"),
-    ("远程文件", "像文件管理器一样浏览单台 Windows 主机；当前浏览器继续使用 WinRM，Agent 用于正式 HTTPS 分发与远程控制。", "file"),
+    ("远程文件", "通过 FDS Agent HTTPS 浏览和传输单台 Windows 主机上的允许目录。", "file"),
     ("主机管理", "管理目标主机身份、分组、在线状态和远程访问能力。", "hosts"),
     ("主机发现", "跨一个或多个 IPv4 网段发现可访问的 Windows 主机。", "radar"),
     ("分发历史", "查看任务、主机、文件、备份、校验以及远程操作详情。", "history"),
     ("审计日志", "查看软件操作、主机发现、分发、备份、校验和远程操作的本地审计记录。", "terminal"),
-    ("使用帮助", "查看 WinRM 初始化、ADMS 账号权限检查和常用远程操作说明。", "terminal"),
+    ("使用帮助", "查看 FDS Agent 安装、配对和远程操作说明。", "terminal"),
     ("系统设置", "调整并发、扫描、备份、校验、本地缓存和审计目录。", "settings"),
 ]
 
@@ -250,7 +250,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.pages = [
             self._build_distribution_page(), self._build_remote_files_page(), self._build_inventory_page(), self._build_discovery_page(),
-            self._build_history_page(), self._build_audit_page(), self._build_help_page(), self._build_settings_page()
+            self._build_history_page(), self._build_audit_page(), self._build_agent_help_page(), self._build_settings_page()
         ]
         for p in self.pages: self.stack.addWidget(p)
         cl.addWidget(top); cl.addWidget(self.stack,1)
@@ -324,7 +324,7 @@ class MainWindow(QMainWindow):
 
         target, target_l = card(
             "Windows 目标主机",
-            "选择本次要分发的 Windows 主机，并设置默认账号密码。",
+            "选择本次要分发的 Windows 主机，并为每台主机设置一次 FDS Agent HTTPS 配对令牌。",
         )
         cred = QHBoxLayout()
         self.win_user = QLineEdit(self.settings.winrm_default_username); self.win_password = PasswordLineEdit()
@@ -336,14 +336,19 @@ class MainWindow(QMainWindow):
         cred.addWidget(QLabel("默认 Windows 用户")); cred.addWidget(self.win_user, 1)
         cred.addSpacing(10); cred.addWidget(QLabel("密码")); cred.addWidget(self.win_password, 1)
         cred.addWidget(self.remember_default_cred)
-        target_l.addLayout(cred)
+        # Agent-only 分支不再显示或收集 WinRM 用户名/密码。保留控件对象是为了
+        # 兼容旧配置加载和旧信号连接，但它们不会进入正式业务路径。
+        cred_widget = QWidget()
+        cred_widget.setLayout(cred)
+        cred_widget.setVisible(False)
+        target_l.addWidget(cred_widget)
         self._load_default_winrm_credential()
         self.win_user.editingFinished.connect(lambda: self._save_default_winrm_credential(show_error=False))
         self.win_password.editingFinished.connect(lambda: self._save_default_winrm_credential(show_error=False))
         self.remember_default_cred.toggled.connect(lambda _checked: self._save_default_winrm_credential(show_error=False))
         cred_hint = QLabel(
-            "默认使用 WinRM HTTP 5985。首次使用目标机可下载 WinRM 设置脚本；脚本不会修改任何 Windows 账号、用户组或 RDP 权限。"
-            "记住凭据时密码来自 Windows 凭据管理器；取消勾选并重新输入可清除旧密码。本地账号会按目标主机名发送。"
+            "当前分支不再使用 WinRM、RDP 或 Windows 管理共享。请在目标主机安装 FDS Agent，"
+            "然后在下方选择主机并设置 Agent 配对令牌；文件分发、进程树结束和强制重启均通过 Agent HTTPS 完成。"
         )
         cred_hint.setObjectName("Muted"); cred_hint.setWordWrap(True); target_l.addWidget(cred_hint)
 
@@ -354,20 +359,20 @@ class MainWindow(QMainWindow):
         self.target_filter_edit.setPlaceholderText("输入 IP、主机名、分组、凭据或状态，例如：172.16.21 / Dispatcher / AUTH_OK")
         self.target_filter_edit.textChanged.connect(self._apply_target_filter)
         target_filter_row.addWidget(self.target_filter_edit, 1)
-        self.btn_test_all_winrm_select = QPushButton("全量测试并选中 WinRM")
+        self.btn_test_all_winrm_select = QPushButton("全量测试并选中 Agent")
         self.btn_test_all_winrm_select.setIcon(app_icon("radar"))
         self.btn_test_all_winrm_select.setToolTip(
-            "测试全部已保存主机的 WinRM 连接和身份验证；测试通过的主机会自动勾选，失败主机会自动取消。"
-            "这里只测试 WinRM，不执行写入、不创建目录。适合测试后直接分发。"
+            "测试全部已保存主机的 FDS Agent HTTPS 连接和配对令牌；测试通过的主机会自动勾选，失败主机会自动取消。"
+            "这里只测试 Agent，不执行写入、不创建目录。适合测试后直接分发。"
         )
-        self.btn_test_all_winrm_select.clicked.connect(self._test_all_winrm_and_select)
+        self.btn_test_all_winrm_select.clicked.connect(self._test_all_agent_and_select)
         self.target_filter_count = QLabel("显示 0 / 0 台 · 已选 0 台")
         self.target_filter_count.setObjectName("Muted")
         target_filter_row.addWidget(self.target_filter_count)
         target_l.addLayout(target_filter_row)
 
         self.target_table = QTableWidget(0, 8)
-        self.target_table.setHorizontalHeaderLabels(["选择", "名称", "主机 / IP", "分组", "凭据", "在线状态", "通道状态", "任务状态"])
+        self.target_table.setHorizontalHeaderLabels(["选择", "名称", "主机 / IP", "分组", "Agent 令牌", "在线状态", "Agent 状态", "任务状态"])
         self.target_table.setAlternatingRowColors(True)
         self.target_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.target_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -388,20 +393,20 @@ class MainWindow(QMainWindow):
             ("测试网络状态（Ping/端口）", self._test_distribution_hosts_online, "radar"),
         ]:
             b = QPushButton(text); b.setIcon(app_icon(icon)); b.clicked.connect(fn); target_action_buttons.append(b)
-        self.btn_winrm_test = QPushButton("测试已选主机 WinRM")
+        self.btn_winrm_test = QPushButton("测试已选主机 Agent")
         self.btn_winrm_test.setIcon(app_icon("terminal"))
         self.btn_winrm_test.setToolTip(
-            "只测试当前已勾选的主机。没有分发映射时只验证 WinRM；有启用的分发映射时，还会测试目标目录的创建、写入、读取和删除。"
+            "只测试当前已勾选主机的 FDS Agent HTTPS 连接和配对令牌。"
         )
-        self.btn_winrm_test.clicked.connect(self._test_winrm_targets)
+        self.btn_winrm_test.clicked.connect(self._test_agent_targets)
         target_action_buttons.append(self.btn_winrm_test)
         self.btn_force_restart = QPushButton("强制重启选中主机")
         self.btn_force_restart.setIcon(app_icon("refresh"))
         self.btn_force_restart.setToolTip(
-            "通过 WinRM 后台强制重启当前勾选的目标主机，不依赖 explorer.exe 或交互桌面。"
-            "执行前会再次确认，重启后 WinRM 连接中断属于正常现象。"
+            "通过 FDS Agent 直接强制重启当前勾选的目标主机，不依赖 explorer.exe、RDP 或交互桌面。"
+            "执行前会再次确认，重启后 Agent 连接中断属于正常现象。"
         )
-        self.btn_force_restart.clicked.connect(self._force_restart_selected_hosts)
+        self.btn_force_restart.clicked.connect(self._force_restart_agent_hosts)
         target_action_buttons.append(self.btn_force_restart)
         self.btn_agent_test = QPushButton("测试已选主机 Agent")
         self.btn_agent_test.setIcon(app_icon("terminal"))
@@ -413,6 +418,11 @@ class MainWindow(QMainWindow):
         self.btn_agent_restart.setToolTip("通过 FDS Agent 直接发送 shutdown.exe /r /f /t 0，不依赖 explorer.exe、RDP 或交互桌面。")
         self.btn_agent_restart.clicked.connect(self._force_restart_agent_hosts)
         target_action_buttons.append(self.btn_agent_restart)
+        # The legacy button slots above are retained only as compatibility
+        # attributes for old saved layouts.  Show one Agent control for each
+        # action so the page cannot suggest two different transports.
+        self.btn_agent_test.setVisible(False)
+        self.btn_agent_restart.setVisible(False)
         self.btn_target_env_check = QPushButton("ADMS 部署前检查")
         self.btn_target_env_check.setIcon(app_icon("search"))
         self.btn_target_env_check.setToolTip(
@@ -455,20 +465,22 @@ class MainWindow(QMainWindow):
         self.btn_winrm_setup.setToolTip("查看其他 WinRM 准备方式和脚本内容。")
         self.btn_winrm_setup.clicked.connect(self._show_winrm_setup_guide)
         target_action_buttons.append(self.btn_winrm_setup)
+        for legacy_button in (
+            self.btn_target_env_check, self.btn_open_rdp, self.btn_download_adms_setup,
+            self.btn_download_adms_restore, self.btn_winrm_setup,
+        ):
+            legacy_button.setVisible(False)
         def _compact_action_button(button: QPushButton):
             # 横向允许拉伸，让同一行按钮均匀填满；高度仍保持紧凑。
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             button.setMinimumWidth(0)
             button.setMinimumHeight(34)
 
-        # 固定呈现顺序：第一行放主机选择与状态动作，后续行分别放 WinRM、Agent、
-        # 诊断和配置脚本；两种通道并列呈现，避免用户误把 Agent 当成 WinRM 配置。
+        # 固定呈现顺序：只显示 Agent 主机选择、连通性、测试和重启动作。
+        # 旧 WinRM/RDP/ADMS 配置入口保留为兼容属性，但不再加入布局。
         target_action_buttons = [
             self.btn_test_all_winrm_select, *target_action_buttons[:4],
-            self.btn_winrm_test, self.btn_force_restart,
-            self.btn_agent_test, self.btn_agent_restart,
-            self.btn_target_env_check, self.btn_open_rdp,
-            self.btn_winrm_setup, self.btn_download_adms_setup, self.btn_download_adms_restore,
+            self.btn_force_restart,
         ]
         for b in target_action_buttons:
             _compact_action_button(b)
@@ -480,9 +492,8 @@ class MainWindow(QMainWindow):
             tr.setColumnStretch(col, 1)
         target_l.addLayout(tr)
         adms_precheck_hint = QLabel(
-            "ADMS 部署前检查：只读检查 WinRM 和时间偏差（≤2 分钟）；"
-            "Domain/Private/Public 防火墙、时区和 Windows Time 仅作为诊断信息显示。防火墙不需要整体关闭，"
-            "只需允许目标机 TCP 5985，真实可达性以 WinRM 测试结果为准。"
+            "Agent 部署前检查：只读检查 Agent HTTPS、时间偏差（≤2 分钟）和目标机诊断信息。"
+            "目标机只需运行 FDS Agent 服务并允许配置的 HTTPS 端口；客户机无需启用 WinRM。"
         )
         adms_precheck_hint.setObjectName("Muted")
         adms_precheck_hint.setWordWrap(True)
@@ -493,15 +504,15 @@ class MainWindow(QMainWindow):
         cred_title = QLabel("凭据管理")
         self.btn_set_host_cred = QPushButton("设置选中凭据")
         self.btn_set_host_cred.setIcon(app_icon("edit"))
-        self.btn_set_host_cred.setToolTip("为表格中高亮选择的一台或多台主机设置自定义 WinRM 凭据。按 Ctrl / Shift 可选择多行。")
+        self.btn_set_host_cred.setToolTip("旧 WinRM 凭据入口已停用，请使用“设置 Agent 令牌”。")
         self.btn_set_host_cred.clicked.connect(self._set_selected_host_credentials)
         self.btn_batch_host_cred = QPushButton("批量设置凭据")
         self.btn_batch_host_cred.setIcon(app_icon("hosts"))
-        self.btn_batch_host_cred.setToolTip("为当前勾选的全部分发目标主机设置同一套自定义 WinRM 凭据。")
+        self.btn_batch_host_cred.setToolTip("旧 WinRM 凭据入口已停用，请使用“设置 Agent 令牌”。")
         self.btn_batch_host_cred.clicked.connect(self._set_checked_host_credentials)
         self.btn_clear_host_cred = QPushButton("恢复默认凭据")
         self.btn_clear_host_cred.setIcon(app_icon("clear"))
-        self.btn_clear_host_cred.setToolTip("清除表格中高亮选择主机的自定义凭据，恢复使用顶部默认凭据。")
+        self.btn_clear_host_cred.setToolTip("旧 WinRM 凭据入口已停用。")
         self.btn_clear_host_cred.clicked.connect(self._restore_selected_default_credentials)
         self.btn_set_agent_token = QPushButton("设置 Agent 令牌")
         self.btn_set_agent_token.setIcon(app_icon("settings"))
@@ -514,10 +525,12 @@ class MainWindow(QMainWindow):
         cred_actions.addWidget(self.btn_batch_host_cred)
         cred_actions.addWidget(self.btn_clear_host_cred)
         cred_actions.addWidget(self.btn_set_agent_token)
-        cred_note = QLabel("大多数主机使用默认凭据；只有账号/密码不同的主机才需要自定义。")
+        cred_note = QLabel("每台目标主机只需设置一次 Agent 配对令牌；令牌使用 Windows 凭据管理器保存。")
         cred_note.setObjectName("Muted"); cred_note.setWordWrap(True)
         cred_actions.addWidget(cred_note, 1)
         target_l.addLayout(cred_actions)
+        for legacy_cred_button in (self.btn_set_host_cred, self.btn_batch_host_cred, self.btn_clear_host_cred):
+            legacy_cred_button.setVisible(False)
 
 
         def task_toggle(title: str, checked: bool) -> QPushButton:
@@ -550,21 +563,21 @@ class MainWindow(QMainWindow):
         ol.addWidget(self.chk_distribution); ol.addWidget(self.chk_verify); ol.addWidget(self.chk_preflight); ol.addWidget(QLabel("失败重试")); ol.addWidget(self.retry_spin); ol.addWidget(QLabel("主机并发数")); ol.addWidget(self.concurrent_spin); ol.addStretch(1); opts_l.addLayout(ol)
         bind_task_card(self.chk_distribution, opts)
 
-        backup_card, backup_l = card("备份（独立可选）", "备份与文件分发完全解耦：备份文件保存在各目标 Windows 主机本地；加入组合任务时备份即将被覆盖的文件，单独执行时通过 WinRM 浏览并勾选需要备份的目标。")
-        br0=QHBoxLayout(); self.chk_backup=task_toggle("分发前备份", bool(self.settings.backup_task_enabled or self.settings.backup_existing)); self.btn_run_backup=QPushButton("单独执行备份"); self.btn_run_backup.setIcon(app_icon("play")); self.btn_run_backup.clicked.connect(self._run_backup_standalone); br0.addWidget(self.chk_backup); br0.addStretch(1); br0.addWidget(self.btn_run_backup); backup_l.addLayout(br0)
+        backup_card, backup_l = card("备份（独立可选）", "备份与文件分发完全解耦：组合任务中的覆盖前备份通过 FDS Agent HTTPS 完成，备份文件保存在各目标主机本地。")
+        br0=QHBoxLayout(); self.chk_backup=task_toggle("分发前备份", bool(self.settings.backup_task_enabled or self.settings.backup_existing)); self.btn_run_backup=QPushButton("单独执行备份"); self.btn_run_backup.setIcon(app_icon("play")); self.btn_run_backup.clicked.connect(self._run_backup_standalone); self.btn_run_backup.setVisible(False); br0.addWidget(self.chk_backup); br0.addStretch(1); br0.addWidget(self.btn_run_backup); backup_l.addLayout(br0)
         bf=QFormLayout(); self.backup_root=QLineEdit(self.settings.default_backup_root); self.backup_root.setPlaceholderText(r"留空：在目标主机对应目录使用 .fds_backup；可填目标主机本地路径，例如 E:\Backup")
         bf.addRow("目标主机备份根目录", self.backup_root); backup_l.addLayout(bf)
         backup_location=QLabel("备份位置：各目标 Windows 主机本地，不会把备份文件回收到当前电脑。")
         backup_location.setObjectName("Muted"); backup_location.setWordWrap(True); backup_l.addWidget(backup_location)
-        hint=QLabel(r"组合执行时，只备份本次将被覆盖的目标文件；单独执行备份时会打开远程文件浏览器，从盘符开始直接浏览文件夹和文件并勾选目标，文件夹会递归备份，不依赖分发映射。目标主机备份根目录不存在时自动创建，已存在时直接使用；自定义根目录按任务 ID、原盘符和原目录结构保存。")
+        hint=QLabel(r"组合执行时，只备份本次将被覆盖的目标文件；目标主机备份根目录不存在时自动创建，已存在时直接使用；自定义根目录按任务 ID、原盘符和原目录结构保存。Agent 只允许操作安装时配置的 AllowedRoots。")
         hint.setObjectName("Muted"); hint.setWordWrap(True); backup_l.addWidget(hint)
         bind_task_card(self.chk_backup, backup_card)
 
         remote, remote_l = card(
-            "WinRM 连接与远程操作",
-            "执行顺序：结束目标进程 → 分发前命令 → 文件分发 → 分发后命令；模块开关只决定是否加入本次任务，不影响配置编辑。",
+            "FDS Agent 远程操作",
+            "Agent 仅提供受控的进程树结束和强制重启；旧 WinRM 命令、交互式桌面和任意 CMD 已从本分支移除。",
         )
-        rt=QHBoxLayout(); self.remote_enabled=task_toggle("程序 / 服务前后操作", bool(self.settings.winrm_remote_actions_enabled)); self.remote_https=QCheckBox("HTTPS"); self.remote_port=QSpinBox(); self.remote_port.setRange(1,65535); self.remote_port.setValue(int(self.settings.winrm_port or 5985)); self.remote_https.toggled.connect(lambda c:self.remote_port.setValue(5986 if c else 5985)); self.remote_https.setChecked(bool(self.settings.winrm_use_https)); self.remote_port.setValue(int(self.settings.winrm_port or (5986 if self.remote_https.isChecked() else 5985)))
+        rt=QHBoxLayout(); self.remote_enabled=task_toggle("Agent 进程 / 重启操作", bool(self.settings.winrm_remote_actions_enabled)); self.remote_https=QCheckBox("HTTPS"); self.remote_port=QSpinBox(); self.remote_port.setRange(1,65535); self.remote_port.setValue(int(self.settings.winrm_port or 5985)); self.remote_https.toggled.connect(lambda c:self.remote_port.setValue(5986 if c else 5985)); self.remote_https.setChecked(bool(self.settings.winrm_use_https)); self.remote_port.setValue(int(self.settings.winrm_port or (5986 if self.remote_https.isChecked() else 5985)))
         self.remote_https.setVisible(False); self.remote_port.setVisible(False)
         self.winrm_conn_summary = QLabel(); self.winrm_conn_summary.setObjectName("Muted")
         self._refresh_winrm_connection_summary()
@@ -574,7 +587,7 @@ class MainWindow(QMainWindow):
 
         pipeline = QFrame(); pipeline.setObjectName("SoftCard"); self.remote_pipeline = pipeline
         pl = QVBoxLayout(pipeline); pl.setContentsMargins(14,12,14,12); pl.setSpacing(9)
-        order = QLabel("0  WinRM 认证与目标目录预检查（自动，任何停服/杀进程之前完成）")
+        order = QLabel("0  Agent HTTPS 认证与目标目录预检查（自动，任何进程操作之前完成）")
         order.setObjectName("PipelineAuto"); pl.addWidget(order)
 
         cwd_row=QHBoxLayout(); cwd_label=QLabel("命令工作目录"); cwd_label.setObjectName("PipelineLabel")
@@ -596,12 +609,12 @@ class MainWindow(QMainWindow):
         self.kill_processes=QLineEdit("; ".join(self.settings.winrm_kill_processes or [])); self.kill_processes.setPlaceholderText("例如：adms.exe; helper.exe")
         self.btn_select_remote_processes=QPushButton("选择远程进程")
         self.btn_select_remote_processes.setIcon(app_icon("terminal"))
-        self.btn_select_remote_processes.setToolTip("通过 WinRM 只读读取参考目标主机当前进程，按实际 exe 镜像名勾选要结束的进程。")
+        self.btn_select_remote_processes.setToolTip("Agent-only 分支不再通过 WinRM 读取进程；请直接填写 EXE 镜像名。")
         self.btn_select_remote_processes.clicked.connect(self._select_remote_processes)
         kill_row=QHBoxLayout(); kill_row.setContentsMargins(0,0,0,0); kill_row.addWidget(self.kill_processes,1); kill_row.addWidget(self.btn_select_remote_processes)
         sf.addRow("① 结束目标进程", kill_row); pl.addLayout(sf)
 
-        kill_hint=QLabel("先结束这里选择/填写的 EXE（例如 GUI/客户端），释放可能占用的程序文件；随后再执行下面的停止/准备命令。")
+        kill_hint=QLabel("Agent 会按 EXE 镜像名结束所有匹配实例，并递归结束整个子进程树；请填写例如 GridExplorer.exe。")
         kill_hint.setObjectName("Muted"); kill_hint.setWordWrap(True); pl.addWidget(kill_hint)
 
         pre_label=QLabel("② 分发前 CMD（停止/准备）"); pre_label.setObjectName("PipelineStep")
@@ -609,7 +622,7 @@ class MainWindow(QMainWindow):
         self.pre_commands.setPlainText(self.settings.winrm_pre_commands_text or "")
         pl.addWidget(pre_label); pl.addWidget(self.pre_commands)
 
-        transfer = QLabel("③ 文件分发（自动：备份旧文件 → WinRM 流式上传 → 临时文件校验 → 正式替换 → 最终校验）")
+        transfer = QLabel("③ 文件分发（自动：备份旧文件 → Agent HTTPS 流式上传 → 临时文件校验 → 正式替换 → 最终校验）")
         transfer.setObjectName("PipelineAuto"); transfer.setWordWrap(True); pl.addWidget(transfer)
 
         post_label=QLabel("④ 分发后 CMD"); post_label.setObjectName("PipelineStep")
@@ -625,6 +638,22 @@ class MainWindow(QMainWindow):
 
         cwd_hint=QLabel(r"提示：当前顺序为先结束选中的 GUI/客户端进程，再执行 sys_ctl stop 等停止/准备命令，完成文件分发后再执行 sys_ctl start fast 等启动/恢复命令。命令工作目录建议设置为实际 bin 目录。上次使用的命令、进程和执行方式会自动记住。")
         cwd_hint.setObjectName("Muted"); cwd_hint.setWordWrap(True); remote_l.addWidget(cwd_hint)
+
+        # Agent 不执行任意远程 CMD，也不依赖交互式桌面。隐藏旧 WinRM
+        # 配置控件并清空旧配置，避免历史设置在 Agent 分支被误发送。
+        for legacy_widget in (
+            self.winrm_conn_summary, advanced_btn, order, cwd_label, self.command_workdir,
+            exec_label, self.command_execution_mode, exec_hint, pre_label, self.pre_commands,
+            transfer, post_label, self.post_commands, cmd_hint, self.post_on_failure, cwd_hint,
+            self.btn_select_remote_processes,
+        ):
+            legacy_widget.setVisible(False)
+        self.remote_https.setVisible(False)
+        self.remote_port.setVisible(False)
+        self.command_workdir.clear()
+        self.pre_commands.clear()
+        self.post_commands.clear()
+        self.post_on_failure.setChecked(False)
 
         version_card, version_l = card(
             "版本检查（独立可选）",
@@ -650,12 +679,18 @@ class MainWindow(QMainWindow):
         vr1=QHBoxLayout(); self.version_collect=QCheckBox("回收 CSV 到本机"); self.version_collect.setChecked(bool(self.settings.version_checker_collect_excel)); self.version_close=QCheckBox("完成后关闭 Version Checker"); self.version_close.setChecked(bool(self.settings.version_checker_close_after)); vr1.addWidget(self.version_collect); vr1.addWidget(self.version_close); vr1.addStretch(1); version_l.addLayout(vr1)
         vh=QLabel("执行方式：WinRM 负责调度，在目标机当前已登录用户的交互桌面启动 version_checker；自动执行 Save → 等待 Information 提示 → OK → 确认 version_checker_result.csv 写入完成 → 直接回收到所选本机结果目录（文件名前加主机名）→ 可选关闭程序。Save 优先使用 UI Automation/Win32 控件，必要时使用窗口相对位置点击。目标机必须已有用户登录。")
         vh.setObjectName("Muted"); vh.setWordWrap(True); version_l.addWidget(vh)
+        # Version Checker 依赖交互式桌面和旧 WinRM 调度，Agent API 不提供
+        # 任意 GUI 启动能力；Agent-only 分支不允许它进入任务链。
+        self.version_after_distribution.setChecked(False)
+        self.version_after_distribution.setEnabled(False)
+        self.btn_run_version_check.setVisible(False)
+        version_card.setVisible(False)
 
         run_card, run_l = card("执行与日志", "本次任务按已启用组件执行：备份 → 程序/服务前置操作 → 文件分发 → 后置操作 → Version Checker。未启用的步骤自动跳过。")
         self.task_plan_label=QLabel(); self.task_plan_label.setObjectName("PipelineAuto"); self.task_plan_label.setWordWrap(True); run_l.addWidget(self.task_plan_label)
         ar=QHBoxLayout()
         self.btn_clear_log=QPushButton("清空日志"); self.btn_clear_log.setIcon(app_icon("clear")); self.btn_clear_log.setToolTip("仅清空当前页面的执行日志显示，不删除审计日志和分发历史"); self.btn_clear_log.clicked.connect(self._clear_distribution_log)
-        self.btn_dry_run=QPushButton("Dry Run 预演"); self.btn_dry_run.setIcon(app_icon("search")); self.btn_dry_run.setToolTip("只检查源文件、WinRM、远端路径、磁盘空间、CMD 工作目录和 Version Checker 路径；不会上传、覆盖、备份、结束进程或执行命令。")
+        self.btn_dry_run=QPushButton("Dry Run 预演"); self.btn_dry_run.setIcon(app_icon("search")); self.btn_dry_run.setToolTip("Agent-only 分支暂不提供旧 WinRM 预演；正式执行前会自动完成 Agent 认证、目录检查和文件校验。"); self.btn_dry_run.setVisible(False)
         self.btn_retry_failed=QPushButton("重试失败主机"); self.btn_retry_failed.setIcon(app_icon("refresh")); self.btn_retry_failed.setEnabled(False); self.btn_retry_failed.setToolTip("仅重新执行上一轮失败的主机，不重复执行已经成功的主机。")
         self.btn_export_result=QPushButton("导出任务结果"); self.btn_export_result.setIcon(app_icon("file")); self.btn_export_result.setEnabled(False); self.btn_export_result.setToolTip("把最近一次分发任务的主机级结果导出为 Excel。")
         self.btn_start=QPushButton("开始执行所选任务"); self.btn_start.setObjectName("Primary"); self.btn_start.setIcon(app_icon("play"))
@@ -781,37 +816,16 @@ class MainWindow(QMainWindow):
         audit.operation(self.settings.audit_path,"MAPPING","ADD","SUCCESS","已添加分发映射。",subject=mapping.mapping_id,details=mapping.safe_dict())
 
     def _remote_drive_context_for_mapping(self):
-        """为分发映射对话框准备按主机解析后的 WinRM 凭据。
-
-        只用于读取远程盘符，不记录密码。没有勾选主机或任一主机缺少凭据时，
-        映射仍可手工输入目标路径，但自动盘符读取会禁用。
-        """
-        hosts = self._selected_hosts()
-        if not hosts:
-            return [], "请先在下方勾选至少一台目标主机，即可通过 WinRM 自动读取远程盘符；也可以继续手动输入。"
-        try:
-            credentials = self._resolve_credentials(hosts)
-        except Exception as exc:
-            return [], f"当前勾选主机的 WinRM 凭据不完整，暂时不能自动读取盘符：{exc}"
-        contexts = []
-        for h in hosts:
-            username, password, source = credentials[h.host]
-            contexts.append({
-                "host": h.host,
-                "name": h.name,
-                "username": username,
-                "password": password,
-                "source": source,
-            })
-        return contexts, ""
+        """Disable the old WinRM drive browser in the Agent-only branch."""
+        return [], "Agent 分支不再通过 WinRM 自动读取盘符；请直接填写目标主机上的绝对路径，例如 D:\\ADMS\\bin。"
 
     def _mapping_dialog_kwargs(self):
         contexts, hint = self._remote_drive_context_for_mapping()
         return {
             "remote_drive_contexts": contexts,
             "remote_drive_hint": hint,
-            "use_https": self.remote_https.isChecked(),
-            "winrm_port": self.remote_port.value(),
+            "use_https": False,
+            "winrm_port": 0,
         }
 
     def _add_mapping_files(self):
@@ -1251,6 +1265,67 @@ class MainWindow(QMainWindow):
         hosts=self._selected_hosts()
         if not hosts:QMessageBox.warning(self,"在线测试","请先至少勾选一台目标主机。");return
         self._start_host_status_test([h.host for h in hosts],"distribution")
+
+    def _test_all_agent_and_select(self):
+        """Test every saved Agent and rebuild the current selection from the result."""
+        hosts = db.list_hosts()
+        if not hosts:
+            QMessageBox.information(self, "全量测试并选中 Agent", "当前没有已保存的目标主机。")
+            return
+        running = getattr(self, "agent_select_thread", None)
+        if running and running.isRunning():
+            QMessageBox.information(self, "Agent 测试", "已有全量 Agent 测试正在执行，请等待完成。")
+            return
+        try:
+            tokens = self._resolve_agent_tokens(hosts)
+        except Exception as exc:
+            QMessageBox.warning(self, "Agent 测试", str(exc))
+            return
+
+        self._suppress_target_selection_persist = True
+        try:
+            for row in range(self.target_table.rowCount()):
+                checkbox = self.target_table.cellWidget(row, 0)
+                if checkbox:
+                    checkbox.setChecked(False)
+        finally:
+            self._suppress_target_selection_persist = False
+        self._refresh_mapping_scope()
+        self.btn_test_all_winrm_select.setEnabled(False)
+        self.btn_test_all_winrm_select.setText("正在测试全部 Agent…")
+        self.agent_select_thread = AgentTargetTestThread(hosts, tokens, max_workers=8)
+        self.agent_select_thread.result.connect(self._agent_select_result)
+        self.agent_select_thread.completed.connect(self._agent_select_completed)
+        self.agent_select_thread.start()
+
+    def _agent_select_result(self, host, success, message):
+        self._suppress_target_selection_persist = True
+        try:
+            for row in range(self.target_table.rowCount()):
+                host_item = self.target_table.item(row, 2)
+                if host_item and host_item.text().strip() == host:
+                    checkbox = self.target_table.cellWidget(row, 0)
+                    if checkbox:
+                        checkbox.setChecked(bool(success))
+                    break
+        finally:
+            self._suppress_target_selection_persist = False
+        self._refresh_mapping_scope()
+        self._agent_target_test_result(host, success, message)
+
+    def _agent_select_completed(self, success, failed):
+        self.btn_test_all_winrm_select.setEnabled(True)
+        self.btn_test_all_winrm_select.setText("全量测试并选中 Agent")
+        self._save_all_target_selection_preferences()
+        self.refresh_audit()
+        self.refresh_hosts()
+        self._refresh_mapping_scope()
+        QMessageBox.information(
+            self,
+            "全量测试并选中 Agent",
+            f"全量 Agent 测试完成。\n\nAgent 认证通过并已选中：{success} 台\n"
+            f"测试失败并已取消：{failed} 台\n\n后续分发将只针对已选中的主机。",
+        )
 
     def _test_all_winrm_and_select(self):
         """测试全部主机的 WinRM 身份验证，并将通过者设为本次分发目标。"""
@@ -1863,7 +1938,7 @@ class MainWindow(QMainWindow):
         if any(host.target_mode == "AGENT" for host in hosts):
             QMessageBox.information(
                 self, "Dry Run",
-                "当前 Dry Run 仍只验证 WinRM 业务通道；FDS Agent 正式分发已支持 HTTPS 上传和校验。"
+                "当前 Agent-only 分支不提供旧 WinRM Dry Run；正式分发会自动完成 Agent HTTPS 认证、目录检查和文件校验。"
                 "请先对 Agent 主机使用“测试已选主机 Agent”，正式执行时再分发。",
             )
             return
@@ -2054,16 +2129,26 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self,"执行计划检查",str(e));return
 
+        legacy_hosts = [host for host in hosts if host.target_mode != "AGENT"]
+        if legacy_hosts:
+            names = "、".join((host.name or host.host) for host in legacy_hosts[:5])
+            if len(legacy_hosts) > 5:
+                names += f" 等 {len(legacy_hosts)} 台"
+            QMessageBox.warning(
+                self, "需要安装 FDS Agent",
+                f"当前分支已移除 WinRM 正式通道，不能分发到旧通道主机：{names}。\n\n"
+                "请在目标主机安装 FDS Agent，并在主机配置中填写 HTTPS 端口、证书指纹和配对令牌。",
+            )
+            return
+
         self.settings.distribution_enabled=distribution_enabled; self.settings.backup_task_enabled=backup_enabled; self.settings.version_checker_enabled=version_enabled
-        self.settings.verify_sha256=self.chk_verify.isChecked();self.settings.backup_existing=backup_enabled;self.settings.preflight_check=self.chk_preflight.isChecked();self.settings.retry_count=self.retry_spin.value();self.settings.max_concurrency=self.concurrent_spin.value();self.settings.default_backup_root=self.backup_root.text().strip();self.settings.winrm_use_https=self.remote_https.isChecked();self.settings.winrm_port=self.remote_port.value();self.settings.winrm_command_workdir=self.command_workdir.text().strip()
+        self.settings.verify_sha256=self.chk_verify.isChecked();self.settings.backup_existing=backup_enabled;self.settings.preflight_check=self.chk_preflight.isChecked();self.settings.retry_count=self.retry_spin.value();self.settings.max_concurrency=self.concurrent_spin.value();self.settings.default_backup_root=self.backup_root.text().strip()
         self._save_remote_action_preferences()
         self._save_version_checker_preferences()
-        self._save_default_winrm_credential(show_error=True)
-        winrm_hosts = [host for host in hosts if host.target_mode != "AGENT"]
-        agent_hosts = [host for host in hosts if host.target_mode == "AGENT"]
+        agent_hosts = list(hosts)
         try:
-            credentials = self._resolve_credentials(winrm_hosts) if winrm_hosts else {}
-            agent_tokens = self._resolve_agent_tokens(agent_hosts) if agent_hosts else {}
+            credentials = {}
+            agent_tokens = self._resolve_agent_tokens(agent_hosts)
         except Exception as e:
             QMessageBox.warning(self, "远程通道凭据", str(e)); return
 
@@ -2077,21 +2162,16 @@ class MainWindow(QMainWindow):
             command_execution_mode=self.command_execution_mode.currentData() or "INTERACTIVE",
         )
         targets=len(set(m.target_path for m in mappings))
-        default_count=sum(1 for _,_,src in credentials.values() if src=="默认凭据")
-        custom_count=len(credentials)-default_count
         host_lines="\n".join(f"  • {(h.name or h.host)} ({h.host})" if (h.name or h.host) != h.host else f"  • {h.host}" for h in hosts)
         msg=(f"分发映射：{len(mappings)} 条\n目标目录：{targets} 个\n目标主机：{len(hosts)} 台\n{host_lines}\n"
-             f"凭据：默认 {default_count} 台 / 自定义 {custom_count} 台\n"
+             f"Agent 配对：{len(agent_tokens)} 台\n"
              + (f"目标主机本地备份目录：{self.backup_root.text().strip() or '各目标目录\\.fds_backup'}\n" if backup_enabled else "")
-             + f"Agent 主机：{len(agent_hosts)} 台；WinRM 主机：{len(winrm_hosts)} 台\n"
              + f"校验策略：{'文件大小 + SHA256' if self.chk_verify.isChecked() else '文件大小'}\n"
-             f"分发前预检查：{'启用' if self.chk_preflight.isChecked() else '关闭'}\n传输方式：WinRM\n"
+             f"分发前预检查：{'启用' if self.chk_preflight.isChecked() else '关闭'}\n"
              f"附加远程操作：{'已启用' if remote_plan.enabled else '未启用'}\n"
-             f"分发后版本检查：{'已启用' if self.version_after_distribution.isChecked() else '未启用'}\n"
-             f"CMD 工作目录：{remote_plan.command_workdir or 'WinRM 默认目录'}\n"
-             f"CMD 执行方式：{'目标机登录桌面（交互式）' if remote_plan.command_execution_mode == 'INTERACTIVE' else 'WinRM 后台'}\n"
+             f"传输方式：FDS Agent HTTPS\n"
              "执行顺序：预检查 → 结束目标进程 → 分发前 CMD → 文件分发 → 分发后 CMD\n\n"
-             "所有主机会执行同一套映射；WinRM 主机使用 WinRM 凭据，Agent 主机使用 HTTPS 配对令牌。"
+             "所有主机会执行同一套映射；目标主机使用 FDS Agent HTTPS 配对令牌。"
              "本操作可能结束远程进程并覆盖目标文件。\n确定继续吗？")
         if retry_mode:
             msg = "【仅重试上一轮失败主机】\n\n" + msg
@@ -2117,8 +2197,7 @@ class MainWindow(QMainWindow):
                      "auth_sources":{h.host:(credentials[h.host][2] if h.target_mode != "AGENT" else agent_tokens[h.host][1]) for h in hosts},
                      "backup_root":self.backup_root.text().strip(),"verify_sha256":self.chk_verify.isChecked(),
                      "preflight":self.chk_preflight.isChecked(),"remote_actions":remote_plan.enabled,
-                     "transport":"MIXED_WINRM_AGENT" if agent_hosts and winrm_hosts else ("AGENT_HTTPS" if agent_hosts else "WINRM"),
-                     "winrm_port":remote_plan.port,"winrm_https":remote_plan.use_https,
+                     "transport":"AGENT_HTTPS",
                      "command_execution_mode":remote_plan.command_execution_mode},
         )
         for r in range(self.target_table.rowCount()):self.target_table.setItem(r,7,QTableWidgetItem(""))
@@ -2450,7 +2529,7 @@ class MainWindow(QMainWindow):
         canvas, root = self._page_canvas()
         c, l = card(
             "远程文件",
-            "独立的单机人工文件管理工具：通过 WinRM 浏览目标 Windows 文件系统，并在本机与远程之间上传/下载。"
+            "独立的单机人工文件管理工具：通过 FDS Agent HTTPS 浏览 Agent 允许的目录，并在本机与远程之间上传/下载。"
             "它不会加入文件分发、备份、Dry Run、Version Checker 或任何组合任务。",
         )
 
@@ -2470,7 +2549,7 @@ class MainWindow(QMainWindow):
         l.addLayout(top)
 
         help_label = QLabel(
-            "一次只连接 1 台主机，使用“文件分发 → Windows 目标主机”中相同的有效 WinRM 凭据。"
+            "一次只连接 1 台主机，使用“文件分发 → Windows 目标主机”中相同的 Agent 配对令牌。"
             "本机文件可直接从 Windows 资源管理器拖入远程列表上传；下载时先选择本地目录，再选择远程文件。"
         )
         help_label.setWordWrap(True); help_label.setObjectName("Muted"); l.addWidget(help_label)
@@ -2602,10 +2681,18 @@ class MainWindow(QMainWindow):
         host = self._remote_file_current_host()
         if not host:
             raise ValueError("请先选择一台目标主机。")
-        self._save_default_winrm_credential(show_error=False)
-        creds = self._resolve_credentials([host])
-        username, password, source = creds[host.host]
-        return host, {"host": host.host, "name": host.name, "username": username, "password": password, "credential_source": source}
+        if host.target_mode != "AGENT":
+            raise ValueError("当前分支只支持 FDS Agent HTTPS；请先在主机配置中安装并配对 Agent。")
+        token = self._load_agent_token(host.host)
+        if not token:
+            raise ValueError("该主机尚未设置 Agent 配对令牌。")
+        return host, {
+            "host": host.host,
+            "name": host.name,
+            "token": token,
+            "agent_port": int(host.agent_port or 8743),
+            "certificate_sha256": host.agent_certificate_sha256,
+        }
 
     def _remote_file_host_changed(self, *_):
         host = self._remote_file_current_host()
@@ -2702,11 +2789,12 @@ class MainWindow(QMainWindow):
             for d in payload.get("data") or []:
                 r=self.remote_file_table.rowCount(); self.remote_file_table.insertRow(r)
                 name=d.get("name","")
-                item=self._checkable_file_item(f"{name}  {d.get('volume_label','')}".strip())
-                item.setData(Qt.UserRole+401,name); item.setData(Qt.UserRole+402,True); self.remote_file_table.setItem(r,0,item)
-                self.remote_file_table.setItem(r,1,QTableWidgetItem("磁盘"))
-                self.remote_file_table.setItem(r,2,QTableWidgetItem(f"可用 {human_bytes(int(d.get('free_size',0) or 0))} / {human_bytes(int(d.get('total_size',0) or 0))}"))
-                self.remote_file_table.setItem(r,3,QTableWidgetItem(""))
+                path = str(d.get("path") or name)
+                item=self._checkable_file_item(name)
+                item.setData(Qt.UserRole+401,path); item.setData(Qt.UserRole+402,True); self.remote_file_table.setItem(r,0,item)
+                self.remote_file_table.setItem(r,1,QTableWidgetItem("Agent 允许目录"))
+                self.remote_file_table.setItem(r,2,QTableWidgetItem("—"))
+                self.remote_file_table.setItem(r,3,QTableWidgetItem(str(d.get("modified", ""))))
         else:
             path=str(payload.get("path") or "")
             self.remote_file_path.setText(path)
@@ -2824,7 +2912,7 @@ class MainWindow(QMainWindow):
     def _build_inventory_page(self):
         canvas,root=self._page_canvas(); c,l=card(
             "已保存主机",
-            "主机管理只维护机器身份、分组和连接能力；可在主机配置中选择 WinRM 或 FDS Agent。WinRM 凭据和 Agent 令牌统一在“文件分发 → Windows 目标主机”管理。Ping、SMB 445、RDP 3389、DNS/NetBIOS/SMB 身份仅用于发现与辅助诊断。",
+            "主机管理只维护机器身份、分组和连接能力。本分支正式操作统一使用 FDS Agent HTTPS；Agent 令牌在“文件分发 → Windows 目标主机”管理。Ping、SMB 445、RDP 3389、DNS/NetBIOS/SMB 身份仅用于发现与辅助诊断。",
         )
         # 主机数量直接展示给用户，不再需要通过行数或数据库 ID 猜测。
         self.inventory_count_label = QLabel("当前共 0 台主机")
@@ -2836,7 +2924,7 @@ class MainWindow(QMainWindow):
         inventory_filter_row.addWidget(QLabel("快速筛选"))
         self.inventory_filter_edit = QLineEdit()
         self.inventory_filter_edit.setClearButtonEnabled(True)
-        self.inventory_filter_edit.setPlaceholderText("输入 IP、主机名、分组、在线状态、WinRM 状态或备注")
+        self.inventory_filter_edit.setPlaceholderText("输入 IP、主机名、分组、在线状态、Agent 状态或备注")
         self.inventory_filter_edit.textChanged.connect(self._apply_inventory_filter)
         inventory_filter_row.addWidget(self.inventory_filter_edit, 1)
         self.inventory_filter_count = QLabel("显示 0 / 0 台")
@@ -2846,8 +2934,8 @@ class MainWindow(QMainWindow):
 
         self.host_table=QTableWidget(0,18)
         self.host_table.setHorizontalHeaderLabels([
-            "选择","ID","名称","主机 / IP","名称来源","名称状态","分组","WinRM 凭据",
-            "在线状态","Ping","445 SMB（识别）","3389 RDP（识别）","WinRM 端口","WinRM 状态","SMB 辅助状态","最后测试","最后发现","备注"
+            "选择","ID","名称","主机 / IP","名称来源","名称状态","分组","Agent 令牌",
+            "在线状态","Ping","445 SMB（识别）","3389 RDP（识别）","Agent 端口","Agent 状态","SMB 辅助状态","最后测试","最后发现","备注"
         ])
         self.host_table.setAlternatingRowColors(True); self.host_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.host_table.setSelectionMode(QAbstractItemView.ExtendedSelection); self.host_table.setEditTriggers(QAbstractItemView.NoEditTriggers); self.host_table.verticalHeader().setVisible(False); configure_full_content_table(self.host_table, fixed_columns={0: 44})
         # SQLite 自增 ID 仅用于程序内部关联。删除/重新发现主机后数字不会连续，
@@ -2859,8 +2947,7 @@ class MainWindow(QMainWindow):
             ("添加",self._add_host,"add"),("编辑",self._edit_host,"edit"),("删除",self._delete_host,"delete"),
             ("全选",lambda:self._set_inventory_checks(True),"check"),("取消全选",lambda:self._set_inventory_checks(False),"clear"),
             ("测试网络状态（Ping/端口）",self._test_inventory_online,"radar"),
-            ("ADMS 部署前检查",lambda:self._check_host_environment(self._selected_inventory_hosts(), "主机管理"),"search"),
-            ("验证主机名",self._verify_inventory_names,"terminal"),("导出 Excel",self._export_inventory_excel,"file"),("刷新",self.refresh_hosts,"refresh")
+            ("导出 Excel",self._export_inventory_excel,"file"),("刷新",self.refresh_hosts,"refresh")
         ]:
             b=QPushButton(text); b.setIcon(app_icon(icon)); b.clicked.connect(fn); row.addWidget(b)
         row.addStretch(1); l.addLayout(row); root.addWidget(c); return canvas
@@ -2903,7 +2990,7 @@ class MainWindow(QMainWindow):
                 verify_text="已验证" if h.hostname_verified else ("未验证" if h.name and h.name != h.host else "未识别")
                 cred_status,_cred_tip=self._credential_status_for_host(h.host, h)
                 vals=[h.id,h.name,h.host,hostname_source_text(h.hostname_source),verify_text,group_text(h.group_name),cred_status,
-                      online_status_text(h.online_status),"是" if h.ping_ok else "","是" if h.smb_port_ok else "","是" if h.rdp_port_ok else "","是" if h.winrm_port_ok else "",winrm_status_label(h.winrm_status),smb_status_label(h.smb_status),h.last_test_at,h.last_seen,h.notes]
+                      online_status_text(h.online_status),"是" if h.ping_ok else "","是" if h.smb_port_ok else "","是" if h.rdp_port_ok else "",str(h.agent_port or 8743),h.agent_status or "UNTESTED",smb_status_label(h.smb_status),h.agent_last_test_at or h.last_test_at,h.last_seen,h.notes]
                 for c,v in enumerate(vals, start=1):self.host_table.setItem(r,c,QTableWidgetItem(str(v if v is not None else "")))
             fit_full_content_table(self.host_table)
             self.host_table.verticalScrollBar().setValue(inventory_scroll)
@@ -2931,10 +3018,10 @@ class MainWindow(QMainWindow):
                 item=QTableWidgetItem(h.name); item.setData(ROLE_HOST_OBJECT,h); self.target_table.setItem(r,1,item)
                 self.target_table.setItem(r,2,QTableWidgetItem(h.host)); self.target_table.setItem(r,3,QTableWidgetItem(group_text(h.group_name)))
                 cred_text,cred_tip=self._credential_status_for_host(h.host, h); cred_item=QTableWidgetItem(cred_text); cred_item.setToolTip(cred_tip); self.target_table.setItem(r,4,cred_item)
-                online=QTableWidgetItem(online_status_text(h.online_status)); online.setToolTip(f"Ping={'是' if h.ping_ok else '否'}，445={'是' if h.smb_port_ok else '否'}，3389={'是' if h.rdp_port_ok else '否'}，WinRM={'是' if h.winrm_port_ok else '否'}\n最后测试：{h.last_test_at or '未测试'}"); self.target_table.setItem(r,5,online)
-                channel_status = (h.agent_status or "UNTESTED") if h.target_mode == "AGENT" else winrm_status_label(h.winrm_status)
+                online=QTableWidgetItem(online_status_text(h.online_status)); online.setToolTip(f"Ping={'是' if h.ping_ok else '否'}，445={'是' if h.smb_port_ok else '否'}，3389={'是' if h.rdp_port_ok else '否'}\n最后测试：{h.last_test_at or '未测试'}"); self.target_table.setItem(r,5,online)
+                channel_status = h.agent_status or "UNTESTED"
                 channel_item = QTableWidgetItem(channel_status)
-                channel_item.setToolTip("FDS Agent（HTTPS）" if h.target_mode == "AGENT" else "WinRM（固定业务通道）")
+                channel_item.setToolTip("FDS Agent（HTTPS）")
                 self.target_table.setItem(r,6,channel_item); self.target_table.setItem(r,7,QTableWidgetItem(""))
             fit_full_content_table(self.target_table)
             self.target_table.verticalScrollBar().setValue(target_scroll)
@@ -2961,21 +3048,21 @@ class MainWindow(QMainWindow):
         if not file_path.lower().endswith(".xlsx"):
             file_path += ".xlsx"
         headers = [
-            "名称", "主机 / IP", "名称来源", "名称状态", "分组", "WinRM 凭据",
-            "在线状态", "Ping", "445 SMB（识别）", "3389 RDP（识别）", "WinRM 端口",
-            "WinRM 状态", "SMB 辅助状态", "最后测试", "最后发现", "备注"
+            "名称", "主机 / IP", "名称来源", "名称状态", "分组", "Agent 令牌",
+            "在线状态", "Ping", "445 SMB（识别）", "3389 RDP（识别）", "Agent 端口",
+            "Agent 状态", "SMB 辅助状态", "最后测试", "最后发现", "备注"
         ]
         rows = []
         for h in hosts:
             verify_text = "已验证" if h.hostname_verified else ("未验证" if h.name and h.name != h.host else "未识别")
-            cred_status, _ = self._credential_status_for_host(h.host)
+            cred_status, _ = self._credential_status_for_host(h.host, h)
             rows.append([
                 h.name, h.host, hostname_source_text(h.hostname_source), verify_text,
                 group_text(h.group_name), cred_status, online_status_text(h.online_status),
                 "是" if h.ping_ok else "否", "是" if h.smb_port_ok else "否",
-                "是" if h.rdp_port_ok else "否", "是" if h.winrm_port_ok else "否",
-                winrm_status_label(h.winrm_status), smb_status_label(h.smb_status),
-                h.last_test_at or "", h.last_seen or "", h.notes or ""
+                "是" if h.rdp_port_ok else "否", str(h.agent_port or 8743),
+                h.agent_status or "UNTESTED", smb_status_label(h.smb_status),
+                h.agent_last_test_at or h.last_test_at or "", h.last_seen or "", h.notes or ""
             ])
         try:
             saved = export_xlsx(file_path, headers, rows, sheet_name="主机信息")
@@ -3068,8 +3155,8 @@ class MainWindow(QMainWindow):
     def _host_status_test_result(self,host,result):
         self._host_status_results[host]=result
         now=datetime.now().isoformat(timespec="seconds")
-        db.update_host_connectivity(host,online_status=result.online_status,ping_ok=result.ping_ok,smb_port_ok=result.smb_port_ok,rdp_port_ok=result.rdp_port_ok,winrm_port_ok=result.winrm_port_ok,last_test_at=now)
-        audit.operation(self.settings.audit_path,"HOST","CONNECTIVITY_TEST","SUCCESS" if result.online_status!="OFFLINE" else "FAILED",result.message,host=host,details={"ping":result.ping_ok,"smb_445":result.smb_port_ok,"rdp_3389":result.rdp_port_ok,"winrm_5985":result.winrm_5985_ok,"winrm_5986":result.winrm_5986_ok,"online_status":result.online_status})
+        db.update_host_connectivity(host,online_status=result.online_status,ping_ok=result.ping_ok,smb_port_ok=result.smb_port_ok,rdp_port_ok=result.rdp_port_ok,agent_port_ok=result.agent_port_ok,last_test_at=now)
+        audit.operation(self.settings.audit_path,"HOST","CONNECTIVITY_TEST","SUCCESS" if result.online_status!="OFFLINE" else "FAILED",result.message,host=host,details={"ping":result.ping_ok,"smb_445":result.smb_port_ok,"rdp_3389":result.rdp_port_ok,"agent_8743":result.agent_8743_ok,"online_status":result.online_status})
         if hasattr(self,"dist_log"):self._append_log(f"[{host}] 在线测试：{result.message.replace(chr(10),'；')}")
 
     def _host_status_test_completed(self,online,offline):
@@ -3088,7 +3175,7 @@ class MainWindow(QMainWindow):
             self._append_log("Ping 不可达主机：" + "、".join(ping_failed))
         else:
             message += "\n\nPing 全部通过。"
-        message += "\n\n注意：Ping/445/3389 仅用于发现和识别；正式分发要求 WinRM 5985/5986 可达并且账号认证通过。"
+        message += "\n\n注意：Ping/445/3389 仅用于发现和识别；正式分发要求目标机 FDS Agent HTTPS 可达且配对令牌认证通过。"
         QMessageBox.information(self,"网络状态测试结果",message)
 
     def _verify_inventory_names(self):
@@ -3117,13 +3204,13 @@ class MainWindow(QMainWindow):
         action.addWidget(self.discovery_progress,1); action.addWidget(self.btn_scan); action.addWidget(self.btn_stop_scan); l.addLayout(action)
         root.addWidget(c)
 
-        rcard,rl=card("发现的 Windows 主机","发现结果仅使用 Ping/445/3389/5985/5986、DNS、NetBIOS、SMB/WKSSVC 等只读信号进行识别。正式文件分发、备份、服务与进程控制仍只使用 WinRM。")
+        rcard,rl=card("发现的 Windows 主机","发现结果仅使用 Ping/445/3389、DNS、NetBIOS、SMB/WKSSVC 等只读信号进行识别。正式文件分发、备份、进程控制和强制重启统一使用 FDS Agent HTTPS。")
         self.discovery_table=QTableWidget(0,12)
-        self.discovery_table.setHorizontalHeaderLabels(["添加","来源网段","IP","识别名称","名称来源","名称状态","445 SMB","3389 RDP","5985 WinRM","5986 WinRM","主机状态","名称说明"])
+        self.discovery_table.setHorizontalHeaderLabels(["添加","来源网段","IP","识别名称","名称来源","名称状态","445 SMB","3389 RDP","8743 Agent","Agent 状态","主机状态","名称说明"])
         self.discovery_table.setAlternatingRowColors(True); self.discovery_table.verticalHeader().setVisible(False); configure_full_content_table(self.discovery_table, fixed_columns={0: 44})
         rl.addWidget(self.discovery_table)
         bottom=QHBoxLayout(); self.discovery_status=QLabel("就绪"); self.discovery_status.setObjectName("Muted")
-        b_verify=QPushButton("深度验证主机名"); b_verify.setIcon(app_icon("terminal")); b_verify.clicked.connect(self._verify_discovered_names)
+        b_verify=QPushButton("深度验证主机名"); b_verify.setIcon(app_icon("terminal")); b_verify.clicked.connect(self._verify_discovered_names); b_verify.setVisible(False)
         b_add=QPushButton("手动同步选中主机"); b_add.setIcon(app_icon("hosts")); b_add.clicked.connect(self._add_discovered)
         bottom.addWidget(self.discovery_status); bottom.addStretch(1); bottom.addWidget(b_verify); bottom.addWidget(b_add); rl.addLayout(bottom); root.addWidget(rcard); return canvas
 
@@ -3231,14 +3318,15 @@ class MainWindow(QMainWindow):
         chk=QCheckBox(); chk.setChecked(True); holder=QWidget(); hl=QHBoxLayout(holder); hl.setContentsMargins(0,0,0,0); hl.setAlignment(Qt.AlignCenter); hl.addWidget(chk); self.discovery_table.setCellWidget(r,0,holder)
         verify="已验证" if x.hostname_verified else ("未验证" if x.hostname else "未识别")
         vals=[x.network,x.host,x.hostname,hostname_source_text(x.hostname_source),verify,
-              "是" if x.port_445 else "","是" if x.port_3389 else "","是" if x.port_5985 else "","是" if x.port_5986 else "",status_text(x.status),x.hostname_note]
+              "是" if x.port_445 else "","是" if x.port_3389 else "","是" if x.port_agent else "",
+              "端口开放" if x.port_agent else "未检测",status_text(x.status),x.hostname_note]
         for c,v in enumerate(vals,1):self.discovery_table.setItem(r,c,QTableWidgetItem(v))
         self.discovery_table.item(r,3).setData(Qt.UserRole,x.hostname_source)
         self.discovery_table.item(r,5).setData(Qt.UserRole,bool(x.hostname_verified))
         self.discovery_table.item(r,5).setData(Qt.UserRole + 1, "")
         fit_full_content_table(self.discovery_table)
         self._mark_duplicate_discovery_names()
-        audit.operation(self.settings.audit_path,"DISCOVERY","HOST_FOUND","SUCCESS","扫描发现 Windows 主机。",host=x.host,details={"network":x.network,"hostname":x.hostname,"hostname_source":x.hostname_source,"hostname_verified":x.hostname_verified,"hostname_note":x.hostname_note,"smb_445":x.port_445,"rdp_3389":x.port_3389,"winrm_5985":x.port_5985,"winrm_5986":x.port_5986,"status":x.status})
+        audit.operation(self.settings.audit_path,"DISCOVERY","HOST_FOUND","SUCCESS","扫描发现 Windows 主机。",host=x.host,details={"network":x.network,"hostname":x.hostname,"hostname_source":x.hostname_source,"hostname_verified":x.hostname_verified,"hostname_note":x.hostname_note,"smb_445":x.port_445,"rdp_3389":x.port_3389,"agent_8743":x.port_agent,"status":x.status})
 
     def _mark_duplicate_discovery_names(self):
         names={}
@@ -3253,7 +3341,7 @@ class MainWindow(QMainWindow):
             elif verify_error == "FAILED":state_item.setText("验证失败")
             elif r in duplicate_rows:
                 state_item.setText("名称重复，建议验证"); note=(note_item.text().strip() if note_item else "")
-                if "重复" not in note:note_item.setText((note+" ").strip()+"同一次扫描中有多个 IP 返回相同名称，建议执行 SMB/WKSSVC 或 WinRM 深度验证实际计算机名。")
+                if "重复" not in note:note_item.setText((note+" ").strip()+"同一次扫描中有多个 IP 返回相同名称，建议执行 SMB/WKSSVC 深度验证实际计算机名。")
             elif name:state_item.setText("未验证")
             else:state_item.setText("未识别")
 
@@ -3282,15 +3370,15 @@ class MainWindow(QMainWindow):
             "source_text":self.discovery_table.item(r,4).text(),"source_code":self.discovery_table.item(r,3).data(Qt.UserRole),
             "verified":bool(self.discovery_table.item(r,5).data(Qt.UserRole)),"note":self.discovery_table.item(r,11).text(),
             "status":self.discovery_table.item(r,10).text(),"smb":self.discovery_table.item(r,6).text()=="是",
-            "rdp":self.discovery_table.item(r,7).text()=="是","w1":self.discovery_table.item(r,8).text()=="是","w2":self.discovery_table.item(r,9).text()=="是",
+            "rdp":self.discovery_table.item(r,7).text()=="是","agent":self.discovery_table.item(r,8).text()=="是",
         }
 
     def _upsert_discovery_data(self,d):
         now=datetime.now().isoformat(timespec="seconds")
-        source_map={"DNS PTR":"DNS_PTR","NetBIOS":"NETBIOS","Windows 名称解析":"WINDOWS_RESOLVER","Windows 工作站 API":"NETAPI_WKSTA","SMB/NTLM 指纹":"SMB_NTLM","SMB/WKSSVC 验证":"SMB_RPC","WinRM hostname":"WINRM","手工维护":"MANUAL"}
+        source_map={"DNS PTR":"DNS_PTR","NetBIOS":"NETBIOS","Windows 名称解析":"WINDOWS_RESOLVER","Windows 工作站 API":"NETAPI_WKSTA","SMB/NTLM 指纹":"SMB_NTLM","SMB/WKSSVC 验证":"SMB_RPC","手工维护":"MANUAL"}
         stable_source=d["source_code"] or source_map.get(d["source_text"],"")
-        online_status="ONLINE_WINRM" if (d["w1"] or d["w2"]) else ("ONLINE_SMB" if d["smb"] else ("ONLINE" if d["rdp"] else "UNTESTED"))
-        db.upsert_host(HostRecord(id=None,name=d["hostname"] or d["ip"],host=d["ip"],group_name="自动发现",target_mode="WINRM",default_target="",os_hint=d["status"],last_seen=now,notes="",hostname_source=stable_source,hostname_verified=int(d["verified"]),hostname_note=d["note"],online_status=online_status,ping_ok=0,smb_port_ok=int(d["smb"]),rdp_port_ok=int(d["rdp"]),winrm_port_ok=int(d["w1"] or d["w2"]),smb_status="UNTESTED",last_test_at=now))
+        online_status="ONLINE_AGENT" if d["agent"] else ("ONLINE_SMB" if d["smb"] else ("ONLINE" if d["rdp"] else "UNTESTED"))
+        db.upsert_host(HostRecord(id=None,name=d["hostname"] or d["ip"],host=d["ip"],group_name="自动发现",target_mode="AGENT",default_target="",os_hint=d["status"],last_seen=now,notes="",hostname_source=stable_source,hostname_verified=int(d["verified"]),hostname_note=d["note"],online_status=online_status,ping_ok=0,smb_port_ok=int(d["smb"]),rdp_port_ok=int(d["rdp"]),winrm_port_ok=0,agent_port=8743,agent_status="PORT_OPEN" if d["agent"] else "UNTESTED",smb_status="UNTESTED",last_test_at=now))
 
     def _show_discovery_sync_dialog(self,recheck_results):
         known=set(self._scan_existing_hosts)
@@ -3300,11 +3388,11 @@ class MainWindow(QMainWindow):
             h=self._scan_existing_hosts.get(ip)
             if res is None:
                 offline.append((h,"复查失败")); continue
-            windows_signal=bool(res.smb_port_ok or res.rdp_port_ok or res.winrm_port_ok)
+            windows_signal=bool(res.smb_port_ok or res.rdp_port_ok or res.agent_port_ok)
             if windows_signal:
-                db.update_host_connectivity(ip,online_status=res.online_status,ping_ok=res.ping_ok,smb_port_ok=res.smb_port_ok,rdp_port_ok=res.rdp_port_ok,winrm_port_ok=res.winrm_port_ok,last_test_at=datetime.now().isoformat(timespec="seconds"))
+                db.update_host_connectivity(ip,online_status=res.online_status,ping_ok=res.ping_ok,smb_port_ok=res.smb_port_ok,rdp_port_ok=res.rdp_port_ok,agent_port_ok=res.agent_port_ok,last_test_at=datetime.now().isoformat(timespec="seconds"))
             elif res.ping_ok:
-                non_windows.append((h,"IP 可达，但 445/3389/5985/5986 均未检测到 Windows 服务特征"))
+                non_windows.append((h,"IP 可达，但 445/3389/8743 均未检测到 Windows/Agent 服务特征"))
             else:
                 offline.append((h,"本次扫描和复查均不可达，可能关机、断网或被防火墙阻断"))
         if not new_rows and not non_windows and not offline:
@@ -3463,6 +3551,38 @@ class MainWindow(QMainWindow):
         except Exception as e: QMessageBox.critical(self,"审计目录",str(e))
 
     # ---------- Help ----------
+    def _build_agent_help_page(self):
+        canvas, root = self._page_canvas()
+        c, l = card(
+            "FDS Agent 使用说明",
+            "当前分支只使用目标主机上的 FDS Agent HTTPS 服务；客户机无需启用 WinRM、RDP 或 Windows 管理共享。",
+        )
+        text = QPlainTextEdit(); text.setReadOnly(True); text.setMinimumHeight(260)
+        text.setPlainText(
+            "目标主机首次准备：\n"
+            "1. 在目标 Windows 上以管理员身份运行 agent\\Install-FdsAgent.ps1。\n"
+            "2. 用 -AllowedRoot 指定允许 Agent 访问的业务目录，例如 D:\\ADMS。\n"
+            "3. 记录脚本输出的 HTTPS 端口、证书 SHA-256 指纹和配对令牌。\n"
+            "4. 在本软件的主机配置中选择 FDS Agent（HTTPS），填入端口和证书指纹；再点击“设置 Agent 令牌”。\n\n"
+            "桌面端支持：\n"
+            "• 全量测试并自动选中 Agent 可用主机；\n"
+            "• 从本机向目标目录流式上传并校验文件；\n"
+            "• 远程文件浏览、上传、下载、新建目录、重命名和删除（仅限 AllowedRoots）；\n"
+            "• 按 EXE 镜像名结束全部实例及整个子进程树；\n"
+            "• 不依赖 explorer.exe 的强制重启。\n\n"
+            "安全边界：Agent 只允许访问安装时配置的 AllowedRoots；令牌保存在当前 Windows 用户的凭据管理器中。"
+        )
+        l.addWidget(text)
+        root.addWidget(c)
+        a, la = card(
+            "分发建议",
+            "将 FTP、SFTP 或 Windows 共享中的压缩包先下载到本机，再从本机分发。这样传输链路更短，便于校验、重试和审计。",
+        )
+        note = QLabel("Agent 连接失败时，程序会直接报告 Agent HTTPS 或配对令牌问题，不会回退到 WinRM。")
+        note.setWordWrap(True); note.setObjectName("Muted"); la.addWidget(note)
+        root.addWidget(a); root.addStretch(1)
+        return wrap_scroll(canvas)
+
     def _build_help_page(self):
         canvas,root=self._page_canvas()
 
@@ -3535,7 +3655,7 @@ class MainWindow(QMainWindow):
 
     # ---------- Settings ----------
     def _build_settings_page(self):
-        canvas,root=self._page_canvas(); c,l=card("系统设置",r"配置文件保存在 %LOCALAPPDATA%\FileDistributionStudio；WinRM 密码只可安全保存到 Windows 凭据管理器，不会写入配置、SQLite 或审计日志。")
+        canvas,root=self._page_canvas(); c,l=card("系统设置",r"配置文件保存在 %LOCALAPPDATA%\FileDistributionStudio；Agent 配对令牌只可安全保存到 Windows 凭据管理器，不会写入配置、SQLite 或审计日志。")
         form=QFormLayout(); self.set_concurrency=QSpinBox(); self.set_concurrency.setRange(1,32); self.set_concurrency.setValue(self.settings.max_concurrency); self.set_timeout=QLineEdit(str(self.settings.socket_timeout)); self.set_workers=QSpinBox(); self.set_workers.setRange(1,256); self.set_workers.setValue(self.settings.discovery_workers); self.set_retry=QSpinBox(); self.set_retry.setRange(0,10); self.set_retry.setValue(self.settings.retry_count); self.set_margin=QSpinBox(); self.set_margin.setRange(0,102400); self.set_margin.setValue(self.settings.min_free_space_margin_mb)
         self.set_cache=QLineEdit(self.settings.cache_path); br=QPushButton("浏览"); br.clicked.connect(self._pick_cache); rw=QHBoxLayout(); rw.addWidget(self.set_cache); rw.addWidget(br); cw=QWidget(); cw.setLayout(rw)
         self.set_audit=QLineEdit(self.settings.audit_path); ba=QPushButton("浏览"); ba.clicked.connect(self._pick_audit); ar=QHBoxLayout(); ar.addWidget(self.set_audit); ar.addWidget(ba); aw=QWidget(); aw.setLayout(ar)

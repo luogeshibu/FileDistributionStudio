@@ -29,17 +29,16 @@ class HostEditDialog(QDialog):
         self.host = QLineEdit(host.host if host else "")
         self.group = QLineEdit(group_text(host.group_name) if host else "默认")
         self.mode = QComboBox()
-        self.mode.addItem("WinRM（固定业务通道）", "WINRM")
         self.mode.addItem("FDS Agent（HTTPS）", "AGENT")
         self.mode.setEnabled(True)
-        self.business_channel = QLineEdit("FDS Agent（HTTPS）" if host and host.target_mode == "AGENT" else "WinRM（固定业务通道）")
+        self.business_channel = QLineEdit("FDS Agent（HTTPS）")
         self.business_channel.setReadOnly(True)
         self.agent_port = QSpinBox()
         self.agent_port.setRange(1, 65535)
         self.agent_port.setValue(int(host.agent_port if host else 8743) or 8743)
         self.agent_pin = QLineEdit(host.agent_certificate_sha256 if host else "")
         self.agent_pin.setPlaceholderText("可选：SHA-256 证书指纹（64 位十六进制）")
-        self.mode.setCurrentIndex(1 if host and host.target_mode == "AGENT" else 0)
+        self.mode.setCurrentIndex(0)
         self.mode.currentIndexChanged.connect(self._channel_changed)
         self.notes = QTextEdit(host.notes if host else "")
 
@@ -80,9 +79,9 @@ class HostEditDialog(QDialog):
 
     def _channel_changed(self, *_):
         is_agent = self.mode.currentData() == "AGENT"
-        self.business_channel.setText("FDS Agent（HTTPS）" if is_agent else "WinRM（固定业务通道）")
-        self.agent_port.setEnabled(is_agent)
-        self.agent_pin.setEnabled(is_agent)
+        self.business_channel.setText("FDS Agent（HTTPS）")
+        self.agent_port.setEnabled(True)
+        self.agent_pin.setEnabled(True)
 
     def value(self):
         new_name = self.name.text().strip() or self.host.text().strip()

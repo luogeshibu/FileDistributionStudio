@@ -2,7 +2,7 @@
 
 这是目标 Windows 主机上的后台 Agent，计划替代 WinRM、RDP 和管理共享作为文件分发与远程操作通道。
 
-当前分支先提供基础服务接口和目标机安装脚本：
+当前分支提供 Agent-only 基础服务接口和目标机安装脚本；桌面端正式业务不再依赖 WinRM：
 
 - Windows Service 宿主；
 - 仅 HTTPS 监听，不默认启动明文 HTTP；
@@ -24,8 +24,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 脚本会自动生成每台机器独立的自签名 HTTPS 证书、随机配对令牌、受保护的配置文件、
 Windows 防火墙入站规则和自动启动服务。脚本最后会显示配对令牌和证书指纹；把它们录入桌面端后，
-桌面端即可测试 Agent、执行进程树结束/强制重启操作；当前桌面端的正式多文件分发仍保留 WinRM 业务流程，
-待 Agent 的远程目录浏览、备份和完整校验接口完成后再切换，避免出现“界面显示 Agent、实际又偷偷走 WinRM”的混用。
+桌面端即可测试 Agent、浏览允许目录、上传/下载文件、执行进程树结束/强制重启和多文件分发。
+当前分支不会在 Agent 连接失败时回退到 WinRM；旧 WinRM 配置、账号密码和初始化脚本均不参与正式运行。
 
 默认只允许写入 `C:\FDS-Data`。生产环境应通过 `-AllowedRoot` 明确限制到实际业务目录，
 不要把系统盘根目录、`Windows` 或整个用户目录加入允许范围。
@@ -42,7 +42,7 @@ Agent 只允许向 AllowedRoots 下写入文件，避免桌面端可以任意覆
 
 appsettings.example.json 仅用于说明字段，不包含可用凭据或证书。
 
-## API 草案
+## API
 
 除健康检查外，所有 API 都需要请求头：
 
@@ -55,9 +55,16 @@ appsettings.example.json 仅用于说明字段，不包含可用凭据或证书�
          { "path": "D:\\ADMS\\bin\\example.zip", "includeSha256": true }
     POST /api/v1/files/backup
          { "sourcePath": "D:\\ADMS\\bin\\example.zip", "backupPath": "D:\\ADMS\\.fds_backup\\..." }
+    GET  /api/v1/files/list?path=D%3A%5CADMS
+    GET  /api/v1/files/download?path=D%3A%5CADMS%5Cexample.zip
+    POST /api/v1/files/directory
+         { "path": "D:\\ADMS\\new-folder" }
+    POST /api/v1/files/rename
+         { "path": "D:\\ADMS\\old.zip", "newPath": "D:\\ADMS\\new.zip" }
+    DELETE /api/v1/files?path=D%3A%5CADMS%5Cold.zip
     POST /api/v1/operations/process/kill
          { "imageName": "GridExplorer.exe" }
     POST /api/v1/operations/restart
          { "force": true }
 
-这是 Agent 的第一阶段代码，当前尚未接入 Python 桌面端，也未提供安装器。请先由开发机完成编译和人工验证，再继续实现安装、配对、升级和桌面端适配。
+这是 Agent-only 分支的目标机服务代码。正式分发前仍应由开发机完成 Agent 编译和人工验证，再制作安装包、证书配对和升级流程。
