@@ -1516,7 +1516,11 @@ class SftpMappingDialog(QDialog):
         self.folder_mode.setEnabled(self.source_kind.currentData()=="DIR")
         scope_names = [((c.get("name") or c.get("host") or "").strip()) for c in self.remote_drive_contexts]
         scope_text = f" 当前已勾选 {len(scope_names)} 台目标主机，这条映射会应用到全部这些主机。" if scope_names else ""
-        note = QLabel("SFTP 密码只存在当前程序进程内，不写入 SQLite、JSONL 或任务审计文件。分发时先拉取到本机缓存，再通过 WinRM 向 Windows 目标主机分发。" + scope_text)
+        note = QLabel(
+            "SFTP 密码只存在当前程序进程内，不写入 SQLite、JSONL 或任务审计文件。"
+            "FTP、SFTP、Windows 共享等网络源必须先下载到本机缓存，再通过 WinRM 向 Windows 目标主机分发；"
+            "禁止让目标主机直接读取 FTP 或共享路径。" + scope_text
+        )
         note.setWordWrap(True); note.setStyleSheet("color:#667A8A;")
         self.browse_remote_btn = QPushButton("浏览远程目录")
         self.browse_remote_btn.setEnabled(bool(self.remote_drive_contexts))

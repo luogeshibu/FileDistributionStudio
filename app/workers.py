@@ -275,6 +275,96 @@ class WinRMTargetTestThread(QThread):
         self.completed.emit(success, failed)
 
 
+class RemoteRestartThread(QThread):
+    """Send a force-restart command through WinRM without using an interactive desktop."""
+    result = Signal(str, bool, str)  # host, success, message
+    completed = Signal(int, int)  # success, failed
+
+    def __init__(self, hosts: list[HostRecord], credentials: dict[str, tuple[str, str, str]],
+                 use_https: bool = False, port: int = 5985, max_workers: int = 8,
+                 audit_root: str = ""):
+        super().__init__()
+        self.hosts = list(hosts or [])
+        self.credentials = dict(credentials or {})
+        self.use_https = bool(use_https)
+        self.port = int(port)
+        self.max_workers = max(1, min(16, int(max_workers or 8)))
+        self.audit_root = audit_root or ""
+        self.task_id = "RESTART-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        self.command = "shutdown.exe /r /f /t 0"
+        self.restart_script = r'''
+$ErrorActionPreference = 'Stop'
+$shutdown = Join-Path $env:SystemRoot 'System32\shutdown.exe'
+if (-not (Test-Path -LiteralPath $shutdown)) {
+    throw "系统关机程序不存在：$shutdown"
+}
+Start-Process -FilePath $shutdown -ArgumentList @('/r', '/f', '/t', '0') -WindowStyle Hidden
+'FDS_RESTART_REQUESTED'
+'''
+
+    def _one(self, host_record: HostRecord):
+        host = host_record.host
+        username, password, source = self.credentials.get(host, ("", "", "未设置"))
+        if not username or not password:
+            message = f"{source}缺少用户名或密码。"
+            audit.operation(self.audit_root, "WINRM", "REMOTE_RESTART", "FAILED", message,
+                            task_id=self.task_id, host=host, subject=self.command,
+                            details={"transport": "WINRM_BACKGROUND", "credential_source": source})
+            return host, False, message
+
+        resolved_username = qualify_windows_username(username, host_record.name)
+        plan = RemoteActionPlan(
+            enabled=False,
+            use_https=self.use_https,
+            port=self.port,
+            username=resolved_username,
+            password=password,
+            command_timeout=10,
+            read_timeout_sec=11,
+        )
+        try:
+            # 通过 WinRM 直接启动系统 shutdown.exe，不经过 CMD、sys_ctl 或交互桌面。
+            # /f 会强制关闭正在运行的进程；Start-Process 让关机请求脱离当前
+            # WinRM 命令生命周期，目标机随即重启不会把控制通道拖成失败。
+            result = WinRMExecutor(host, plan).run_ps(self.restart_script)
+            if int(result.get("exit_code", 1)) != 0:
+                detail = result.get("stderr") or result.get("stdout") or f"退出码={result.get('exit_code')}"
+                audit.operation(self.audit_root, "WINRM", "REMOTE_RESTART", "FAILED", detail,
+                                task_id=self.task_id, host=host, subject=self.command,
+                                details={"transport": "WINRM_BACKGROUND", "username": resolved_username,
+                                         "credential_source": source})
+                return host, False, detail
+            if "FDS_RESTART_REQUESTED" not in (result.get("stdout") or ""):
+                message = "WinRM 已接受强制重启请求，目标机即将重启。"
+            else:
+                message = "强制重启请求已发送，目标机即将重启；随后 WinRM 连接中断属于正常现象。"
+            audit.operation(self.audit_root, "WINRM", "REMOTE_RESTART", "SUCCESS", message,
+                            task_id=self.task_id, host=host, subject=self.command,
+                            details={"transport": "WINRM_BACKGROUND", "username": resolved_username,
+                                     "credential_source": source})
+            return host, True, message
+        except Exception as exc:
+            message = str(exc)
+            audit.operation(self.audit_root, "WINRM", "REMOTE_RESTART", "FAILED", message,
+                            task_id=self.task_id, host=host, subject=self.command,
+                            details={"transport": "WINRM_BACKGROUND", "username": resolved_username,
+                                     "credential_source": source})
+            return host, False, message
+
+    def run(self):
+        success = failed = 0
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, max(1, len(self.hosts)))) as ex:
+            futures = [ex.submit(self._one, host) for host in self.hosts]
+            for future in as_completed(futures):
+                host, ok, message = future.result()
+                if ok:
+                    success += 1
+                else:
+                    failed += 1
+                self.result.emit(host, ok, message)
+        self.completed.emit(success, failed)
+
+
 class HostEnvironmentCheckThread(QThread):
     """Read-only Windows environment inspection via WinRM."""
     result = Signal(str, bool, object)

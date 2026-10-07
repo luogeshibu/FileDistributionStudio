@@ -26,7 +26,7 @@ from ..services.remote_exec import RemoteActionPlan, WinRMExecutor, qualify_wind
 from ..services import audit, credential_store
 from ..services.xlsx_export import export_xlsx
 from ..utils import human_bytes, validate_windows_target_path
-from ..workers import DiscoveryThread, DistributionThread, DryRunThread, BackupThread, VersionCheckThread, HostnameVerificationThread, WinRMTargetTestThread, HostStatusTestThread, DiscoveryReconcileThread, HostEnvironmentCheckThread, RemoteFileOperationThread
+from ..workers import DiscoveryThread, DistributionThread, DryRunThread, BackupThread, VersionCheckThread, HostnameVerificationThread, WinRMTargetTestThread, RemoteRestartThread, HostStatusTestThread, DiscoveryReconcileThread, HostEnvironmentCheckThread, RemoteFileOperationThread
 from .. import db
 from .dialogs import (HostEditDialog, TaskDetailDialog, HostnameCredentialDialog, MappingTargetDialog,
                       SftpMappingDialog, WinRMSetupDialog, WinRMHostCredentialDialog, RemoteProcessBrowserDialog,
@@ -270,12 +270,22 @@ class MainWindow(QMainWindow):
 
         src, src_l = card(
             "分发映射",
-            "一次任务可以配置多条“源 → 目标目录”映射。每条映射的目标目录都可以不同；所有勾选主机会执行完全相同的映射计划。",
+            "一次任务可以配置多条“源 → 目标目录”映射。建议分发源使用本机已落盘的文件或目录；网络源请先下载到本机，再分发到目标主机。",
         )
         self.mapping_scope_label = QLabel("当前分发范围：尚未选择目标主机。")
         self.mapping_scope_label.setWordWrap(True)
         self.mapping_scope_label.setStyleSheet("color:#476574; font-weight:600;")
         src_l.addWidget(self.mapping_scope_label)
+        source_warning = QLabel(
+            "重要：禁止让目标主机直接读取 FTP、SFTP、Windows 共享或其他网络路径作为分发源。"
+            "请先将压缩包或文件完整下载到本机，再从本机分发；这样速度更快，也便于校验、重试和记录结果。"
+        )
+        source_warning.setWordWrap(True)
+        source_warning.setStyleSheet(
+            "color:#8A5A00; background:#FFF7E6; border:1px solid #F0D28A; "
+            "border-radius:4px; padding:6px 8px; font-weight:600;"
+        )
+        src_l.addWidget(source_warning)
         self.mapping_table = QTableWidget(0, 8)
         self.mapping_table.setHorizontalHeaderLabels([
             "启用", "来源", "类型", "源文件 / 目录", "目标目录", "当前目标主机", "目录方式", "状态"
@@ -382,6 +392,14 @@ class MainWindow(QMainWindow):
         )
         self.btn_winrm_test.clicked.connect(self._test_winrm_targets)
         target_action_buttons.append(self.btn_winrm_test)
+        self.btn_force_restart = QPushButton("强制重启选中主机")
+        self.btn_force_restart.setIcon(app_icon("refresh"))
+        self.btn_force_restart.setToolTip(
+            "通过 WinRM 后台强制重启当前勾选的目标主机，不依赖 explorer.exe 或交互桌面。"
+            "执行前会再次确认，重启后 WinRM 连接中断属于正常现象。"
+        )
+        self.btn_force_restart.clicked.connect(self._force_restart_selected_hosts)
+        target_action_buttons.append(self.btn_force_restart)
         self.btn_target_env_check = QPushButton("ADMS 部署前检查")
         self.btn_target_env_check.setIcon(app_icon("search"))
         self.btn_target_env_check.setToolTip(
@@ -430,23 +448,18 @@ class MainWindow(QMainWindow):
             button.setMinimumWidth(0)
             button.setMinimumHeight(34)
 
-        # 固定呈现顺序：第一行放主机选择与状态动作，第二行放 WinRM/诊断动作，
-        # 后两行放配置向导和脚本下载，避免全量 WinRM 按钮藏在筛选栏里。
+        # 固定呈现顺序：第一行放主机选择与状态动作，第二行放 WinRM/电源动作，
+        # 第三行放诊断、远程桌面和配置脚本。
         target_action_buttons = [
             self.btn_test_all_winrm_select, *target_action_buttons[:4],
-            self.btn_winrm_test,
+            self.btn_winrm_test, self.btn_force_restart,
             self.btn_target_env_check, self.btn_open_rdp,
             self.btn_winrm_setup, self.btn_download_adms_setup, self.btn_download_adms_restore,
         ]
         for b in target_action_buttons:
             _compact_action_button(b)
         # 4 + 4 + 1/3 + 4，确保“全量测试并选中 WinRM”位于操作区第一排。
-        positions = [
-            (0, 0, 1, 1), (0, 1, 1, 1), (0, 2, 1, 1), (0, 3, 1, 1),
-            (1, 0, 1, 1), (1, 1, 1, 1), (1, 2, 1, 1), (1, 3, 1, 1),
-            (2, 0, 1, 1), (2, 1, 1, 3),
-            (3, 0, 1, 4),
-        ]
+        positions = [(row, col, 1, 1) for row in range(3) for col in range(4)]
         for b, pos in zip(target_action_buttons, positions):
             tr.addWidget(b, *pos)
         for col in range(4):
@@ -1325,6 +1338,94 @@ class MainWindow(QMainWindow):
         box.exec()
         if box.clickedButton() is guide_btn:
             self._show_winrm_setup_guide()
+
+    def _force_restart_selected_hosts(self):
+        hosts = self._selected_hosts()
+        if not hosts:
+            QMessageBox.warning(self, "强制重启", "请先勾选至少一台目标主机。")
+            return
+        running = getattr(self, "remote_restart_thread", None)
+        if running and running.isRunning():
+            QMessageBox.information(self, "强制重启", "已有强制重启任务正在执行，请等待完成。")
+            return
+        other_threads = (
+            getattr(self, "distribution_thread", None),
+            getattr(self, "backup_thread", None),
+            getattr(self, "version_check_thread", None),
+            getattr(self, "winrm_test_thread", None),
+        )
+        if any(thread and thread.isRunning() for thread in other_threads):
+            QMessageBox.warning(self, "强制重启", "当前还有其他远程任务正在执行，请等待任务结束后再重启主机。")
+            return
+
+        preview = "\n".join(
+            f"{h.name or h.host} ({h.host})" for h in hosts[:12]
+        )
+        if len(hosts) > 12:
+            preview += f"\n……另有 {len(hosts) - 12} 台"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("确认强制重启")
+        box.setText(
+            f"即将通过 WinRM 强制重启 {len(hosts)} 台目标主机。\n"
+            "目标机上的未保存工作和运行中的程序将被强制关闭。\n\n"
+            f"{preview}\n\n确定继续吗？"
+        )
+        yes = box.addButton("立即强制重启", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+
+        self._save_default_winrm_credential(show_error=True)
+        try:
+            credentials = self._resolve_credentials(hosts)
+        except Exception as exc:
+            QMessageBox.warning(self, "强制重启", str(exc))
+            return
+
+        self.btn_force_restart.setEnabled(False)
+        self.btn_force_restart.setText("正在发送重启命令…")
+        selected = {h.host for h in hosts}
+        for row in range(self.target_table.rowCount()):
+            item = self.target_table.item(row, 2)
+            if item and item.text().strip() in selected:
+                self.target_table.setItem(row, 7, QTableWidgetItem("正在发送强制重启…"))
+
+        self.remote_restart_thread = RemoteRestartThread(
+            hosts,
+            credentials,
+            use_https=self.remote_https.isChecked(),
+            port=self.remote_port.value(),
+            max_workers=min(self.concurrent_spin.value(), 8),
+            audit_root=self.settings.audit_path,
+        )
+        self.remote_restart_thread.result.connect(self._remote_restart_result)
+        self.remote_restart_thread.completed.connect(self._remote_restart_completed)
+        self.remote_restart_thread.start()
+
+    def _remote_restart_result(self, host, success, message):
+        label = "强制重启已发送" if success else "强制重启失败"
+        for row in range(self.target_table.rowCount()):
+            item = self.target_table.item(row, 2)
+            if item and item.text().strip() == host:
+                cell = QTableWidgetItem(f"{label}：{message}")
+                cell.setToolTip(message)
+                self.target_table.setItem(row, 7, cell)
+                break
+        self._append_log(f"[{host}] {label}：{message}")
+
+    def _remote_restart_completed(self, success, failed):
+        self.btn_force_restart.setEnabled(True)
+        self.btn_force_restart.setText("强制重启选中主机")
+        self.refresh_audit()
+        self.refresh_hosts()
+        QMessageBox.information(
+            self,
+            "强制重启",
+            f"强制重启命令发送完成。\n\n成功：{success} 台\n失败：{failed} 台\n\n"
+            "成功发送后，目标机随后离线属于正常现象。详细原因请查看审计日志。",
+        )
 
     def _test_winrm(self):
         hosts=self._selected_hosts()

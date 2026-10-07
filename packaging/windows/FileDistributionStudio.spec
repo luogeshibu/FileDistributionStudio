@@ -1,8 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules
 ROOT = Path(SPEC).resolve().parents[2]
-IMPACKET_HIDDEN = collect_submodules("impacket")
+# The application only uses Impacket for SMB/NTLM identity checks and the
+# authenticated WKSSVC hostname lookup.  Collecting the whole package also
+# pulls in optional example tools (notably ntlmrelayx), and some Impacket
+# wheels do not contain every example-package __init__.py that PyInstaller
+# expects while building the PYZ archive.
+IMPACKET_HIDDEN = [
+    "impacket",
+    "impacket.ntlm",
+    "impacket.smbconnection",
+    "impacket.smb3structs",
+    "impacket.nt_errors",
+    "impacket.dcerpc",
+    "impacket.dcerpc.v5",
+    "impacket.dcerpc.v5.transport",
+    "impacket.dcerpc.v5.wkst",
+]
 RES = ROOT / "resources"
 a = Analysis(
     [str(ROOT / "main.py")],

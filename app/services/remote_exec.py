@@ -215,6 +215,7 @@ $preferredUser = {preferred_user_q}
 $desktopUser = ''
 $desktopSessionId = -1
 $candidates = @()
+$sessionProbe = ''
 $runner = $null
 $outFile = $null
 $errFile = $null
@@ -253,6 +254,29 @@ try {{
         }} catch {{ $candidates = @() }}
     }}
 
+    # explorer.exe 可能因为 RDP 断开、权限限制或桌面尚未完全启动而无法读取。
+    # query user 仍能直接告诉我们当前登录会话和 SessionId，作为最后一个可靠
+    # 的交互会话来源；不依赖用户手工输入密码，也不创建额外账号。
+    if ($candidates.Count -eq 0) {{
+        try {{
+            $queryLines = @(query.exe user 2>$null)
+            $sessionProbe = ($queryLines -join ' | ')
+            $tmp = @()
+            foreach ($line in $queryLines) {{
+                $text = [string]$line
+                $match = [regex]::Match($text, '^\s*>?(?<user>\S+)\s+(?:(?<session>\S+)\s+)?(?<id>\d+)\s+(?<state>Active|Disc|Disconnected|Idle)\b', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                if ($match.Success) {{
+                    $tmp += [pscustomobject]@{{
+                        User = [string]$match.Groups['user'].Value
+                        SessionId = [int]$match.Groups['id'].Value
+                        State = [string]$match.Groups['state'].Value
+                    }}
+                }}
+            }}
+            $candidates = @($tmp | Sort-Object @{{ Expression = {{ if ($_.State -ieq 'Active') {{ 0 }} else {{ 1 }} }} }})
+        }} catch {{ $candidates = @() }}
+    }}
+
     $preferredLeaf = [string]$preferredUser
     if ($preferredLeaf.Contains('\')) {{ $preferredLeaf = ($preferredLeaf -split '\\')[-1] }}
     if ($preferredLeaf.Contains('@')) {{ $preferredLeaf = ($preferredLeaf -split '@')[0] }}
@@ -275,8 +299,8 @@ try {{
     }}
     if ([string]::IsNullOrWhiteSpace($desktopUser)) {{
         $seen = @($candidates | ForEach-Object {{ ([string]$_.User + ' [Session ' + [string]$_.SessionId + ']') }}) -join ', '
-        if ([string]::IsNullOrWhiteSpace($seen)) {{ $seen = '未发现 explorer.exe 桌面会话' }}
-        throw ('目标机没有检测到可用的已登录桌面用户。WinRM 已连接，但交互桌面用户检测为空。检测结果：' + $seen)
+        if ([string]::IsNullOrWhiteSpace($seen)) {{ $seen = 'no explorer.exe or query-user session' }}
+        throw ('No interactive desktop session was found. WinRM is connected, but no usable explorer.exe/query user session was detected. Log on to the target host or choose WinRM background mode. Details: ' + $seen + ' ; query user: ' + $sessionProbe)
     }}
     if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) {{
         throw '目标系统缺少 ScheduledTasks PowerShell 模块，无法使用登录桌面执行模式。'
