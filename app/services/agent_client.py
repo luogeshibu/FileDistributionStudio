@@ -28,7 +28,10 @@ class AgentEndpoint:
 
 
 class AgentClient:
-    CHUNK_SIZE = 128 * 1024
+    # A few MiB keeps the number of HTTPS requests manageable without making
+    # each retry expensive when a target connection is unstable.
+    CHUNK_SIZE = 4 * 1024 * 1024
+    UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 
     def __init__(self, endpoint: AgentEndpoint):
         host = (endpoint.host or "").strip()
@@ -86,12 +89,15 @@ class AgentClient:
             connection.close()
             raise AgentError(f"无法连接 Agent {self.endpoint.host}:{self.endpoint.port}：{exc}") from exc
 
-    def _headers(self, content_length: int | None = None) -> dict[str, str]:
+    def _headers(self, content_length: int | None = None,
+                 content_type: str | None = None) -> dict[str, str]:
         headers = {"Accept": "application/json", "Connection": "close"}
         if self.endpoint.token:
             headers["X-FDS-Agent-Token"] = self.endpoint.token
         if content_length is not None:
             headers["Content-Length"] = str(content_length)
+        if content_type:
+            headers["Content-Type"] = content_type
         return headers
 
     @staticmethod
@@ -117,7 +123,11 @@ class AgentClient:
                  accepted: tuple[int, ...] = (200,)) -> dict:
         connection = self._connect()
         try:
-            connection.request(method, path, body=body, headers=self._headers(len(body) if body is not None else None))
+            headers = self._headers(
+                len(body) if body is not None else None,
+                "application/json; charset=utf-8" if body is not None else None,
+            )
+            connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
             payload = self._decode_response(response)
             if response.status not in accepted:
@@ -129,6 +139,41 @@ class AgentClient:
             raise AgentError(f"Agent 请求中断：{exc}") from exc
         finally:
             connection.close()
+
+    def _raw_request(self, method: str, path: str, body: bytes,
+                     accepted: tuple[int, ...] = (200,)) -> dict:
+        """Send one bounded binary request and always close that connection."""
+        connection = self._connect()
+        try:
+            connection.request(
+                method,
+                path,
+                body=body,
+                headers=self._headers(len(body), "application/octet-stream"),
+            )
+            response = connection.getresponse()
+            payload = self._decode_response(response)
+            if response.status not in accepted:
+                raise AgentError(self._error_message(response.status, payload))
+            return payload
+        except AgentError:
+            raise
+        except (OSError, ssl.SSLError, TimeoutError) as exc:
+            raise AgentError(f"Agent 请求中断：{exc}") from exc
+        finally:
+            connection.close()
+
+    def _raw_request_on_connection(self, connection: http.client.HTTPSConnection,
+                                   method: str, path: str, body: bytes,
+                                   accepted: tuple[int, ...] = (200,)) -> dict:
+        headers = self._headers(len(body), "application/octet-stream")
+        headers["Connection"] = "keep-alive"
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        payload = self._decode_response(response)
+        if response.status not in accepted:
+            raise AgentError(self._error_message(response.status, payload))
+        return payload
 
     def health(self) -> dict:
         return self._request("GET", "/api/v1/health")
@@ -148,6 +193,11 @@ class AgentClient:
             item = dict(raw or {})
             item["is_dir"] = bool(item.get("isDir", item.get("is_dir", False)))
             item["modified"] = item.get("lastWriteUtc", item.get("modified", ""))
+            # Older Agent builds returned an empty Path.GetFileName for drive
+            # roots such as C:\\. Keep the desktop usable while a target is
+            # being upgraded by falling back to the returned absolute path.
+            if not str(item.get("name") or "").strip() and item.get("path"):
+                item["name"] = str(item["path"])
             entries.append(item)
         return entries
 
@@ -170,6 +220,38 @@ class AgentClient:
     def backup_file(self, source_path: str, backup_path: str) -> dict:
         body = json.dumps({"sourcePath": source_path, "backupPath": backup_path}, ensure_ascii=False).encode("utf-8")
         return self._request("POST", "/api/v1/files/backup", body)
+
+    def backup_tree(self, source_path: str, backup_path: str) -> dict:
+        body = json.dumps({"sourcePath": source_path, "backupPath": backup_path}, ensure_ascii=False).encode("utf-8")
+        return self._request("POST", "/api/v1/files/backup-tree", body)
+
+    def system_info(self) -> dict:
+        return self._request("GET", "/api/v1/system/info")
+
+    def free_space(self, path: str) -> int | None:
+        drive, _ = os.path.splitdrive(path)
+        if not drive:
+            return None
+        wanted = (drive.rstrip("\\/") + "\\").upper()
+        for item in self.system_info().get("drives") or []:
+            name = str(item.get("name") or "").replace("/", "\\")
+            if name.upper() == wanted:
+                return int(item.get("freeBytes", item.get("free_bytes", 0)) or 0)
+        return None
+
+    def list_processes(self) -> list[dict]:
+        payload = self._request("GET", "/api/v1/operations/process/list")
+        result = []
+        for raw in payload.get("data") or payload.get("processes") or []:
+            item = dict(raw or {})
+            result.append({
+                "pid": int(item.get("pid", item.get("Pid", 0)) or 0),
+                "image_name": str(item.get("imageName", item.get("ImageName", item.get("image_name", ""))) or ""),
+                "description": str(item.get("description", item.get("Description", "")) or ""),
+                "path": str(item.get("path", item.get("Path", "")) or ""),
+                "command_line": str(item.get("commandLine", item.get("CommandLine", "")) or ""),
+            })
+        return result
 
     def rename(self, path: str, new_path: str) -> dict:
         body = json.dumps({"path": path, "newPath": new_path}, ensure_ascii=False).encode("utf-8")
@@ -217,41 +299,79 @@ class AgentClient:
                 pass
 
     def upload_file(self, local_path: str | Path, target_path: str,
-                    progress: Callable[[int, int], None] | None = None) -> dict:
+                    progress: Callable[[int, int], None] | None = None,
+                    sha256_hex: str = "") -> dict:
         source = Path(local_path)
         if not source.is_file():
             raise AgentError(f"本地文件不存在：{source}")
         if not target_path or not os.path.isabs(target_path):
             raise AgentError("Agent 目标文件必须使用目标主机上的绝对路径。")
         size = source.stat().st_size
-        query = urlencode({"path": target_path})
-        connection = self._connect()
-        sent = 0
+        expected_hash = "".join(ch for ch in (sha256_hex or "").upper() if ch in "0123456789ABCDEF")
+        init_body = json.dumps({
+            "path": target_path,
+            "size": size,
+            "sha256": expected_hash,
+        }, ensure_ascii=False).encode("utf-8")
+        init = self._request("POST", "/api/v1/files/upload/init", init_body)
+        upload_id = str(init.get("uploadId") or "")
+        sent = int(init.get("offset", 0) or 0)
+        if not upload_id or sent < 0 or sent > size:
+            raise AgentError("Agent 返回了无效的上传会话。")
+        if progress:
+            progress(sent, size)
+
+        reconnect_attempts = 0
+        connection = None
         try:
-            connection.putrequest("PUT", f"/api/v1/files?{query}")
-            for key, value in self._headers(size).items():
-                connection.putheader(key, value)
-            connection.endheaders()
             with source.open("rb") as stream:
-                while True:
-                    chunk = stream.read(self.CHUNK_SIZE)
+                while sent < size:
+                    stream.seek(sent)
+                    chunk = stream.read(min(self.UPLOAD_CHUNK_SIZE, size - sent))
                     if not chunk:
-                        break
-                    connection.send(chunk)
-                    sent += len(chunk)
+                        raise AgentError(f"本地文件读取提前结束（已读取 {sent} / {size} 字节）。")
+                    try:
+                        if connection is None:
+                            connection = self._connect()
+                        query = urlencode({"path": target_path, "uploadId": upload_id, "offset": sent})
+                        response = self._raw_request_on_connection(
+                            connection, "PUT", f"/api/v1/files/upload/chunk?{query}", chunk)
+                        new_offset = int(response.get("offset", sent + len(chunk)) or 0)
+                        if new_offset <= sent or new_offset > size:
+                            raise AgentError("Agent 返回了无效的上传偏移量。")
+                        sent = new_offset
+                        if connection.sock is None:
+                            connection.close()
+                            connection = None
+                    except (AgentError, OSError, ssl.SSLError, TimeoutError):
+                        if connection is not None:
+                            connection.close()
+                            connection = None
+                        reconnect_attempts += 1
+                        if reconnect_attempts > 3:
+                            raise
+                        # The server commits a chunk before acknowledging it.  A
+                        # fresh init therefore discovers the committed offset even
+                        # when the acknowledgement itself was lost.
+                        init = self._request("POST", "/api/v1/files/upload/init", init_body)
+                        upload_id = str(init.get("uploadId") or upload_id)
+                        new_sent = int(init.get("offset", sent) or sent)
+                        if new_sent < sent:
+                            raise
+                        sent = new_sent
+                        continue
+                    reconnect_attempts = 0
                     if progress:
                         progress(sent, size)
-            response = connection.getresponse()
-            payload = self._decode_response(response)
-            if response.status != 200:
-                raise AgentError(self._error_message(response.status, payload))
-            return payload
-        except AgentError:
-            raise
-        except (OSError, ssl.SSLError, TimeoutError) as exc:
-            raise AgentError(f"Agent 上传中断（已发送 {sent} / {size} 字节）：{exc}") from exc
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
+
+        complete_body = json.dumps({
+            "path": target_path,
+            "uploadId": upload_id,
+        }, ensure_ascii=False).encode("utf-8")
+        return self._request("POST", "/api/v1/files/upload/complete", complete_body)
 
     def kill_process(self, image_name: str) -> dict:
         image = (image_name or "").strip()

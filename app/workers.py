@@ -273,7 +273,8 @@ class WinRMTargetTestThread(QThread):
 
 class AgentTargetTestThread(QThread):
     """Authenticate against the FDS Agent on each selected host."""
-    result = Signal(str, bool, str)
+    # host, success, message, machine name returned by the Agent
+    result = Signal(str, bool, str, str)
     completed = Signal(int, int)
     TEST_TIMEOUT_SEC = 10
 
@@ -288,7 +289,7 @@ class AgentTargetTestThread(QThread):
         host = host_record.host
         token, source = self.tokens.get(host, ("", "未设置"))
         if not token:
-            return host, False, f"{source}缺少 Agent 配对令牌。"
+            return host, False, f"{source}缺少 Agent 配对令牌。", ""
         endpoint = AgentEndpoint(
             host=host,
             port=int(host_record.agent_port or 8743),
@@ -301,24 +302,24 @@ class AgentTargetTestThread(QThread):
             payload = AgentClient(endpoint).status()
             elapsed = monotonic() - started
             if elapsed > self.TEST_TIMEOUT_SEC:
-                return host, False, f"Agent 测试超过 {self.TEST_TIMEOUT_SEC} 秒，已判定失败。"
+                return host, False, f"Agent 测试超过 {self.TEST_TIMEOUT_SEC} 秒，已判定失败。", ""
             machine = payload.get("machine") or host_record.name or host
             version = payload.get("version") or "未知版本"
-            return host, True, f"Agent 已认证：{machine}，版本 {version}；凭据来源：{source}。"
+            return host, True, f"Agent 已认证：{machine}，版本 {version}；凭据来源：{source}。", str(machine)
         except Exception as exc:
             if "timed out" in str(exc).lower() or "timeout" in str(exc).lower():
-                return host, False, f"Agent 测试超过 {self.TEST_TIMEOUT_SEC} 秒，已判定失败。"
-            return host, False, f"凭据来源：{source}。{exc}"
+                return host, False, f"Agent 测试超过 {self.TEST_TIMEOUT_SEC} 秒，已判定失败。", ""
+            return host, False, f"凭据来源：{source}。{exc}", ""
 
     def run(self):
         success = failed = 0
         with ThreadPoolExecutor(max_workers=min(self.max_workers, max(1, len(self.hosts)))) as ex:
             futures = [ex.submit(self._one, host) for host in self.hosts]
             for future in as_completed(futures):
-                host, ok, message = future.result()
+                host, ok, message, machine = future.result()
                 success += int(ok)
                 failed += int(not ok)
-                self.result.emit(host, ok, message)
+                self.result.emit(host, ok, message, machine)
         self.completed.emit(success, failed)
 
 
@@ -475,8 +476,42 @@ class HostEnvironmentCheckThread(QThread):
         self.credentials=dict(credentials or {})
         self.use_https=bool(use_https); self.port=int(port)
         self.max_workers=max(1,min(16,int(max_workers or 8)))
+        self.agent_tokens: dict[str, tuple[str, str]] = {}
+
+    def set_agent_tokens(self, tokens: dict[str, tuple[str, str]] | None):
+        self.agent_tokens = dict(tokens or {})
 
     def _one(self, hrec: HostRecord):
+        token, source = self.agent_tokens.get(hrec.host, ("", "未设置"))
+        if hrec.target_mode == "AGENT" or token:
+            if not token:
+                return hrec.host, False, {"error": f"{source}缺少 Agent 配对令牌。"}
+            try:
+                t0 = datetime.now(timezone.utc)
+                payload = AgentClient(AgentEndpoint(
+                    host=hrec.host, port=int(hrec.agent_port or 8743), token=token,
+                    certificate_sha256=hrec.agent_certificate_sha256, timeout=20,
+                )).system_info()
+                t1 = datetime.now(timezone.utc)
+                raw = str(payload.get("utc") or "").replace("Z", "+00:00")
+                remote = datetime.fromisoformat(raw) if raw else t1
+                if remote.tzinfo is None:
+                    remote = remote.replace(tzinfo=timezone.utc)
+                midpoint = t0 + (t1 - t0) / 2
+                drift = (remote.astimezone(timezone.utc) - midpoint).total_seconds()
+                return hrec.host, True, {
+                    "time_drift_seconds": round(drift, 3),
+                    "remote_utc": remote.astimezone(timezone.utc).isoformat(),
+                    "local_utc": midpoint.isoformat(),
+                    "time_zone": str(payload.get("timeZone") or "未知"),
+                    "time_service": "FDS Agent",
+                    "firewall_profiles": [],
+                    "firewall_summary": "未通过 Agent 读取（仅供诊断）",
+                    "credential_source": source,
+                    "machine": str(payload.get("machine") or hrec.name or hrec.host),
+                }
+            except Exception as exc:
+                return hrec.host, False, {"error": f"Agent 环境信息读取失败：{exc}", "credential_source": source}
         username,password,source=self.credentials.get(hrec.host,("","","未设置"))
         if not username or not password:
             return hrec.host,False,{"error":f"{source}缺少用户名或密码。"}
@@ -587,7 +622,7 @@ class DistributionThread(QThread):
             raise RuntimeError(f"{hrec.host} 缺少 WinRM 凭据（{source}）。")
         return username, password, source
 
-    def _precheck_winrm_auth(self):
+    def _precheck_agent_auth(self):
         """在生成本地/SFTP 清单之前验证所有目标主机的 Agent 会话。"""
         if not self.hosts:
             raise RuntimeError("没有目标主机。")
@@ -753,7 +788,7 @@ class DistributionThread(QThread):
             )
 
             # 先验证 Agent 身份，不让用户在认证失败时还等待本地/SFTP 清单和 SHA256。
-            self._precheck_winrm_auth()
+            self._precheck_agent_auth()
 
             prepared = []
             for mapping in self.mappings:
@@ -885,9 +920,11 @@ class DryRunThread(DistributionThread):
     def __init__(self, mappings: list[DistributionMapping], hosts: list[HostRecord],
                  credentials: dict[str, tuple[str, str, str]], settings: AppSettings,
                  remote_plan: RemoteActionPlan | None = None, backup_root_path: str = "",
-                 version_config: dict | None = None):
+                 version_config: dict | None = None,
+                 agent_tokens: dict[str, tuple[str, str]] | None = None):
         super().__init__(mappings, hosts, credentials, settings,
-                         remote_plan or RemoteActionPlan(enabled=False), backup_root_path)
+                         remote_plan or RemoteActionPlan(enabled=False), backup_root_path,
+                         agent_tokens=agent_tokens)
         self.task_id = "DRYRUN-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
         self.version_config = dict(version_config or {})
 
@@ -905,21 +942,24 @@ class DryRunThread(DistributionThread):
         return totals
 
     def _check_host(self, hrec: HostRecord, prepared: list[PreparedMapping]) -> dict:
-        username, password, source = self._credential_for(hrec)
-        plan = replace(self.remote_plan, enabled=False, username=username, password=password)
-        executor = WinRMExecutor(hrec.host, plan)
+        token, source = self.agent_tokens.get(hrec.host, ("", "未设置"))
+        if not token:
+            return {"host": hrec.host, "name": hrec.name or hrec.host, "status": "FAILED",
+                    "issues": [f"{hrec.host} 缺少 Agent 配对令牌（{source}）。"], "warnings": [], "details": []}
+        executor = AgentClient(AgentEndpoint(
+            host=hrec.host, port=int(hrec.agent_port or 8743), token=token,
+            certificate_sha256=hrec.agent_certificate_sha256, timeout=30,
+        ))
         issues: list[str] = []
         warnings: list[str] = []
         details: list[str] = []
 
         try:
-            r = executor.test()
-            if int(r.get("exit_code", 1)) != 0:
-                raise RuntimeError(r.get("stderr") or r.get("stdout") or f"退出码={r.get('exit_code')}")
-            details.append(f"WinRM认证通过（{source}）")
+            executor.status()
+            details.append(f"FDS Agent 认证通过（{source}）")
         except Exception as exc:
             return {"host": hrec.host, "name": hrec.name or hrec.host, "status": "FAILED",
-                    "issues": [describe_winrm_failure(hrec.host, plan, exc)], "warnings": [], "details": []}
+                    "issues": [f"Agent 认证失败：{exc}"], "warnings": [], "details": []}
 
         target_totals = self._target_bytes(prepared)
         margin = max(0, int(self.settings.min_free_space_margin_mb)) * 1024 * 1024
@@ -1090,9 +1130,11 @@ class BackupThread(DistributionThread):
     def __init__(self, mappings: list[DistributionMapping], hosts: list[HostRecord],
                  credentials: dict[str, tuple[str, str, str]], settings: AppSettings,
                  connection_plan: RemoteActionPlan | None = None, backup_root_path: str = "",
-                 remote_paths: list[str] | None = None):
+                 remote_paths: list[str] | None = None,
+                 agent_tokens: dict[str, tuple[str, str]] | None = None):
         super().__init__(mappings, hosts, credentials, settings,
-                         connection_plan or RemoteActionPlan(enabled=False), backup_root_path)
+                         connection_plan or RemoteActionPlan(enabled=False), backup_root_path,
+                         agent_tokens=agent_tokens)
         self.remote_paths = list(remote_paths or [])
         self.task_id = "BACKUP-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
 
@@ -1133,14 +1175,18 @@ class BackupThread(DistributionThread):
 
             success=failed=0
             def one(hrec):
-                username,password,source=self._credential_for(hrec)
-                plan=replace(self.remote_plan,enabled=False,username=username,password=password)
-                ex=WinRMExecutor(hrec.host,plan)
+                token, source = self.agent_tokens.get(hrec.host, ("", "未设置"))
+                if not token:
+                    raise RuntimeError(f"{hrec.host} 缺少 Agent 配对令牌（{source}）。")
+                agent = AgentClient(AgentEndpoint(
+                    host=hrec.host, port=int(hrec.agent_port or 8743), token=token,
+                    certificate_sha256=hrec.agent_certificate_sha256, timeout=120,
+                ))
                 self.host_status.emit(hrec.host,"RUNNING","备份中")
                 if self.backup_root_path:
                     import ntpath
                     task_backup_root = ntpath.join(self.backup_root_path, self.task_id)
-                    ex.ensure_directory(task_backup_root)
+                    agent.ensure_directory(task_backup_root)
                     self._log(f"[{hrec.host}] 备份目录已就绪：{task_backup_root}（不存在自动创建，已存在直接使用）")
                 copied=skipped=0
                 targets=list(self.remote_paths)
@@ -1150,20 +1196,15 @@ class BackupThread(DistributionThread):
                             targets.append(self._remote_final_path(pm.mapping,entry.relative_path))
                 for remote in targets:
                     if self._cancel.is_set(): return hrec,"CANCELLED",copied,skipped,"已取消"
-                    info=ex.path_info(remote)
+                    info=agent.path_info(remote)
                     if not info.get("exists"):
                         skipped+=1
                         self._log(f"[{hrec.host}] 跳过（目标不存在）：{remote}")
                         continue
                     dest=self._backup_destination(remote)
-                    if info.get("is_dir"):
-                        ex.copy_remote_directory(remote,dest,overwrite=True)
-                        copied+=1
-                        self._log(f"[{hrec.host}] 已递归备份目录：{remote} → {dest}")
-                    else:
-                        ex.copy_remote_file(remote,dest,overwrite=True)
-                        copied+=1
-                        self._log(f"[{hrec.host}] 已备份文件：{remote} → {dest}")
+                    result = agent.backup_tree(remote, dest)
+                    copied += 1
+                    self._log(f"[{hrec.host}] 已通过 Agent 备份{'目录' if info.get('is_dir') else '文件'}：{remote} → {dest}（{result.get('files', 1)} 个文件）")
                 return hrec,"SUCCESS",copied,skipped,""
 
             with ThreadPoolExecutor(max_workers=max(1,self.settings.max_concurrency)) as pool:

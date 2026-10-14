@@ -41,7 +41,9 @@ def _client(host_record: HostRecord, token: str) -> AgentClient:
         port=int(host_record.agent_port or 8743),
         token=token,
         certificate_sha256=host_record.agent_certificate_sha256,
-        timeout=10,
+        # File distribution may spend longer than the short health-check
+        # timeout waiting on a slow target disk or network path.
+        timeout=300,
     ))
 
 
@@ -140,6 +142,7 @@ def distribute_plan_to_host_agent(
                             entry.absolute_path, dest,
                             progress=(lambda sent, _size: byte_progress_cb(host, base_bytes + sent, total_bytes, dest))
                             if byte_progress_cb else None,
+                            sha256_hex=source_hash,
                         )
                         final_info = client.inspect_file(dest, include_sha256=verify_sha256)
                         if not final_info.get("exists") or int(final_info.get("size", -1)) != int(entry.size):

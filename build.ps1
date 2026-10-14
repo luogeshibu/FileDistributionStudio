@@ -26,15 +26,50 @@ if ([string]$env:FDS_REQUIRE_SIGNING -eq '1') { $RequireSigning = $true }
 $Python=Join-Path $Root '.venv\Scripts\python.exe'
 $Spec=Join-Path $Root 'packaging\windows\FileDistributionStudio.spec'
 if (-not (Test-Path $Python)) { throw '未找到 .venv，请先运行 setup.bat。' }
-& $Python -c "import PyInstaller,PySide6,paramiko,psutil,impacket; print('打包环境检查通过')"
+& $Python -c "import PyInstaller,PySide6,paramiko,psutil; print('打包环境检查通过')"
 if ($LASTEXITCODE -ne 0) { throw '打包环境无效，请重新运行 setup.bat。' }
+$Dotnet = Get-Command dotnet.exe -ErrorAction SilentlyContinue
+if (-not $Dotnet) {
+    throw '未找到 .NET SDK。请安装 .NET 8 SDK（不是只有 Runtime），再重新运行 build.ps1。'
+}
+$DotnetSdks = @(& $Dotnet.Source --list-sdks 2>$null)
+if (-not ($DotnetSdks | Where-Object { $_ -match '^\s*8\.' })) {
+    throw '未找到 .NET 8 SDK。当前机器可能只有 .NET Runtime；请安装 .NET 8 SDK，再重新运行 build.ps1。'
+}
+$AgentProject = Join-Path $Root 'agent\FileDistributionStudio.Agent\FileDistributionStudio.Agent.csproj'
+$AgentSetupProject = Join-Path $Root 'agent\FileDistributionStudio.Agent.Setup\FileDistributionStudio.Agent.Setup.csproj'
+if (-not (Test-Path -LiteralPath $AgentProject -PathType Leaf)) {
+    throw "未找到 Agent 项目：$AgentProject"
+}
+if (-not (Test-Path -LiteralPath $AgentSetupProject -PathType Leaf)) {
+    throw "未找到 Agent 安装程序项目：$AgentSetupProject"
+}
 $Version=(& $Python -c "from app.version import APP_VERSION; print(APP_VERSION)").Trim()
 $Build=Join-Path $Root 'build'
 $Stage=Join-Path $Build 'stage'
 $Work=Join-Path $Build 'pyinstaller'
+$AgentStage=Join-Path $Build 'agent-publish'
+$AgentSetupStage=Join-Path $Build 'agent-setup-publish'
+$ArchiveStage=Join-Path $Build 'archive-stage'
 $Release=Join-Path $Root ("release\v$Version")
-Remove-Item $Stage,$Work -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $Stage,$Release | Out-Null
+Remove-Item $Stage,$Work,$AgentStage,$AgentSetupStage,$ArchiveStage -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $Stage,$Release,$AgentStage,$AgentSetupStage | Out-Null
+
+Write-Host '正在发布 FDS Agent（自包含 win-x64）……'
+& $Dotnet.Source publish $AgentProject --configuration Release --runtime win-x64 --self-contained true `
+    --output $AgentStage /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true --nologo
+if ($LASTEXITCODE -ne 0) { throw 'FDS Agent 发布失败。请查看上方 .NET/C# 编译错误并修复后重试。' }
+$AgentExe=Join-Path $AgentStage 'FileDistributionStudio.Agent.Service.exe'
+if (-not (Test-Path -LiteralPath $AgentExe -PathType Leaf)) { throw '未找到发布后的 FileDistributionStudio.Agent.Service.exe。' }
+
+Write-Host '正在发布 FDS Agent 一键安装程序（自包含 win-x64）……'
+& $Dotnet.Source publish $AgentSetupProject --configuration Release --runtime win-x64 --self-contained true `
+    --output $AgentSetupStage /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true `
+    "-p:AgentPayload=$AgentExe" --nologo
+if ($LASTEXITCODE -ne 0) { throw 'FDS Agent 一键安装程序发布失败。请查看上方 .NET/C# 编译错误并修复后重试。' }
+$AgentLauncherExe=Join-Path $AgentSetupStage 'FileDistributionStudio.Agent.exe'
+if (-not (Test-Path -LiteralPath $AgentLauncherExe -PathType Leaf)) { throw '未找到发布后的 FileDistributionStudio.Agent.exe。' }
+
 & $Python -m PyInstaller --noconfirm --clean --distpath $Stage --workpath $Work $Spec
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller 打包失败。' }
 $App=Join-Path $Stage 'FileDistributionStudio'
@@ -104,8 +139,27 @@ if ($SigningRequested) {
 & $Exe --self-test
 if ($LASTEXITCODE -ne 0) { throw '打包后的 EXE 自检失败。' }
 $Target=Join-Path $Release $Product
-Remove-Item $Target -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $Target) {
+    try {
+        Remove-Item $Target -Recurse -Force -ErrorAction Stop
+    } catch {
+        throw "无法清理旧发布目录：$Target。请先退出正在运行的发布程序，然后重新执行 build.ps1。"
+    }
+}
 Copy-Item $App $Target -Recurse
+# 只交付桌面端和一键 Agent 安装程序；Agent 本体已经嵌入安装程序。
+#   FileDistributionStudio.exe
+#   FileDistributionStudio.Agent.exe
+Copy-Item $AgentLauncherExe (Join-Path $Target 'FileDistributionStudio.Agent.exe') -Force
+Copy-Item (Join-Path $Root 'agent\README.md') (Join-Path $Target 'AGENT_README.md') -Force
+
+# Build the archive from an unlocked staging copy. The published application
+# directory may still be open in File Explorer or running from the previous
+# release, which can lock base_library.zip inside $Target.
+New-Item -ItemType Directory -Force -Path $ArchiveStage | Out-Null
+Copy-Item -Path (Join-Path $App '*') -Destination $ArchiveStage -Recurse -Force
+Copy-Item $AgentLauncherExe (Join-Path $ArchiveStage 'FileDistributionStudio.Agent.exe') -Force
+Copy-Item (Join-Path $Root 'agent\README.md') (Join-Path $ArchiveStage 'AGENT_README.md') -Force
 $Zip=Join-Path $Release "$Product.zip"
 Remove-Item $Zip -Force -ErrorAction SilentlyContinue
 $archiveError = $null
@@ -113,7 +167,7 @@ $archiveReady = $false
 for ($attempt = 1; $attempt -le 6; $attempt++) {
     try {
         Remove-Item $Zip -Force -ErrorAction SilentlyContinue
-        Compress-Archive -Path "$Target\*" -DestinationPath $Zip -CompressionLevel Optimal -ErrorAction Stop
+        Compress-Archive -Path "$ArchiveStage\*" -DestinationPath $Zip -CompressionLevel Optimal -ErrorAction Stop
         if (-not (Test-Path -LiteralPath $Zip -PathType Leaf)) {
             throw "压缩命令完成，但未找到 ZIP 文件。"
         }
@@ -129,7 +183,7 @@ for ($attempt = 1; $attempt -le 6; $attempt++) {
     }
 }
 if (-not $archiveReady) {
-    throw "发布 ZIP 失败：$($archiveError.Exception.Message)。请关闭正在运行的发布目录程序后重试。"
+    throw "发布 ZIP 失败：$($archiveError.Exception.Message)。请检查目标目录是否被其他程序锁定后重试。"
 }
 $Hash=(Get-FileHash -LiteralPath $Zip -Algorithm SHA256 -ErrorAction Stop).Hash
 "$Hash  $Product.zip" | Set-Content (Join-Path $Release 'SHA256SUMS.txt') -Encoding ascii

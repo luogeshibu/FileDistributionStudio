@@ -51,7 +51,46 @@ public sealed class ProcessOperations
 
         return new KillProcessResult(true, normalized, processes.Length, killed, failures);
     }
+
+    public IReadOnlyList<ProcessInfo> List()
+    {
+        var result = new List<ProcessInfo>();
+        foreach (var process in Process.GetProcesses())
+        {
+            try
+            {
+                var image = process.ProcessName + ".exe";
+                var path = "";
+                var description = "";
+                try
+                {
+                    path = process.MainModule?.FileName ?? "";
+                    if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                        description = FileVersionInfo.GetVersionInfo(path).FileDescription ?? "";
+                }
+                catch
+                {
+                    // Protected/system processes may deny module inspection; the
+                    // image name and PID are still useful to the desktop UI.
+                }
+                result.Add(new ProcessInfo(process.Id, image, description, path));
+            }
+            catch
+            {
+                // A process can exit between enumeration and inspection.
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+        return result.OrderBy(x => x.ImageName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.Pid)
+            .ToArray();
+    }
 }
+
+public sealed record ProcessInfo(int Pid, string ImageName, string Description, string Path);
 
 public sealed record KillProcessResult(
     bool Accepted,

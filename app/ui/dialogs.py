@@ -13,6 +13,7 @@ from ..models import HostRecord
 from .. import db
 from ..utils import validate_windows_target_path, human_bytes
 from ..resources import script_path
+from ..services.agent_client import AgentClient, AgentEndpoint
 from ..services.remote_exec import RemoteActionPlan, WinRMExecutor, describe_winrm_failure
 from .locale_zh import (status_text, action_text, phase_text, mode_text, group_text, source_text,
                         audit_category_text, verify_stage_text, hostname_source_text)
@@ -313,15 +314,54 @@ class RemoteDirectoryQueryThread(QThread):
     """只读查询单台参考主机的远程盘符或某目录的一层子目录。"""
     completed = Signal(object)
 
-    def __init__(self, context: dict, *, path="", use_https=False, port=5985):
+    def __init__(self, context: dict, *, path="", use_https=False, port=5985, agent_mode=False):
         super().__init__()
         self.context = dict(context or {})
         self.path = (path or "").strip()
         self.use_https = bool(use_https)
         self.port = int(port)
+        self.agent_mode = bool(agent_mode or self.context.get("agent_mode") or self.context.get("token"))
 
     def run(self):
         host = self.context.get("host", "")
+        if self.agent_mode:
+            try:
+                token = str(self.context.get("token") or "").strip()
+                if not token:
+                    raise RuntimeError("Agent 配对令牌未设置。")
+                client = AgentClient(AgentEndpoint(
+                    host=host,
+                    port=int(self.context.get("agent_port") or 8743),
+                    token=token,
+                    certificate_sha256=self.context.get("certificate_sha256", ""),
+                    timeout=30,
+                ))
+                entries = client.list_directory_entries(self.path)
+                if self.path:
+                    entries = [entry for entry in entries if entry.get("is_dir")]
+                    kind = "directories"
+                else:
+                    kind = "drives"
+                self.completed.emit({
+                    "ok": True,
+                    "host": host,
+                    "kind": kind,
+                    "path": self.path,
+                    "data": entries,
+                    "known_folders": [],
+                    "error": "",
+                })
+            except Exception as exc:
+                self.completed.emit({
+                    "ok": False,
+                    "host": host,
+                    "kind": "directories" if self.path else "drives",
+                    "path": self.path,
+                    "data": [],
+                    "error": str(exc),
+                })
+            return
+
         plan = RemoteActionPlan(
             enabled=False,
             use_https=self.use_https,
@@ -368,12 +408,13 @@ class RemotePathCoverageThread(QThread):
     """只读检查同一目标目录在所有当前目标主机上的存在情况。"""
     completed = Signal(object)
 
-    def __init__(self, contexts: list[dict], *, path: str, use_https=False, port=5985, max_workers=4):
+    def __init__(self, contexts: list[dict], *, path: str, use_https=False, port=5985, max_workers=4, agent_mode=False):
         super().__init__()
         self.contexts = list(contexts or [])
         self.path = (path or "").strip().replace("/", "\\")
         self.use_https = bool(use_https)
         self.port = int(port)
+        self.agent_mode = bool(agent_mode or any(ctx.get("agent_mode") or ctx.get("token") for ctx in self.contexts))
         self.max_workers = max(1, min(8, int(max_workers)))
 
     def run(self):
@@ -382,6 +423,21 @@ class RemotePathCoverageThread(QThread):
 
         def one(ctx):
             host = ctx.get("host", "")
+            if self.agent_mode or ctx.get("agent_mode") or ctx.get("token"):
+                try:
+                    token = str(ctx.get("token") or "").strip()
+                    if not token:
+                        raise RuntimeError("Agent 配对令牌未设置。")
+                    info = AgentClient(AgentEndpoint(
+                        host=host,
+                        port=int(ctx.get("agent_port") or 8743),
+                        token=token,
+                        certificate_sha256=ctx.get("certificate_sha256", ""),
+                        timeout=30,
+                    )).path_info(self.path)
+                    return host, info, ""
+                except Exception as exc:
+                    return host, {}, str(exc)
             plan = RemoteActionPlan(
                 enabled=False,
                 use_https=self.use_https,
@@ -418,12 +474,13 @@ class RemoteDirectoryBrowserDialog(QDialog):
     ROLE_KIND = Qt.UserRole + 22
     ROLE_LOADED = Qt.UserRole + 23
 
-    def __init__(self, parent=None, *, contexts=None, initial_path="", use_https=False, port=5985):
+    def __init__(self, parent=None, *, contexts=None, initial_path="", use_https=False, port=5985, agent_mode=False):
         super().__init__(parent)
         self.contexts = list(contexts or [])
         self.initial_path = (initial_path or "").strip().replace("/", "\\")
         self.use_https = bool(use_https)
         self.port = int(port)
+        self.agent_mode = bool(agent_mode or any(ctx.get("agent_mode") or ctx.get("token") for ctx in self.contexts))
         self._thread = None
         self._coverage_thread = None
         self._loading_item = None
@@ -533,8 +590,8 @@ class RemoteDirectoryBrowserDialog(QDialog):
             self.refresh_btn.setEnabled(False)
             self.select_btn.setEnabled(False)
             self.check_path_btn.setEnabled(False)
-            self.coverage_summary.setText("当前没有可用目标主机/WinRM 凭据。")
-            self.status.setText("当前没有可用目标主机/WinRM 凭据，无法浏览远程目录。")
+            self.coverage_summary.setText("当前没有可用目标主机/Agent 配对信息。")
+            self.status.setText("当前没有可用目标主机/Agent 配对信息，无法浏览远程目录。")
         else:
             self._reset_coverage_rows("未检查")
             QTimer.singleShot(80, self.refresh_root)
@@ -583,12 +640,13 @@ class RemoteDirectoryBrowserDialog(QDialog):
             return
         self._loading_item = item
         host = ctx.get("host", "")
+        channel = "FDS Agent" if self.agent_mode else "WinRM"
         if path:
-            self._set_busy(True, f"正在通过 WinRM 读取 {host}：{path}")
+            self._set_busy(True, f"正在通过 {channel} 读取 {host}：{path}")
         else:
-            self._set_busy(True, f"正在通过 WinRM 读取 {host} 的本地盘符……")
+            self._set_busy(True, f"正在通过 {channel} 读取 {host} 的本地盘符……")
         self._thread = RemoteDirectoryQueryThread(
-            ctx, path=path, use_https=self.use_https, port=self.port,
+            ctx, path=path, use_https=self.use_https, port=self.port, agent_mode=self.agent_mode,
         )
         self._thread.completed.connect(self._query_completed)
         self._thread.finished.connect(self._remote_thread_finished)
@@ -628,13 +686,21 @@ class RemoteDirectoryBrowserDialog(QDialog):
             if self.initial_path and path.lower() == self.initial_path.rstrip("\\").lower():
                 target_item = item
         for d in drives or []:
-            path = str(d.get("name", "") or "").replace("/", "\\")
+            # Agent roots are returned as ordinary file-list entries.  Their
+            # path is authoritative; using only `name` would make C:\\ render
+            # as a blank row on Windows.
+            is_agent_root = bool(d.get("path")) and ("is_dir" in d or "isDir" in d)
+            path = str((d.get("path") if is_agent_root else d.get("name")) or "").replace("/", "\\")
             if not path:
                 continue
-            label = (d.get("volume_label") or "").strip() or "无卷标"
-            total = int(d.get("total_size", 0) or 0)
-            free = int(d.get("free_size", 0) or 0)
-            info = f"{label} · 可用 {human_bytes(free)} / {human_bytes(total)}" if total else label
+            if is_agent_root:
+                label = str(d.get("name") or path).strip()
+                info = f"Agent 允许目录 · {path}"
+            else:
+                label = (d.get("volume_label") or "").strip() or "无卷标"
+                total = int(d.get("total_size", 0) or 0)
+                free = int(d.get("free_size", 0) or 0)
+                info = f"{label} · 可用 {human_bytes(free)} / {human_bytes(total)}" if total else label
             item = QTreeWidgetItem([path, info])
             item.setData(0, self.ROLE_PATH, path)
             item.setData(0, self.ROLE_KIND, "drive")
@@ -752,7 +818,7 @@ class RemoteDirectoryBrowserDialog(QDialog):
         self.check_path_btn.setText("正在检查…")
         self._coverage_thread = RemotePathCoverageThread(
             self.contexts, path=path, use_https=self.use_https, port=self.port,
-            max_workers=min(8, len(self.contexts)),
+            max_workers=min(8, len(self.contexts)), agent_mode=self.agent_mode,
         )
         self._coverage_thread.completed.connect(self._coverage_completed)
         self._coverage_thread.finished.connect(self._remote_thread_finished)
@@ -882,15 +948,32 @@ class RemoteBackupEntryQueryThread(QThread):
     """只读读取参考主机盘符或当前目录的一层文件/文件夹。"""
     completed = Signal(object)
 
-    def __init__(self, context: dict, *, path="", use_https=False, port=5985):
+    def __init__(self, context: dict, *, path="", use_https=False, port=5985, agent_mode=False):
         super().__init__()
         self.context = dict(context or {})
         self.path = (path or "").strip().replace("/", "\\")
         self.use_https = bool(use_https)
         self.port = int(port)
+        self.agent_mode = bool(agent_mode or self.context.get("agent_mode"))
 
     def run(self):
         host = self.context.get("host", "")
+        if self.agent_mode:
+            try:
+                token = self.context.get("token", "")
+                if not token:
+                    raise RuntimeError("Agent 配对令牌未设置。")
+                client = AgentClient(AgentEndpoint(
+                    host=host, port=int(self.context.get("agent_port") or self.port or 8743),
+                    token=token, certificate_sha256=self.context.get("certificate_sha256", ""), timeout=40,
+                ))
+                data = client.list_directory_entries(self.path)
+                kind = "entries" if self.path else "drives"
+                self.completed.emit({"ok": True, "host": host, "kind": kind, "path": self.path, "data": data, "error": ""})
+            except Exception as exc:
+                self.completed.emit({"ok": False, "host": host, "kind": "entries" if self.path else "drives",
+                                     "path": self.path, "data": [], "error": str(exc)})
+            return
         plan = RemoteActionPlan(
             enabled=False, use_https=self.use_https, port=self.port,
             username=self.context.get("username", ""), password=self.context.get("password", ""),
@@ -917,11 +1000,12 @@ class RemoteBackupBrowserDialog(QDialog):
     ROLE_PATH = Qt.UserRole + 41
     ROLE_IS_DIR = Qt.UserRole + 42
 
-    def __init__(self, parent=None, *, contexts=None, preselected=None, use_https=False, port=5985):
+    def __init__(self, parent=None, *, contexts=None, preselected=None, use_https=False, port=5985, agent_mode=False):
         super().__init__(parent)
         self.contexts = list(contexts or [])
         self.use_https = bool(use_https)
         self.port = int(port)
+        self.agent_mode = bool(agent_mode or any(c.get("agent_mode") for c in self.contexts))
         self._thread = None
         self._selected_paths = []
         for x in (preselected or []):
@@ -1002,7 +1086,7 @@ class RemoteBackupBrowserDialog(QDialog):
         if self.contexts:
             QTimer.singleShot(80, self._load_drives)
         else:
-            self.status.setText("当前没有可用目标主机/WinRM 凭据。")
+            self.status.setText("当前没有可用目标主机/Agent 配对信息。")
             self.ok_btn.setEnabled(False)
 
     def _current_context(self):
@@ -1026,7 +1110,7 @@ class RemoteBackupBrowserDialog(QDialog):
         if not ctx:
             return
         self._set_busy(True, f"正在读取 {ctx.get('host','')}：{path or '磁盘列表'} ...")
-        self._thread = RemoteBackupEntryQueryThread(ctx, path=path, use_https=self.use_https, port=self.port)
+        self._thread = RemoteBackupEntryQueryThread(ctx, path=path, use_https=self.use_https, port=self.port, agent_mode=self.agent_mode)
         self._thread.completed.connect(self._query_done)
         self._thread.start()
 
@@ -1043,8 +1127,8 @@ class RemoteBackupBrowserDialog(QDialog):
             self.drive_combo.blockSignals(True)
             self.drive_combo.clear()
             for d in payload.get("data") or []:
-                name = d.get("name", "")
-                label = d.get("volume_label", "")
+                name = d.get("path", d.get("name", "")) if self.agent_mode else d.get("name", "")
+                label = d.get("volumeLabel", d.get("volume_label", ""))
                 info = f"{name}  {label}".strip()
                 self.drive_combo.addItem(info, name)
             self.drive_combo.blockSignals(False)
@@ -1161,14 +1245,28 @@ class RemoteProcessQueryThread(QThread):
     """通过 WinRM 只读读取一个参考主机的当前进程列表。"""
     completed = Signal(object)
 
-    def __init__(self, context: dict, *, use_https=False, port=5985):
+    def __init__(self, context: dict, *, use_https=False, port=5985, agent_mode=False):
         super().__init__()
         self.context = dict(context or {})
         self.use_https = bool(use_https)
         self.port = int(port)
+        self.agent_mode = bool(agent_mode or self.context.get("agent_mode"))
 
     def run(self):
         host = self.context.get("host", "")
+        if self.agent_mode:
+            try:
+                token = self.context.get("token", "")
+                if not token:
+                    raise RuntimeError("Agent 配对令牌未设置。")
+                data = AgentClient(AgentEndpoint(
+                    host=host, port=int(self.context.get("agent_port") or self.port or 8743),
+                    token=token, certificate_sha256=self.context.get("certificate_sha256", ""), timeout=35,
+                )).list_processes()
+                self.completed.emit({"ok": True, "host": host, "data": data, "error": ""})
+            except Exception as exc:
+                self.completed.emit({"ok": False, "host": host, "data": [], "error": str(exc)})
+            return
         plan = RemoteActionPlan(
             enabled=False,
             use_https=self.use_https,
@@ -1198,12 +1296,13 @@ class RemoteProcessBrowserDialog(QDialog):
     COL_PIDS = 4
     COL_PATH = 5
 
-    def __init__(self, parent=None, *, contexts=None, preselected=None, use_https=False, port=5985):
+    def __init__(self, parent=None, *, contexts=None, preselected=None, use_https=False, port=5985, agent_mode=False):
         super().__init__(parent)
         self.contexts = list(contexts or [])
         self.preselected = [x.strip() for x in (preselected or []) if str(x).strip()]
         self.use_https = bool(use_https)
         self.port = int(port)
+        self.agent_mode = bool(agent_mode or any(c.get("agent_mode") for c in self.contexts))
         self._thread = None
 
         self.setWindowTitle("选择远程进程")
@@ -1234,7 +1333,7 @@ class RemoteProcessBrowserDialog(QDialog):
         header.setSectionResizeMode(self.COL_PIDS, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self.COL_PATH, QHeaderView.ResizeToContents)
 
-        self.status = QLabel("进程读取只通过 WinRM 查询，不会在打开窗口时结束任何进程。")
+        self.status = QLabel("进程读取只通过 FDS Agent 查询，不会在打开窗口时结束任何进程。")
         self.status.setWordWrap(True)
         self.status.setStyleSheet("color:#667A8A;")
         self.note = QLabel(
@@ -1288,7 +1387,7 @@ class RemoteProcessBrowserDialog(QDialog):
         if not self.contexts:
             self.refresh_btn.setEnabled(False)
             self.ok_btn.setEnabled(False)
-            self.status.setText("当前没有可用目标主机/WinRM 凭据，无法读取远程进程。")
+            self.status.setText("当前没有可用目标主机/Agent 配对信息，无法读取远程进程。")
         else:
             QTimer.singleShot(80, self.refresh_processes)
 
@@ -1314,8 +1413,8 @@ class RemoteProcessBrowserDialog(QDialog):
         if not ctx:
             return
         host = ctx.get("host", "")
-        self._set_busy(True, f"正在通过 WinRM 读取 {host} 的进程列表……")
-        self._thread = RemoteProcessQueryThread(ctx, use_https=self.use_https, port=self.port)
+        self._set_busy(True, f"正在通过 FDS Agent 读取 {host} 的进程列表……")
+        self._thread = RemoteProcessQueryThread(ctx, use_https=self.use_https, port=self.port, agent_mode=self.agent_mode)
         self._thread.completed.connect(self._processes_loaded)
         self._thread.start()
 
@@ -1435,7 +1534,7 @@ class RemoteProcessBrowserDialog(QDialog):
 class MappingTargetDialog(QDialog):
     def __init__(self, parent=None, *, title="配置分发映射", target_path="", is_directory=False,
                  folder_mode="CONTENTS", remote_drive_contexts=None, remote_drive_hint="",
-                 use_https=False, winrm_port=5985):
+                 use_https=False, winrm_port=5985, agent_mode=False):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(760, 330)
@@ -1443,6 +1542,7 @@ class MappingTargetDialog(QDialog):
         self.remote_drive_hint = remote_drive_hint or ""
         self.use_https = bool(use_https)
         self.winrm_port = int(winrm_port)
+        self.agent_mode = bool(agent_mode)
         self.target = QLineEdit(target_path)
         self.target.setPlaceholderText(r"例如：D:\ADMS\dll、E:\NariTech\bin")
         self.mode = QComboBox()
@@ -1463,7 +1563,7 @@ class MappingTargetDialog(QDialog):
         note.setWordWrap(True); note.setStyleSheet("color:#667A8A;")
         self.browse_remote_btn = QPushButton("浏览远程目录")
         self.browse_remote_btn.setEnabled(bool(self.remote_drive_contexts))
-        self.browse_remote_btn.setToolTip("通过 WinRM 只读浏览参考目标主机的盘符和目录；不会创建或修改远程文件。")
+        self.browse_remote_btn.setToolTip("通过 FDS Agent 只读浏览参考目标主机的盘符和目录；不会创建或修改远程文件。")
         self.browse_remote_btn.clicked.connect(self._browse_remote_directory)
         target_row = QHBoxLayout()
         target_row.setContentsMargins(0, 0, 0, 0)
@@ -1489,7 +1589,7 @@ class MappingTargetDialog(QDialog):
             return
         d = RemoteDirectoryBrowserDialog(
             self, contexts=self.remote_drive_contexts, initial_path=self.target.text().strip(),
-            use_https=self.use_https, port=self.winrm_port,
+            use_https=self.use_https, port=self.winrm_port, agent_mode=self.agent_mode,
         )
         if d.exec():
             self.target.setText(d.selected_path())
@@ -1513,7 +1613,7 @@ class MappingTargetDialog(QDialog):
 
 class SftpMappingDialog(QDialog):
     def __init__(self, parent=None, *, initial=None, remote_drive_contexts=None, remote_drive_hint="",
-                 use_https=False, winrm_port=5985):
+                 use_https=False, winrm_port=5985, agent_mode=False):
         super().__init__(parent)
         initial = initial or {}
         self.setWindowTitle("添加 SFTP 分发映射")
@@ -1522,6 +1622,7 @@ class SftpMappingDialog(QDialog):
         self.remote_drive_hint = remote_drive_hint or ""
         self.use_https = bool(use_https)
         self.winrm_port = int(winrm_port)
+        self.agent_mode = bool(agent_mode)
         self.host = QLineEdit(initial.get("host", ""))
         self.port = QSpinBox(); self.port.setRange(1,65535); self.port.setValue(int(initial.get("port",22)))
         self.username = QLineEdit(initial.get("username", ""))
@@ -1544,7 +1645,7 @@ class SftpMappingDialog(QDialog):
         note.setWordWrap(True); note.setStyleSheet("color:#667A8A;")
         self.browse_remote_btn = QPushButton("浏览远程目录")
         self.browse_remote_btn.setEnabled(bool(self.remote_drive_contexts))
-        self.browse_remote_btn.setToolTip("通过 WinRM 只读浏览参考目标主机目录。")
+        self.browse_remote_btn.setToolTip("通过 FDS Agent 只读浏览参考目标主机目录。")
         self.browse_remote_btn.clicked.connect(self._browse_remote_directory)
         target_row = QHBoxLayout(); target_row.setContentsMargins(0,0,0,0); target_row.addWidget(self.target,1); target_row.addWidget(self.browse_remote_btn)
         form=QFormLayout(); form.addRow("SFTP 主机",self.host); form.addRow("端口",self.port); form.addRow("用户名",self.username); form.addRow("密码",self.password); form.addRow("远程路径",self.remote_path); form.addRow("远程源类型",self.source_kind); form.addRow("目标目录",target_row); form.addRow("目录方式",self.folder_mode)
@@ -1560,7 +1661,7 @@ class SftpMappingDialog(QDialog):
             return
         d = RemoteDirectoryBrowserDialog(
             self, contexts=self.remote_drive_contexts, initial_path=self.target.text().strip(),
-            use_https=self.use_https, port=self.winrm_port,
+            use_https=self.use_https, port=self.winrm_port, agent_mode=self.agent_mode,
         )
         if d.exec():
             self.target.setText(d.selected_path())

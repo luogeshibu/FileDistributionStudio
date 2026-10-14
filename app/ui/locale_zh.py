@@ -38,12 +38,12 @@ ACTION_MAP = {
 
 PHASE_MAP = {"PRE": "分发前", "POST": "分发后"}
 SOURCE_MAP = {"LOCAL": "本地文件 / 目录", "SFTP": "SFTP 远程服务器", "MULTI": "多源多目标映射"}
-MODE_MAP = {"WINRM": "WinRM", "ADMIN_SHARE": "Windows 管理共享（兼容）", "UNC": "UNC 共享路径（兼容）"}
+MODE_MAP = {"AGENT": "FDS Agent（HTTPS）", "WINRM": "旧 WinRM（历史记录）", "ADMIN_SHARE": "旧 Windows 管理共享（历史记录）", "UNC": "旧 UNC 共享路径（历史记录）"}
 GROUP_MAP = {"Default": "默认", "Discovered": "自动发现"}
 
 AUDIT_CATEGORY_MAP = {
     "APP": "程序", "TASK": "任务", "SOURCE": "分发源", "DISCOVERY": "主机发现", "HOST": "主机管理",
-    "SFTP": "SFTP", "SMB": "SMB", "WINRM": "WinRM", "PREFLIGHT": "分发前预检查",
+    "SFTP": "SFTP", "SMB": "SMB", "AGENT": "FDS Agent", "WINRM": "旧 WinRM（历史记录）", "PREFLIGHT": "分发前预检查",
     "DISTRIBUTION": "文件分发", "MAPPING": "分发映射", "BACKUP": "备份", "VERIFY": "校验", "SETTINGS": "系统设置", "EXPORT": "导出",
 }
 
@@ -55,7 +55,7 @@ HOSTNAME_SOURCE_MAP = {
     "NETAPI_WKSTA": "Windows 工作站 API",
     "SMB_NTLM": "SMB/NTLM 指纹",
     "SMB_RPC": "SMB/WKSSVC 验证",
-    "WINRM": "WinRM hostname",
+    "WINRM": "旧 WinRM hostname（历史记录）",
     "MANUAL": "手工维护",
 }
 

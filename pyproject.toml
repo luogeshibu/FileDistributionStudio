@@ -11,5 +11,4 @@ dependencies = [
   "PySide6>=6.7,<7",
   "paramiko>=3.4,<5",
   "psutil>=6,<8",
-  "impacket>=0.13,<0.14",
 ]

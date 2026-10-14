@@ -96,11 +96,3 @@ def smb_status_label(status: str) -> str:
         "WRITABLE": "可分发",
         "FAILED": "SMB 测试失败",
     }.get(status or "UNTESTED", status or "未测试")
-
-
-def winrm_status_label(status: str) -> str:
-    return {
-        "UNTESTED": "未测试",
-        "WRITABLE": "可分发",
-        "FAILED": "WinRM 测试失败",
-    }.get(status or "UNTESTED", status or "未测试")
