@@ -29,7 +29,7 @@ from ..utils import human_bytes, validate_windows_target_path
 from ..workers import DiscoveryThread, DistributionThread, DryRunThread, BackupThread, VersionCheckThread, HostnameVerificationThread, WinRMTargetTestThread, RemoteRestartThread, AgentTargetTestThread, AgentRestartThread, HostStatusTestThread, DiscoveryReconcileThread, HostEnvironmentCheckThread, RemoteFileOperationThread
 from .. import db
 from .dialogs import (HostEditDialog, TaskDetailDialog, HostnameCredentialDialog, MappingTargetDialog,
-                      SftpMappingDialog, WinRMSetupDialog, WinRMHostCredentialDialog, AgentTokenDialog, RemoteProcessBrowserDialog,
+                      SftpMappingDialog, WinRMSetupDialog, WinRMHostCredentialDialog, RemoteProcessBrowserDialog,
                       RemoteBackupBrowserDialog)
 from .theme import app_icon
 from .widgets import PasswordLineEdit, RemoteFileDropTable, configure_full_content_table, fit_full_content_table
@@ -324,7 +324,7 @@ class MainWindow(QMainWindow):
 
         target, target_l = card(
             "Windows 目标主机",
-            "选择本次要分发的 Windows 主机，并为每台主机设置一次 FDS Agent HTTPS 配对令牌。",
+            "选择本次要分发的 Windows 主机。Agent 端口、证书指纹和配对令牌统一从“主机管理”读取。",
         )
         cred = QHBoxLayout()
         self.win_user = QLineEdit(self.settings.winrm_default_username); self.win_password = PasswordLineEdit()
@@ -348,7 +348,7 @@ class MainWindow(QMainWindow):
         self.remember_default_cred.toggled.connect(lambda _checked: self._save_default_winrm_credential(show_error=False))
         cred_hint = QLabel(
             "当前分支不再使用 WinRM、RDP 或 Windows 管理共享。请在目标主机安装 FDS Agent，"
-            "然后在下方选择主机并设置 Agent 配对令牌；文件分发、进程树结束和强制重启均通过 Agent HTTPS 完成。"
+            "然后到“主机管理 → 编辑”填写 Agent 端口、证书指纹和配对令牌；文件分发、进程树结束和强制重启均通过 Agent HTTPS 完成。"
         )
         cred_hint.setObjectName("Muted"); cred_hint.setWordWrap(True); target_l.addWidget(cred_hint)
 
@@ -504,28 +504,23 @@ class MainWindow(QMainWindow):
         cred_title = QLabel("凭据管理")
         self.btn_set_host_cred = QPushButton("设置选中凭据")
         self.btn_set_host_cred.setIcon(app_icon("edit"))
-        self.btn_set_host_cred.setToolTip("旧 WinRM 凭据入口已停用，请使用“设置 Agent 令牌”。")
+        self.btn_set_host_cred.setToolTip("旧 WinRM 凭据入口已停用，请到“主机管理 → 编辑”维护 Agent 连接信息。")
         self.btn_set_host_cred.clicked.connect(self._set_selected_host_credentials)
         self.btn_batch_host_cred = QPushButton("批量设置凭据")
         self.btn_batch_host_cred.setIcon(app_icon("hosts"))
-        self.btn_batch_host_cred.setToolTip("旧 WinRM 凭据入口已停用，请使用“设置 Agent 令牌”。")
+        self.btn_batch_host_cred.setToolTip("旧 WinRM 凭据入口已停用，请到“主机管理 → 编辑”维护 Agent 连接信息。")
         self.btn_batch_host_cred.clicked.connect(self._set_checked_host_credentials)
         self.btn_clear_host_cred = QPushButton("恢复默认凭据")
         self.btn_clear_host_cred.setIcon(app_icon("clear"))
         self.btn_clear_host_cred.setToolTip("旧 WinRM 凭据入口已停用。")
         self.btn_clear_host_cred.clicked.connect(self._restore_selected_default_credentials)
-        self.btn_set_agent_token = QPushButton("设置 Agent 令牌")
-        self.btn_set_agent_token.setIcon(app_icon("settings"))
-        self.btn_set_agent_token.setToolTip("为高亮选择的 Agent 主机设置配对令牌；令牌只保存到 Windows 凭据管理器。")
-        self.btn_set_agent_token.clicked.connect(self._set_selected_agent_tokens)
-        for b in (self.btn_set_host_cred, self.btn_batch_host_cred, self.btn_clear_host_cred, self.btn_set_agent_token):
+        for b in (self.btn_set_host_cred, self.btn_batch_host_cred, self.btn_clear_host_cred):
             _compact_action_button(b)
         cred_actions.addWidget(cred_title)
         cred_actions.addWidget(self.btn_set_host_cred)
         cred_actions.addWidget(self.btn_batch_host_cred)
         cred_actions.addWidget(self.btn_clear_host_cred)
-        cred_actions.addWidget(self.btn_set_agent_token)
-        cred_note = QLabel("每台目标主机只需设置一次 Agent 配对令牌；令牌使用 Windows 凭据管理器保存。")
+        cred_note = QLabel("Agent 端口、证书指纹和配对令牌统一在“主机管理 → 编辑”中维护，其他模块会自动使用。")
         cred_note.setObjectName("Muted"); cred_note.setWordWrap(True)
         cred_actions.addWidget(cred_note, 1)
         target_l.addLayout(cred_actions)
@@ -841,7 +836,7 @@ class MainWindow(QMainWindow):
             hint = "以下主机未设置 Agent 配对令牌：" + "、".join(missing[:5])
             if len(missing) > 5:
                 hint += f" 等 {len(missing)} 台"
-            hint += "。请先在下方设置 Agent 令牌并完成测试。"
+            hint += "。请先到“主机管理 → 编辑”填写 Agent 配对令牌并完成测试。"
         elif not hosts:
             hint = "请先勾选至少一台已安装并测试通过 FDS Agent 的目标主机。"
         else:
@@ -1046,7 +1041,7 @@ class MainWindow(QMainWindow):
         token = self._load_agent_token(host)
         if token:
             return "Agent 令牌已配置", "该主机的 FDS Agent 令牌已配置，令牌不会在界面或日志中显示。"
-        return "Agent 令牌未设置", "请先使用“设置 Agent 令牌”，再测试 Agent。"
+        return "Agent 令牌未设置", "请先到“主机管理 → 编辑”填写 Agent 配对令牌，再测试 Agent。"
 
     def _credential_status_for_host(self, host: str, host_record: HostRecord | None = None) -> tuple[str, str]:
         if host_record is not None and host_record.target_mode == "AGENT":
@@ -1108,38 +1103,6 @@ class MainWindow(QMainWindow):
                 preview += f"\n……另有 {len(missing) - 8} 台"
             raise ValueError("以下 Agent 主机缺少配对令牌：\n" + preview)
         return result
-
-    def _set_selected_agent_tokens(self):
-        hosts = self._highlighted_target_hosts()
-        if not hosts:
-            hosts = [h for h in self._selected_hosts() if h.target_mode == "AGENT"]
-        if not hosts:
-            QMessageBox.information(self, "Agent 令牌", "请先高亮选择或勾选目标通道为 Agent 的主机。")
-            return
-        current = self._load_agent_token(hosts[0].host) if len(hosts) == 1 else ""
-        dlg = AgentTokenDialog(self, host_count=len(hosts), token=current)
-        if not dlg.exec():
-            return
-        value = dlg.value()
-        failures = []
-        for host in hosts:
-            self._session_agent_tokens[host.host] = value["token"]
-            if credential_store.is_available():
-                try:
-                    if value["remember"]:
-                        credential_store.write(credential_store.agent_target(host.host), "agent", value["token"])
-                    else:
-                        credential_store.delete(credential_store.agent_target(host.host))
-                except Exception as exc:
-                    failures.append(f"{host.host}: {exc}")
-        audit.operation(
-            self.settings.audit_path, "AGENT", "CREDENTIAL_SET", "SUCCESS" if not failures else "PARTIAL_FAILED",
-            f"已为 {len(hosts)} 台主机设置 Agent 配对令牌。",
-            details={"hosts": [h.host for h in hosts], "remembered_in_windows_credential_manager": bool(value["remember"] and credential_store.is_available())},
-        )
-        self.refresh_hosts(); self.refresh_audit()
-        if failures:
-            QMessageBox.warning(self, "Agent 令牌", "令牌已保存在当前会话，但部分主机未能写入 Windows 凭据管理器：\n" + "\n".join(failures[:5]))
 
     def _highlighted_target_hosts(self) -> list[HostRecord]:
         rows = self.target_table.selectionModel().selectedRows()
@@ -1540,7 +1503,7 @@ class MainWindow(QMainWindow):
     def _test_agent_targets(self):
         hosts = self._agent_hosts_from_selection()
         if not hosts:
-            QMessageBox.information(self, "Agent 测试", "当前勾选的主机中没有使用 FDS Agent（HTTPS）通道的主机。\n请先在主机配置中选择 Agent 通道。")
+            QMessageBox.information(self, "Agent 测试", "当前勾选的主机中没有使用 FDS Agent（HTTPS）通道的主机。\n请先到“主机管理 → 编辑”确认 Agent 通道配置。")
             return
         running = getattr(self, "agent_test_thread", None)
         if running and running.isRunning():
@@ -1565,6 +1528,19 @@ class MainWindow(QMainWindow):
         self.agent_test_thread.completed.connect(self._agent_target_test_completed)
         self.agent_test_thread.start()
 
+    def _record_agent_test_result(self, host: str, success: bool, message: str, machine: str = ""):
+        now = datetime.now().isoformat(timespec="seconds")
+        db.update_host_agent_status(host, "AUTH_OK" if success else "FAILED", now)
+        if success and machine and machine.strip() and machine.strip().casefold() != host.casefold():
+            # The Agent is the authoritative source for the Windows computer name.
+            db.update_host_hostname(host, machine.strip(), "FDS_AGENT", True, "由 FDS Agent /api/v1/status 返回。")
+        self._append_log(f"[{host}] {'Agent 测试通过' if success else 'Agent 测试失败'}：{message}")
+        audit.operation(
+            self.settings.audit_path, "AGENT", "UI_TEST", "SUCCESS" if success else "FAILED",
+            message, host=host,
+            details={"port": next((h.agent_port for h in db.list_hosts() if h.host == host), 8743)},
+        )
+
     def _agent_target_test_result(self, host: str, success: bool, message: str, machine: str = ""):
         label = "Agent AUTH_OK" if success else "Agent 测试失败"
         for row in range(self.target_table.rowCount()):
@@ -1574,19 +1550,56 @@ class MainWindow(QMainWindow):
                 cell.setToolTip(message)
                 self.target_table.setItem(row, 6, cell)
                 break
-        now = datetime.now().isoformat(timespec="seconds")
-        db.update_host_agent_status(host, "AUTH_OK" if success else "FAILED", now)
-        if success and machine and machine.strip() and machine.strip().casefold() != host.casefold():
-            # The Agent is the authoritative source for the Windows computer
-            # name.  Discovery may only know an IP when SMB/RPC is unavailable.
-            db.update_host_hostname(host, machine.strip(), "FDS_AGENT", True, "由 FDS Agent /api/v1/status 返回。")
-        self._append_log(f"[{host}] {'Agent 测试通过' if success else 'Agent 测试失败'}：{message}")
-        audit.operation(self.settings.audit_path, "AGENT", "UI_TEST", "SUCCESS" if success else "FAILED",
-                        message, host=host, details={"port": next((h.agent_port for h in db.list_hosts() if h.host == host), 8743)})
+        self._record_agent_test_result(host, success, message, machine)
 
     def _agent_target_test_completed(self, success: int, failed: int):
         self.btn_agent_test.setEnabled(True)
         self.btn_agent_test.setText("测试已选主机 Agent")
+        self.refresh_audit(); self.refresh_hosts()
+        QMessageBox.information(self, "Agent 测试", f"Agent 测试完成。\n\n通过：{success} 台\n失败：{failed} 台")
+
+    def _test_inventory_agent(self):
+        hosts = [host for host in self._selected_inventory_hosts() if host.target_mode == "AGENT"]
+        if not hosts:
+            QMessageBox.information(self, "Agent 测试", "请先在主机管理中勾选或选中使用 FDS Agent（HTTPS）的主机。")
+            return
+        running = getattr(self, "inventory_agent_test_thread", None)
+        if running and running.isRunning():
+            QMessageBox.information(self, "Agent 测试", "已有 Agent 测试正在执行，请等待完成。")
+            return
+        try:
+            tokens = self._resolve_agent_tokens(hosts)
+        except Exception as exc:
+            QMessageBox.warning(self, "Agent 测试", str(exc))
+            return
+        self.btn_inventory_agent_test.setEnabled(False)
+        self.btn_inventory_agent_test.setText("正在测试 Agent…")
+        selected = {host.host for host in hosts}
+        for row in range(self.host_table.rowCount()):
+            item = self.host_table.item(row, 3)
+            if item and item.text().strip() in selected:
+                self.host_table.setItem(row, 13, QTableWidgetItem("正在测试 Agent…"))
+        self.inventory_agent_test_thread = AgentTargetTestThread(
+            hosts, tokens, max_workers=min(self.concurrent_spin.value(), 8)
+        )
+        self.inventory_agent_test_thread.result.connect(self._inventory_agent_test_result)
+        self.inventory_agent_test_thread.completed.connect(self._inventory_agent_test_completed)
+        self.inventory_agent_test_thread.start()
+
+    def _inventory_agent_test_result(self, host: str, success: bool, message: str, machine: str = ""):
+        label = "AUTH_OK" if success else "FAILED"
+        for row in range(self.host_table.rowCount()):
+            item = self.host_table.item(row, 3)
+            if item and item.text().strip() == host:
+                cell = QTableWidgetItem(label)
+                cell.setToolTip(message)
+                self.host_table.setItem(row, 13, cell)
+                break
+        self._record_agent_test_result(host, success, message, machine)
+
+    def _inventory_agent_test_completed(self, success: int, failed: int):
+        self.btn_inventory_agent_test.setEnabled(True)
+        self.btn_inventory_agent_test.setText("测试选中 Agent")
         self.refresh_audit(); self.refresh_hosts()
         QMessageBox.information(self, "Agent 测试", f"Agent 测试完成。\n\n通过：{success} 台\n失败：{failed} 台")
 
@@ -2581,7 +2594,7 @@ class MainWindow(QMainWindow):
         l.addLayout(top)
 
         help_label = QLabel(
-            "一次只连接 1 台主机，使用“文件分发 → Windows 目标主机”中相同的 Agent 配对令牌。"
+            "一次只连接 1 台主机，自动使用“主机管理 → 编辑”中保存的 Agent 连接信息。"
             "本机文件可直接从 Windows 资源管理器拖入远程列表上传；下载时先选择本地目录，再选择远程文件。"
         )
         help_label.setWordWrap(True); help_label.setObjectName("Muted"); l.addWidget(help_label)
@@ -2714,7 +2727,7 @@ class MainWindow(QMainWindow):
         if not host:
             raise ValueError("请先选择一台目标主机。")
         if host.target_mode != "AGENT":
-            raise ValueError("当前分支只支持 FDS Agent HTTPS；请先在主机配置中安装并配对 Agent。")
+            raise ValueError("当前分支只支持 FDS Agent HTTPS；请先在“主机管理 → 编辑”中确认 Agent 配置。")
         token = self._load_agent_token(host.host)
         if not token:
             raise ValueError("该主机尚未设置 Agent 配对令牌。")
@@ -2944,7 +2957,7 @@ class MainWindow(QMainWindow):
     def _build_inventory_page(self):
         canvas,root=self._page_canvas(); c,l=card(
             "已保存主机",
-            "主机管理只维护机器身份、分组和连接能力。本分支正式操作统一使用 FDS Agent HTTPS；Agent 令牌在“文件分发 → Windows 目标主机”管理。Ping、SMB 445、RDP 3389、DNS/NetBIOS/SMB 身份仅用于发现与辅助诊断。",
+            "主机管理统一维护机器身份、分组、Agent 端口、证书指纹和配对令牌；文件分发、远程文件和其他模块直接使用这里的配置。Ping、SMB 445、RDP 3389、DNS/NetBIOS/SMB 身份仅用于发现与辅助诊断。",
         )
         # 主机数量直接展示给用户，不再需要通过行数或数据库 ID 猜测。
         self.inventory_count_label = QLabel("当前共 0 台主机")
@@ -2975,13 +2988,17 @@ class MainWindow(QMainWindow):
         self.host_table.setColumnHidden(1, True)
         l.addWidget(self.host_table)
         row=QHBoxLayout()
+        self.btn_inventory_agent_test = None
         for text,fn,icon in [
             ("添加",self._add_host,"add"),("编辑",self._edit_host,"edit"),("删除",self._delete_host,"delete"),
             ("全选",lambda:self._set_inventory_checks(True),"check"),("取消全选",lambda:self._set_inventory_checks(False),"clear"),
             ("测试网络状态（Ping/端口）",self._test_inventory_online,"radar"),
+            ("测试选中 Agent",self._test_inventory_agent,"terminal"),
             ("导出 Excel",self._export_inventory_excel,"file"),("刷新",self.refresh_hosts,"refresh")
         ]:
             b=QPushButton(text); b.setIcon(app_icon(icon)); b.clicked.connect(fn); row.addWidget(b)
+            if text == "测试选中 Agent":
+                self.btn_inventory_agent_test = b
         row.addStretch(1); l.addLayout(row); root.addWidget(c); return canvas
 
     def refresh_hosts(self):
@@ -3112,7 +3129,11 @@ class MainWindow(QMainWindow):
         if d.exec():
             h=d.value()
             if h.host:
-                db.upsert_host(h); self.refresh_hosts();audit.operation(self.settings.audit_path,"HOST","ADD","SUCCESS","已添加或更新主机。",host=h.host,details={"name":h.name,"group":h.group_name,"hostname_source":h.hostname_source,"hostname_verified":bool(h.hostname_verified)});self.refresh_audit()
+                db.upsert_host(h)
+                failures=self._save_host_agent_token(h.host,d.agent_token_value())
+                self.refresh_hosts();audit.operation(self.settings.audit_path,"HOST","ADD","SUCCESS","已添加或更新主机及 Agent 连接信息。",host=h.host,details={"name":h.name,"group":h.group_name,"hostname_source":h.hostname_source,"hostname_verified":bool(h.hostname_verified),"agent_token_configured":bool(d.agent_token_value())});self.refresh_audit()
+                if failures:
+                    QMessageBox.warning(self,"Agent 配置","主机已保存，但凭据管理器更新部分失败：\n"+"\n".join(failures[:5]))
 
     def _set_inventory_checks(self, checked: bool):
         for r in range(self.host_table.rowCount()):
@@ -3147,12 +3168,47 @@ class MainWindow(QMainWindow):
         if highlighted:return highlighted[0]
         checked=self._checked_inventory_hosts()
         return checked[0] if checked else None
+
+    def _save_host_agent_token(self, host: str, token: str, previous_host: str = "") -> list[str]:
+        """Keep the token out of SQLite while making host management authoritative."""
+        host = (host or "").strip()
+        previous_host = (previous_host or "").strip()
+        token = (token or "").strip()
+        failures = []
+        if previous_host and previous_host != host:
+            self._session_agent_tokens.pop(previous_host, None)
+            if credential_store.is_available():
+                try:
+                    credential_store.delete(credential_store.agent_target(previous_host))
+                except Exception as exc:
+                    failures.append(f"{previous_host}: {exc}")
+
+        if token:
+            self._session_agent_tokens[host] = token
+            if credential_store.is_available():
+                try:
+                    credential_store.write(credential_store.agent_target(host), "agent", token)
+                except Exception as exc:
+                    failures.append(f"{host}: {exc}")
+        else:
+            self._session_agent_tokens.pop(host, None)
+            if credential_store.is_available():
+                try:
+                    credential_store.delete(credential_store.agent_target(host))
+                except Exception as exc:
+                    failures.append(f"{host}: {exc}")
+        return failures
+
     def _edit_host(self):
         h=self._selected_inventory_host()
         if not h:return
-        d=HostEditDialog(self,h)
+        d=HostEditDialog(self,h,agent_token=self._load_agent_token(h.host))
         if d.exec():
-            new_h=d.value();db.upsert_host(new_h);self.refresh_hosts();audit.operation(self.settings.audit_path,"HOST","EDIT","SUCCESS","已修改主机配置。",host=new_h.host,details={"name":new_h.name,"group":new_h.group_name,"hostname_source":new_h.hostname_source,"hostname_verified":bool(new_h.hostname_verified)});self.refresh_audit()
+            new_h=d.value();db.upsert_host(new_h)
+            failures=self._save_host_agent_token(new_h.host,d.agent_token_value(),previous_host=h.host)
+            self.refresh_hosts();audit.operation(self.settings.audit_path,"HOST","EDIT","SUCCESS","已修改主机配置及 Agent 连接信息。",host=new_h.host,details={"name":new_h.name,"group":new_h.group_name,"hostname_source":new_h.hostname_source,"hostname_verified":bool(new_h.hostname_verified),"agent_token_configured":bool(d.agent_token_value())});self.refresh_audit()
+            if failures:
+                QMessageBox.warning(self,"Agent 配置","主机已保存，但凭据管理器更新部分失败：\n"+"\n".join(failures[:5]))
     def _delete_host(self):
         hosts=self._selected_inventory_hosts()
         if not hosts:return
@@ -3622,7 +3678,7 @@ class MainWindow(QMainWindow):
             "1. 在目标 Windows 上以管理员身份运行 agent\\Install-FdsAgent.ps1。\n"
             "2. 用 -AllowedRoot 指定允许 Agent 访问的业务目录，例如 D:\\ADMS。\n"
             "3. 记录脚本输出的 HTTPS 端口、证书 SHA-256 指纹和配对令牌。\n"
-            "4. 在本软件的主机配置中选择 FDS Agent（HTTPS），填入端口和证书指纹；再点击“设置 Agent 令牌”。\n\n"
+            "4. 在本软件的“主机管理 → 编辑”中填入 Agent 端口、证书指纹和配对令牌；其他模块会自动使用。\n\n"
             "桌面端支持：\n"
             "• 全量测试并自动选中 Agent 可用主机；\n"
             "• 从本机向目标目录流式上传并校验文件；\n"

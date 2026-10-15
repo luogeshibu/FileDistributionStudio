@@ -35,7 +35,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 1. “主机管理” → 添加主机；
 2. 通道选择 `FDS Agent（HTTPS）`；
 3. 填写端口和证书指纹；
-4. “文件分发” → 选择主机 → “设置 Agent 令牌”；
+4. “主机管理” → 编辑目标主机，填写 Agent 端口、证书指纹和配对令牌；
 5. 点击“全量测试并选中 Agent”。
 
 ## 4. 分发文件

@@ -61,7 +61,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 1. 启动 `FileDistributionStudio.exe`。
 2. 进入“主机管理”，添加目标主机，通道保持 `FDS Agent（HTTPS）`。
 3. 填写 Agent 端口，默认 `8743`，以及安装脚本输出的证书 SHA-256 指纹。
-4. 进入“文件分发”，选择目标主机，点击“设置 Agent 令牌”，粘贴安装脚本输出的配对令牌。
+4. 进入“主机管理”编辑目标主机，填写 Agent 端口、证书指纹和安装脚本输出的配对令牌；其他模块会自动使用。
 5. 点击“全量测试并选中 Agent”，测试通过的主机会自动选中。
 
 ## 文件分发

@@ -1,2 +1,2 @@
 APP_NAME = "File Distribution Studio"
-APP_VERSION = "0.6.80"
+APP_VERSION = "0.6.81"

@@ -20,11 +20,11 @@ from .locale_zh import (status_text, action_text, phase_text, mode_text, group_t
 
 
 class HostEditDialog(QDialog):
-    def __init__(self, parent=None, host: HostRecord | None = None):
+    def __init__(self, parent=None, host: HostRecord | None = None, agent_token: str = ""):
         super().__init__(parent)
         self._original = host
         self.setWindowTitle("主机配置")
-        self.resize(560, 390)
+        self.resize(620, 500)
 
         self.name = QLineEdit(host.name if host else "")
         self.host = QLineEdit(host.host if host else "")
@@ -39,6 +39,8 @@ class HostEditDialog(QDialog):
         self.agent_port.setValue(int(host.agent_port if host else 8743) or 8743)
         self.agent_pin = QLineEdit(host.agent_certificate_sha256 if host else "")
         self.agent_pin.setPlaceholderText("可选：SHA-256 证书指纹（64 位十六进制）")
+        self.agent_token = PasswordLineEdit(agent_token or "")
+        self.agent_token.setPlaceholderText("粘贴目标主机安装 Agent 时生成的配对令牌")
         self.mode.setCurrentIndex(0)
         self.mode.currentIndexChanged.connect(self._channel_changed)
         self.notes = QTextEdit(host.notes if host else "")
@@ -62,6 +64,10 @@ class HostEditDialog(QDialog):
         form.addRow("业务通道", self.business_channel)
         form.addRow("Agent HTTPS 端口", self.agent_port)
         form.addRow("Agent 证书指纹", self.agent_pin)
+        form.addRow("Agent 配对令牌", self.agent_token)
+        agent_security_note = QLabel("令牌会安全保存到当前 Windows 用户的凭据管理器，不写入 SQLite；留空将清除已保存令牌。")
+        agent_security_note.setWordWrap(True); agent_security_note.setStyleSheet("color:#667A8A;")
+        form.addRow("安全说明", agent_security_note)
         note = QLabel("v0.5.0 起目标目录由每次分发任务的“分发映射”指定，不再固定保存到主机属性。")
         note.setWordWrap(True); note.setStyleSheet("color:#667A8A;")
         form.addRow("目标目录", note)
@@ -122,6 +128,9 @@ class HostEditDialog(QDialog):
             agent_last_test_at=self._original.agent_last_test_at if self._original else "",
             last_test_at=self._original.last_test_at if self._original else "",
         )
+
+    def agent_token_value(self) -> str:
+        return self.agent_token.text().strip()
 
 
 class RemoteDriveQueryThread(QThread):
@@ -1744,45 +1753,6 @@ class WinRMHostCredentialDialog(QDialog):
             "password": self.password.text(),
             "remember": self.remember.isChecked(),
         }
-
-
-class AgentTokenDialog(QDialog):
-    """Configure a per-host Agent pairing token without writing it to app files."""
-    def __init__(self, parent=None, *, host_count: int = 1, token: str = "", remember: bool = True):
-        super().__init__(parent)
-        self.setWindowTitle("设置 FDS Agent 配对令牌")
-        self.resize(590, 260)
-        title = "当前主机" if host_count == 1 else f"选中的 {host_count} 台主机"
-        note = QLabel(
-            f"为{title}设置 FDS Agent 配对令牌。令牌只保存到当前 Windows 用户的 Windows 凭据管理器，"
-            "不会写入 settings.json、SQLite、JSONL、审计日志或命令行。"
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color:#667A8A;")
-        self.token = PasswordLineEdit(token)
-        self.token.setPlaceholderText("粘贴目标主机安装 Agent 时生成的配对令牌")
-        self.remember = QCheckBox("安全记住令牌（Windows 凭据管理器）")
-        self.remember.setChecked(bool(remember))
-        form = QFormLayout()
-        form.addRow("Agent 令牌", self.token)
-        form.addRow("", self.remember)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("保存 Agent 令牌")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
-        buttons.accepted.connect(self._accept_checked)
-        buttons.rejected.connect(self.reject)
-        lay = QVBoxLayout(self)
-        lay.addWidget(note); lay.addLayout(form); lay.addWidget(buttons)
-
-    def _accept_checked(self):
-        if not self.token.text().strip():
-            QMessageBox.warning(self, "Agent 令牌", "令牌不能为空。")
-            self.token.setFocus()
-            return
-        self.accept()
-
-    def value(self):
-        return {"token": self.token.text().strip(), "remember": self.remember.isChecked()}
 
 
 class HostnameCredentialDialog(QDialog):
